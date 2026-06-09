@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod asset_importer;
+
 enum RenderCommand {
     Reset {
         width: usize,
@@ -33,14 +35,39 @@ struct OxydeGuiApp {
     
     texture_handle: Option<egui::TextureHandle>,
     last_exposure: f32,
+
+    // New fields
+    asset_files: Vec<std::path::PathBuf>,
+    selected_asset_index: usize,
+    current_scene: Option<oxyde::Scene>,
 }
 
 impl OxydeGuiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let width = 800;
         let height = 600;
-        let camera = oxyde::CameraConfig::default();
+        let mut camera = oxyde::CameraConfig::default();
         
+        // Scan assets folder
+        let asset_files = asset_importer::list_assets("assets");
+        let selected_asset_index = asset_files
+            .iter()
+            .position(|p| p.file_name().map_or(false, |name| name == "cornell.glb"))
+            .unwrap_or(0);
+            
+        let mut current_scene = None;
+        if !asset_files.is_empty() {
+            if let Ok(scene) = asset_importer::import_scene(&asset_files[selected_asset_index]) {
+                if !scene.cameras.is_empty() {
+                    let first_cam = &scene.cameras[0];
+                    camera.position = first_cam.position;
+                    camera.target = first_cam.target;
+                    camera.fov = first_cam.fov;
+                }
+                current_scene = Some(scene);
+            }
+        }
+
         let shared_state = Arc::new(Mutex::new(SharedRenderState {
             width,
             height,
@@ -75,6 +102,9 @@ impl OxydeGuiApp {
             local_height: height,
             texture_handle: None,
             last_exposure: 1.0,
+            asset_files,
+            selected_asset_index,
+            current_scene,
         }
     }
     
@@ -147,6 +177,41 @@ impl eframe::App for OxydeGuiApp {
                 ui.heading("Oxyde RT Controls");
                 ui.add_space(10.0);
                 
+                if !self.asset_files.is_empty() {
+                    ui.group(|ui| {
+                        ui.label("Active Scene:");
+                        let selected_name = self.asset_files[self.selected_asset_index]
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                            
+                        let mut scene_changed = false;
+                        egui::ComboBox::from_id_source("scene_selector")
+                            .selected_text(&selected_name)
+                            .show_ui(ui, |ui| {
+                                for (idx, path) in self.asset_files.iter().enumerate() {
+                                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                                    scene_changed |= ui.selectable_value(&mut self.selected_asset_index, idx, name).changed();
+                                }
+                            });
+                            
+                        if scene_changed {
+                            if let Ok(scene) = asset_importer::import_scene(&self.asset_files[self.selected_asset_index]) {
+                                if !scene.cameras.is_empty() {
+                                    let first_cam = &scene.cameras[0];
+                                    self.camera.position = first_cam.position;
+                                    self.camera.target = first_cam.target;
+                                    self.camera.fov = first_cam.fov;
+                                }
+                                self.current_scene = Some(scene);
+                                self.trigger_reset();
+                            }
+                        }
+                    });
+                    ui.add_space(10.0);
+                }
+                
                 let mut changed = false;
                 
                 // Camera section
@@ -212,6 +277,16 @@ impl eframe::App for OxydeGuiApp {
                     total_samples as f64 / self.local_pixels.len() as f64
                 };
                 ui.label(format!("Samples/Pixel (avg): {:.1}", avg_samples));
+                
+                ui.add_space(6.0);
+                if let Some(ref scene) = self.current_scene {
+                    ui.label(format!("Meshes: {}", scene.meshes.len()));
+                    ui.label(format!("Materials: {}", scene.materials.len()));
+                    ui.label(format!("Lights: {}", scene.lights.len()));
+                    ui.label(format!("Cameras: {}", scene.cameras.len()));
+                } else {
+                    ui.label("No scene loaded");
+                }
             });
             
         egui::CentralPanel::default().show(ctx, |ui| {

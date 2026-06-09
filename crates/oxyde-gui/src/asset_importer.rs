@@ -1,0 +1,220 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use nalgebra::{Point3, Vector3, Matrix4, Transform3};
+use oxyde::{Scene, Mesh, Material, Triangle, Node, Light, LightType, Camera};
+
+/// Scans the directory for any .glb or .gltf files and returns their paths.
+pub fn list_assets<P: AsRef<Path>>(dir: P) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "glb" || ext == "gltf" {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Imports a GLB or glTF file and parses it into an oxyde::Scene.
+pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error::Error>> {
+    let (document, buffers, _images) = gltf::import(path)?;
+
+    println!("--- Importing Scene Info ---");
+    println!("Document total nodes: {}", document.nodes().count());
+    println!("Document total lights: {}", document.lights().map_or(0, |l| l.count()));
+    println!("Document total cameras: {}", document.cameras().count());
+    println!("Document total materials: {}", document.materials().count());
+
+    // 1. Load Materials
+    let mut materials = Vec::new();
+    for (idx, mat) in document.materials().enumerate() {
+        let pbr = mat.pbr_metallic_roughness();
+        let base_color = pbr.base_color_factor(); // [f32; 4]
+        let emissive = mat.emissive_factor(); // [f32; 3]
+        
+        println!(
+            "  Material #{} ({}): albedo={:?}, emissive={:?}",
+            idx,
+            mat.name().unwrap_or("unnamed"),
+            [base_color[0], base_color[1], base_color[2]],
+            emissive
+        );
+
+        materials.push(Material {
+            albedo: [base_color[0], base_color[1], base_color[2]],
+            emissive,
+        });
+    }
+
+    // 2. Load Meshes
+    // In glTF, a single Mesh can contain multiple Primitives. Since each Primitive 
+    // can have a different material, we split them into individual oxyde::Mesh instances.
+    let mut meshes = Vec::new();
+    for mesh in document.meshes() {
+        for primitive in mesh.primitives() {
+            let mut vertices = Vec::new();
+            let mut normals = Vec::new();
+            let mut triangles = Vec::new();
+            let mut material_idx = 0;
+
+            let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+            
+            // Read positions
+            if let Some(pos_iter) = reader.read_positions() {
+                for pos in pos_iter {
+                    vertices.push(Point3::new(pos[0], pos[1], pos[2]));
+                }
+            }
+
+            // Read normals
+            if let Some(norm_iter) = reader.read_normals() {
+                for norm in norm_iter {
+                    normals.push(Vector3::new(norm[0], norm[1], norm[2]));
+                }
+            }
+
+            // Read indices
+            if let Some(indices_iter) = reader.read_indices() {
+                let indices: Vec<u32> = indices_iter.into_u32().collect();
+                for chunk in indices.chunks_exact(3) {
+                    triangles.push(Triangle {
+                        v0: chunk[0],
+                        v1: chunk[1],
+                        v2: chunk[2],
+                    });
+                }
+            }
+
+            // Material index
+            if let Some(mat) = primitive.material().index() {
+                material_idx = mat as u32;
+            }
+
+            meshes.push(Mesh {
+                vertices,
+                normals,
+                triangles,
+                material: material_idx,
+            });
+        }
+    }
+
+    // 3. Load Nodes, Cameras and Lights
+    let scene = document.default_scene().or_else(|| document.scenes().next()).ok_or("No scene found in glTF file")?;
+    
+    let mut node_world_transforms = vec![Matrix4::identity(); document.nodes().count()];
+    let mut cameras = Vec::new();
+    let mut lights = Vec::new();
+    let mut nodes_list = Vec::new();
+
+    // Traverses node hierarchy to compute world transforms and extract cameras/lights
+    fn traverse_node(
+        node: &gltf::Node,
+        parent_transform: &Matrix4<f32>,
+        node_world_transforms: &mut [Matrix4<f32>],
+        cameras: &mut Vec<Camera>,
+        lights: &mut Vec<Light>,
+        buffers: &[gltf::buffer::Data],
+    ) {
+        let local_matrix = node.transform().matrix(); // [[f32; 4]; 4]
+        let local_transform = Matrix4::new(
+            local_matrix[0][0], local_matrix[1][0], local_matrix[2][0], local_matrix[3][0],
+            local_matrix[0][1], local_matrix[1][1], local_matrix[2][1], local_matrix[3][1],
+            local_matrix[0][2], local_matrix[1][2], local_matrix[2][2], local_matrix[3][2],
+            local_matrix[0][3], local_matrix[1][3], local_matrix[2][3], local_matrix[3][3],
+        );
+        let world_transform = parent_transform * local_transform;
+        node_world_transforms[node.index()] = world_transform;
+
+        // Camera extraction
+        if let Some(gltf_camera) = node.camera() {
+            let pos = Point3::new(world_transform[(0, 3)], world_transform[(1, 3)], world_transform[(2, 3)]);
+            let dir_vec = world_transform.transform_vector(&Vector3::new(0.0, 0.0, -1.0));
+            let target = pos + dir_vec;
+
+            let fov = match gltf_camera.projection() {
+                gltf::camera::Projection::Perspective(p) => p.yfov().to_degrees(),
+                gltf::camera::Projection::Orthographic(_) => 60.0,
+            };
+
+            cameras.push(Camera {
+                position: pos,
+                target,
+                fov,
+            });
+        }
+
+        // Light extraction (KHR_lights_punctual)
+        if let Some(gltf_light) = node.light() {
+            let pos = Point3::new(world_transform[(0, 3)], world_transform[(1, 3)], world_transform[(2, 3)]);
+            let dir = world_transform.transform_vector(&Vector3::new(0.0, 0.0, -1.0)).normalize();
+            
+            let light_type = match gltf_light.kind() {
+                gltf::khr_lights_punctual::Kind::Directional => LightType::Directional,
+                gltf::khr_lights_punctual::Kind::Point => LightType::Point,
+                gltf::khr_lights_punctual::Kind::Spot { .. } => LightType::Spot,
+            };
+
+            lights.push(Light {
+                position: pos,
+                direction: dir,
+                color: gltf_light.color(),
+                intensity: gltf_light.intensity(),
+                light_type,
+            });
+        }
+
+        // Children traversal
+        for child in node.children() {
+            traverse_node(&child, &world_transform, node_world_transforms, cameras, lights, buffers);
+        }
+    }
+
+    for root in scene.nodes() {
+        traverse_node(&root, &Matrix4::identity(), &mut node_world_transforms, &mut cameras, &mut lights, &buffers);
+    }
+
+    // Construct the node list
+    for node in document.nodes() {
+        let matrix = node.transform().matrix();
+        let m = Matrix4::new(
+            matrix[0][0], matrix[1][0], matrix[2][0], matrix[3][0],
+            matrix[0][1], matrix[1][1], matrix[2][1], matrix[3][1],
+            matrix[0][2], matrix[1][2], matrix[2][2], matrix[3][2],
+            matrix[0][3], matrix[1][3], matrix[2][3], matrix[3][3],
+        );
+        let transform = Transform3::from_matrix_unchecked(m);
+        let children = node.children().map(|c| c.index() as u32).collect();
+        let mesh = node.mesh().map(|m| m.index() as u32);
+
+        nodes_list.push(Node {
+            transform,
+            children,
+            mesh,
+        });
+    }
+
+    // Automatic default camera if none found
+    if cameras.is_empty() {
+        cameras.push(Camera {
+            position: Point3::new(0.0, 0.0, 3.0),
+            target: Point3::new(0.0, 0.0, 0.0),
+            fov: 60.0,
+        });
+    }
+
+    Ok(Scene {
+        meshes,
+        materials,
+        lights,
+        nodes: nodes_list,
+        cameras,
+    })
+}
