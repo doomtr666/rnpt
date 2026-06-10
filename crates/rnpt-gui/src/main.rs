@@ -10,6 +10,7 @@ enum RenderCommand {
         width: usize,
         height: usize,
         camera: rnpt::Camera,
+        scene: rnpt::Scene,
     },
     Stop,
 }
@@ -19,6 +20,7 @@ struct SharedRenderState {
     height: usize,
     pixels: Vec<rnpt::Pixel>,
     is_dirty: bool,
+    rays_per_sec: f64,
 }
 
 struct RnptGuiApp {
@@ -32,6 +34,7 @@ struct RnptGuiApp {
     local_pixels: Vec<rnpt::Pixel>,
     local_width: usize,
     local_height: usize,
+    local_rays_per_sec: f64,
 
     texture_handle: Option<egui::TextureHandle>,
     last_exposure: f32,
@@ -40,6 +43,9 @@ struct RnptGuiApp {
     asset_files: Vec<std::path::PathBuf>,
     selected_asset_index: usize,
     current_scene: Option<rnpt::Scene>,
+
+    auto_fit: bool,
+    resize_timeout: Option<Instant>,
 }
 
 impl RnptGuiApp {
@@ -73,6 +79,7 @@ impl RnptGuiApp {
             height,
             pixels: vec![rnpt::Pixel::default(); width * height],
             is_dirty: false,
+            rays_per_sec: 0.0,
         }));
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
@@ -85,10 +92,18 @@ impl RnptGuiApp {
         });
 
         // Send initial reset command to start rendering
+        let scene = current_scene.clone().unwrap_or_else(|| rnpt::Scene {
+            meshes: vec![],
+            materials: vec![],
+            lights: vec![],
+            nodes: vec![],
+            cameras: vec![],
+        });
         let _ = cmd_tx.send(RenderCommand::Reset {
             width,
             height,
             camera: camera.clone(),
+            scene,
         });
 
         Self {
@@ -100,25 +115,45 @@ impl RnptGuiApp {
             local_pixels: vec![rnpt::Pixel::default(); width * height],
             local_width: width,
             local_height: height,
+            local_rays_per_sec: 0.0,
             texture_handle: None,
             last_exposure: 1.0,
             asset_files,
             selected_asset_index,
             current_scene,
+            auto_fit: true,
+            resize_timeout: None,
         }
     }
 
     fn trigger_reset(&self) {
+        let scene = self.current_scene.clone().unwrap_or_else(|| rnpt::Scene {
+            meshes: vec![],
+            materials: vec![],
+            lights: vec![],
+            nodes: vec![],
+            cameras: vec![],
+        });
         let _ = self.cmd_tx.send(RenderCommand::Reset {
             width: self.resolution[0],
             height: self.resolution[1],
             camera: self.camera.clone(),
+            scene,
         });
     }
 }
 
 impl eframe::App for RnptGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(timeout) = self.resize_timeout {
+            if Instant::now() >= timeout {
+                self.resize_timeout = None;
+                self.trigger_reset();
+            } else {
+                ctx.request_repaint();
+            }
+        }
+
         let mut pixels_updated = false;
 
         // 1. Check if the renderer thread has produced new pixels
@@ -127,6 +162,7 @@ impl eframe::App for RnptGuiApp {
                 if state.is_dirty {
                     self.local_width = state.width;
                     self.local_height = state.height;
+                    self.local_rays_per_sec = state.rays_per_sec;
 
                     // Resize local buffer if needed
                     if self.local_pixels.len() != state.pixels.len() {
@@ -277,21 +313,34 @@ impl eframe::App for RnptGuiApp {
 
                 ui.add_space(10.0);
 
+                let mut resolution_changed = false;
                 // Resolution section
                 ui.collapsing("Resolution", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("W:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut self.resolution[0]).range(64..=2048))
-                            .changed();
-                        ui.label("H:");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut self.resolution[1]).range(64..=2048))
-                            .changed();
+                    let prev_auto_fit = self.auto_fit;
+                    ui.checkbox(&mut self.auto_fit, "Auto-fit to viewport");
+                    if prev_auto_fit != self.auto_fit {
+                        resolution_changed = true;
+                    }
+                    
+                    ui.add_space(4.0);
+                    
+                    ui.add_enabled_ui(!self.auto_fit, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("W:");
+                            let r1 = ui.add(egui::DragValue::new(&mut self.resolution[0]).range(64..=2048));
+                            ui.label("H:");
+                            let r2 = ui.add(egui::DragValue::new(&mut self.resolution[1]).range(64..=2048));
+
+                            let r1_changed_finished = r1.drag_stopped() || r1.lost_focus() || (r1.changed() && !r1.dragged());
+                            let r2_changed_finished = r2.drag_stopped() || r2.lost_focus() || (r2.changed() && !r2.dragged());
+                            if r1_changed_finished || r2_changed_finished {
+                                resolution_changed = true;
+                            }
+                        });
                     });
                 });
 
-                if changed {
+                if changed || resolution_changed {
                     self.trigger_reset();
                 }
 
@@ -325,33 +374,39 @@ impl eframe::App for RnptGuiApp {
                     total_samples as f64 / self.local_pixels.len() as f64
                 };
                 ui.label(format!("Samples/Pixel (avg): {:.1}", avg_samples));
+                ui.label(format!("Performance: {}", format_rays_per_sec(self.local_rays_per_sec)));
 
                 ui.add_space(6.0);
-                if let Some(ref scene) = self.current_scene {
-                    ui.label(format!("Meshes: {}", scene.meshes.len()));
-                    ui.label(format!("Materials: {}", scene.materials.len()));
-                    ui.label(format!("Lights: {}", scene.lights.len()));
-                    ui.label(format!("Cameras: {}", scene.cameras.len()));
-                } else {
-                    ui.label("No scene loaded");
-                }
+                ui.collapsing("Scene Stats", |ui| {
+                    if let Some(ref scene) = self.current_scene {
+                        ui.label(format!("Meshes: {}", scene.meshes.len()));
+                        ui.label(format!("Materials: {}", scene.materials.len()));
+                        ui.label(format!("Lights: {}", scene.lights.len()));
+                        ui.label(format!("Cameras: {}", scene.cameras.len()));
+                    } else {
+                        ui.label("No scene loaded");
+                    }
+                });
             });
 
+        let mut viewport_size = None;
         egui::CentralPanel::default().show(ctx, |ui| {
+            let available = ui.available_size();
+            viewport_size = Some([available.x, available.y]);
+
             if let Some(ref texture) = self.texture_handle {
                 let size = texture.size_vec2();
-                let max_size = ui.available_size();
                 let aspect_ratio = size.x / size.y;
 
-                let desired_size = if max_size.x / max_size.y > aspect_ratio {
-                    egui::vec2(max_size.y * aspect_ratio, max_size.y)
+                let desired_size = if available.x / available.y > aspect_ratio {
+                    egui::vec2(available.y * aspect_ratio, available.y)
                 } else {
-                    egui::vec2(max_size.x, max_size.x / aspect_ratio)
+                    egui::vec2(available.x, available.x / aspect_ratio)
                 };
 
                 // Centering the image in the panel
                 let rect = egui::Rect::from_min_size(
-                    ui.min_rect().min + (max_size - desired_size) * 0.5,
+                    ui.min_rect().min + (available - desired_size) * 0.5,
                     desired_size,
                 );
 
@@ -362,6 +417,18 @@ impl eframe::App for RnptGuiApp {
                 });
             }
         });
+
+        if self.auto_fit {
+            if let Some(size) = viewport_size {
+                let rounded_w = size[0].max(64.0) as usize;
+                let rounded_h = size[1].max(64.0) as usize;
+
+                if rounded_w != self.resolution[0] || rounded_h != self.resolution[1] {
+                    self.resolution = [rounded_w, rounded_h];
+                    self.resize_timeout = Some(Instant::now() + Duration::from_millis(150));
+                }
+            }
+        }
     }
 
     // Cleanup background thread when dropping
@@ -413,6 +480,16 @@ fn tonemap_and_convert(pixels: &[rnpt::Pixel], exposure: f32, output_rgba: &mut 
         });
 }
 
+fn format_rays_per_sec(rays_per_sec: f64) -> String {
+    if rays_per_sec >= 1_000_000.0 {
+        format!("{:.2} Mrays/s", rays_per_sec / 1_000_000.0)
+    } else if rays_per_sec >= 1_000.0 {
+        format!("{:.1} Krays/s", rays_per_sec / 1_000.0)
+    } else {
+        format!("{:.0} rays/s", rays_per_sec)
+    }
+}
+
 fn run_renderer_thread(
     rx: std::sync::mpsc::Receiver<RenderCommand>,
     shared_state: Arc<Mutex<SharedRenderState>>,
@@ -421,25 +498,46 @@ fn run_renderer_thread(
     let mut width = 800;
     let mut height = 600;
     let mut camera = rnpt::Camera::default();
+    let mut scene = rnpt::Scene {
+        meshes: vec![],
+        materials: vec![],
+        lights: vec![],
+        nodes: vec![],
+        cameras: vec![],
+    };
+
+    let mut path_tracer = rnpt::PathTracer::new(rnpt::PathTracerConfig {
+        width,
+        height,
+        camera: camera.clone(),
+        scene: scene.clone(),
+    });
+
     let mut pixels = vec![rnpt::Pixel::default(); width * height];
     let mut running = true;
     let mut last_update_time = Instant::now();
 
+    let mut last_fps_time = Instant::now();
+    let mut rays_since_last_fps = 0u64;
+    let mut current_rays_per_sec = 0.0;
+
     while running {
         // Process commands
         let mut got_command = true;
+        let mut reset_needed = false;
         while got_command {
             match rx.try_recv() {
                 Ok(RenderCommand::Reset {
                     width: w,
                     height: h,
                     camera: cam,
+                    scene: scn,
                 }) => {
                     width = w;
                     height = h;
                     camera = cam;
-                    pixels = vec![rnpt::Pixel::default(); width * height];
-                    last_update_time = Instant::now(); // Force update on reset
+                    scene = scn;
+                    reset_needed = true;
                 }
                 Ok(RenderCommand::Stop) => {
                     running = false;
@@ -459,6 +557,20 @@ fn run_renderer_thread(
             break;
         }
 
+        if reset_needed {
+            path_tracer = rnpt::PathTracer::new(rnpt::PathTracerConfig {
+                width,
+                height,
+                camera: camera.clone(),
+                scene: scene.clone(),
+            });
+            pixels = vec![rnpt::Pixel::default(); width * height];
+            last_update_time = Instant::now(); // Force update on reset
+            last_fps_time = Instant::now();
+            rays_since_last_fps = 0;
+            current_rays_per_sec = 0.0;
+        }
+
         if pixels.is_empty() {
             std::thread::sleep(Duration::from_millis(16));
             continue;
@@ -469,17 +581,28 @@ fn run_renderer_thread(
         pixels.par_iter_mut().enumerate().for_each(|(idx, pixel)| {
             let x = idx % width;
             let y = idx / width;
-            rnpt::sample_pixel(x, y, width, height, &camera, pixel);
+            path_tracer.sample_pixel(x, y, pixel);
         });
+
+        let pass_rays = (width * height) as u64;
+        rays_since_last_fps += pass_rays;
 
         // Rate-limit updates to the GUI (e.g. 30 FPS / every 33 ms)
         let now = Instant::now();
         if now.duration_since(last_update_time) >= Duration::from_millis(33) {
+            let elapsed_fps = now.duration_since(last_fps_time).as_secs_f64();
+            if elapsed_fps >= 0.5 {
+                current_rays_per_sec = rays_since_last_fps as f64 / elapsed_fps;
+                rays_since_last_fps = 0;
+                last_fps_time = now;
+            }
+
             {
                 let mut state = shared_state.lock().unwrap();
                 state.width = width;
                 state.height = height;
                 state.pixels.clone_from(&pixels);
+                state.rays_per_sec = current_rays_per_sec;
                 state.is_dirty = true;
             }
             ctx.request_repaint();

@@ -162,35 +162,6 @@ pub fn generate_ray_with_matrix(
     (ray_origin, ray_dir)
 }
 
-/// A stateless function that computes a sample for a pixel (x, y)
-/// and accumulates the result into the given mutable pixel reference.
-///
-/// This function is thread-safe as long as distinct threads operate
-/// on distinct pixel references.
-pub fn sample_pixel(
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    camera: &Camera,
-    pixel: &mut Pixel,
-) {
-    let u = x as f32 / width as f32;
-    let v = y as f32 / height as f32;
-
-    // Vary the red based on coordinates and camera position
-    let r = 0.5 + 0.5 * (camera.position.x + u * 6.28).sin() * (camera.position.y + v * 6.28).cos();
-
-    // Minor green/blue variations to react to target and fov
-    let g = 0.1 * (camera.target.x + u).cos().abs();
-    let b = 0.1 * (camera.fov.to_radians() + v).sin().abs();
-
-    pixel.r += r;
-    pixel.g += g;
-    pixel.b += b;
-    pixel.samples += 1;
-}
-
 pub struct PathTracerConfig {
     pub width: usize,
     pub height: usize,
@@ -198,4 +169,37 @@ pub struct PathTracerConfig {
     pub scene: Scene,
 }
 
-pub struct PathTracer {}
+pub struct PathTracer {
+    config: PathTracerConfig,
+}
+
+impl PathTracer {
+    pub fn new(config: PathTracerConfig) -> Self {
+        Self { config }
+    }
+
+    /// A stateless function that computes a sample for a pixel (x, y)
+    /// and accumulates the result into the given mutable pixel reference.
+    ///
+    /// This function is thread-safe as long as distinct threads operate
+    /// on distinct pixel references.
+    pub fn sample_pixel(&self, x: usize, y: usize, pixel: &mut Pixel) {
+        let u = x as f32 / self.config.width as f32;
+        let v = y as f32 / self.config.height as f32;
+
+        // Vary the red based on coordinates and camera position
+        let r = 0.5
+            + 0.5
+                * (self.config.camera.position.x + u * 6.28).sin()
+                * (self.config.camera.position.y + v * 6.28).cos();
+
+        // Minor green/blue variations to react to target and fov
+        let g = 0.1 * (self.config.camera.target.x + u).cos().abs();
+        let b = 0.1 * (self.config.camera.fov.to_radians() + v).sin().abs();
+
+        pixel.r += r;
+        pixel.g += g;
+        pixel.b += b;
+        pixel.samples += 1;
+    }
+}
