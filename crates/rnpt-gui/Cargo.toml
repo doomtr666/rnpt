@@ -1,5 +1,5 @@
 [package]
-name = "oxyde-gui"
+name = "rnpt-gui"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,4 +8,4 @@ eframe = "0.28.1"
 rayon = "1.10"
 nalgebra = "0.33"
 gltf = { version = "1.4", features = ["KHR_lights_punctual"] }
-oxyde = { path = "../oxyde" }
+rnpt = { path = "../rnpt" }

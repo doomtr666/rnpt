@@ -1,7 +1,7 @@
+use nalgebra::{Matrix4, Point3, Transform3, Vector3};
+use rnpt::{Camera, Light, LightType, Material, Mesh, Node, Scene, Triangle};
 use std::fs;
 use std::path::{Path, PathBuf};
-use nalgebra::{Point3, Vector3, Matrix4, Transform3};
-use oxyde::{Scene, Mesh, Material, Triangle, Node, Light, LightType, Camera};
 
 /// Scans the directory for any .glb or .gltf files and returns their paths.
 pub fn list_assets<P: AsRef<Path>>(dir: P) -> Vec<PathBuf> {
@@ -22,13 +22,16 @@ pub fn list_assets<P: AsRef<Path>>(dir: P) -> Vec<PathBuf> {
     files
 }
 
-/// Imports a GLB or glTF file and parses it into an oxyde::Scene.
+/// Imports a GLB or glTF file and parses it into an rnpt::Scene.
 pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error::Error>> {
     let (document, buffers, _images) = gltf::import(path)?;
 
     println!("--- Importing Scene Info ---");
     println!("Document total nodes: {}", document.nodes().count());
-    println!("Document total lights: {}", document.lights().map_or(0, |l| l.count()));
+    println!(
+        "Document total lights: {}",
+        document.lights().map_or(0, |l| l.count())
+    );
     println!("Document total cameras: {}", document.cameras().count());
     println!("Document total materials: {}", document.materials().count());
 
@@ -38,7 +41,7 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
         let pbr = mat.pbr_metallic_roughness();
         let base_color = pbr.base_color_factor(); // [f32; 4]
         let emissive = mat.emissive_factor(); // [f32; 3]
-        
+
         println!(
             "  Material #{} ({}): albedo={:?}, emissive={:?}",
             idx,
@@ -54,8 +57,8 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
     }
 
     // 2. Load Meshes
-    // In glTF, a single Mesh can contain multiple Primitives. Since each Primitive 
-    // can have a different material, we split them into individual oxyde::Mesh instances.
+    // In glTF, a single Mesh can contain multiple Primitives. Since each Primitive
+    // can have a different material, we split them into individual rnpt::Mesh instances.
     let mut meshes = Vec::new();
     for mesh in document.meshes() {
         for primitive in mesh.primitives() {
@@ -65,7 +68,7 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
             let mut material_idx = 0;
 
             let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
-            
+
             // Read positions
             if let Some(pos_iter) = reader.read_positions() {
                 for pos in pos_iter {
@@ -107,8 +110,11 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
     }
 
     // 3. Load Nodes, Cameras and Lights
-    let scene = document.default_scene().or_else(|| document.scenes().next()).ok_or("No scene found in glTF file")?;
-    
+    let scene = document
+        .default_scene()
+        .or_else(|| document.scenes().next())
+        .ok_or("No scene found in glTF file")?;
+
     let mut node_world_transforms = vec![Matrix4::identity(); document.nodes().count()];
     let mut cameras = Vec::new();
     let mut lights = Vec::new();
@@ -125,17 +131,33 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
     ) {
         let local_matrix = node.transform().matrix(); // [[f32; 4]; 4]
         let local_transform = Matrix4::new(
-            local_matrix[0][0], local_matrix[1][0], local_matrix[2][0], local_matrix[3][0],
-            local_matrix[0][1], local_matrix[1][1], local_matrix[2][1], local_matrix[3][1],
-            local_matrix[0][2], local_matrix[1][2], local_matrix[2][2], local_matrix[3][2],
-            local_matrix[0][3], local_matrix[1][3], local_matrix[2][3], local_matrix[3][3],
+            local_matrix[0][0],
+            local_matrix[1][0],
+            local_matrix[2][0],
+            local_matrix[3][0],
+            local_matrix[0][1],
+            local_matrix[1][1],
+            local_matrix[2][1],
+            local_matrix[3][1],
+            local_matrix[0][2],
+            local_matrix[1][2],
+            local_matrix[2][2],
+            local_matrix[3][2],
+            local_matrix[0][3],
+            local_matrix[1][3],
+            local_matrix[2][3],
+            local_matrix[3][3],
         );
         let world_transform = parent_transform * local_transform;
         node_world_transforms[node.index()] = world_transform;
 
         // Camera extraction
         if let Some(gltf_camera) = node.camera() {
-            let pos = Point3::new(world_transform[(0, 3)], world_transform[(1, 3)], world_transform[(2, 3)]);
+            let pos = Point3::new(
+                world_transform[(0, 3)],
+                world_transform[(1, 3)],
+                world_transform[(2, 3)],
+            );
             let dir_vec = world_transform.transform_vector(&Vector3::new(0.0, 0.0, -1.0));
             let target = pos + dir_vec;
 
@@ -153,9 +175,15 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
 
         // Light extraction (KHR_lights_punctual)
         if let Some(gltf_light) = node.light() {
-            let pos = Point3::new(world_transform[(0, 3)], world_transform[(1, 3)], world_transform[(2, 3)]);
-            let dir = world_transform.transform_vector(&Vector3::new(0.0, 0.0, -1.0)).normalize();
-            
+            let pos = Point3::new(
+                world_transform[(0, 3)],
+                world_transform[(1, 3)],
+                world_transform[(2, 3)],
+            );
+            let dir = world_transform
+                .transform_vector(&Vector3::new(0.0, 0.0, -1.0))
+                .normalize();
+
             let light_type = match gltf_light.kind() {
                 gltf::khr_lights_punctual::Kind::Directional => LightType::Directional,
                 gltf::khr_lights_punctual::Kind::Point => LightType::Point,
@@ -173,22 +201,48 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
 
         // Children traversal
         for child in node.children() {
-            traverse_node(&child, &world_transform, node_world_transforms, cameras, lights, buffers);
+            traverse_node(
+                &child,
+                &world_transform,
+                node_world_transforms,
+                cameras,
+                lights,
+                buffers,
+            );
         }
     }
 
     for root in scene.nodes() {
-        traverse_node(&root, &Matrix4::identity(), &mut node_world_transforms, &mut cameras, &mut lights, &buffers);
+        traverse_node(
+            &root,
+            &Matrix4::identity(),
+            &mut node_world_transforms,
+            &mut cameras,
+            &mut lights,
+            &buffers,
+        );
     }
 
     // Construct the node list
     for node in document.nodes() {
         let matrix = node.transform().matrix();
         let m = Matrix4::new(
-            matrix[0][0], matrix[1][0], matrix[2][0], matrix[3][0],
-            matrix[0][1], matrix[1][1], matrix[2][1], matrix[3][1],
-            matrix[0][2], matrix[1][2], matrix[2][2], matrix[3][2],
-            matrix[0][3], matrix[1][3], matrix[2][3], matrix[3][3],
+            matrix[0][0],
+            matrix[1][0],
+            matrix[2][0],
+            matrix[3][0],
+            matrix[0][1],
+            matrix[1][1],
+            matrix[2][1],
+            matrix[3][1],
+            matrix[0][2],
+            matrix[1][2],
+            matrix[2][2],
+            matrix[3][2],
+            matrix[0][3],
+            matrix[1][3],
+            matrix[2][3],
+            matrix[3][3],
         );
         let transform = Transform3::from_matrix_unchecked(m);
         let children = node.children().map(|c| c.index() as u32).collect();
