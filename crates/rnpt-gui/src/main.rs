@@ -9,7 +9,7 @@ enum RenderCommand {
     Reset {
         width: usize,
         height: usize,
-        camera: rnpt::CameraConfig,
+        camera: rnpt::Camera,
     },
     Stop,
 }
@@ -22,7 +22,7 @@ struct SharedRenderState {
 }
 
 struct RnptGuiApp {
-    camera: rnpt::CameraConfig,
+    camera: rnpt::Camera,
     resolution: [usize; 2],
     exposure: f32,
 
@@ -46,7 +46,7 @@ impl RnptGuiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let width = 800;
         let height = 600;
-        let mut camera = rnpt::CameraConfig::default();
+        let mut camera = rnpt::Camera::default();
 
         // Scan assets folder
         let asset_files = asset_importer::list_assets("assets");
@@ -171,7 +171,7 @@ impl eframe::App for RnptGuiApp {
             .default_width(260.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
-                ui.heading("rnpt RT Controls");
+                ui.heading("RNPT Controls");
                 ui.add_space(10.0);
 
                 if !self.asset_files.is_empty() {
@@ -420,7 +420,7 @@ fn run_renderer_thread(
 ) {
     let mut width = 800;
     let mut height = 600;
-    let mut camera = rnpt::CameraConfig::default();
+    let mut camera = rnpt::Camera::default();
     let mut pixels = vec![rnpt::Pixel::default(); width * height];
     let mut running = true;
     let mut last_update_time = Instant::now();

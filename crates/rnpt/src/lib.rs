@@ -16,11 +16,21 @@ pub struct Light {
     pub light_type: LightType,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Camera {
     pub position: Point3<f32>,
     pub target: Point3<f32>,
     pub fov: f32, // FOV in degrees
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            position: Point3::new(0.0, 0.0, 3.0),
+            target: Point3::new(0.0, 0.0, 0.0),
+            fov: 60.0,
+        }
+    }
 }
 
 impl Camera {
@@ -98,23 +108,6 @@ pub struct Scene {
     pub cameras: Vec<Camera>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct CameraConfig {
-    pub position: Point3<f32>,
-    pub target: Point3<f32>,
-    pub fov: f32, // FOV in degrees
-}
-
-impl Default for CameraConfig {
-    fn default() -> Self {
-        Self {
-            position: Point3::new(0.0, 0.0, 3.0),
-            target: Point3::new(0.0, 0.0, 0.0),
-            fov: 60.0,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct Pixel {
     pub r: f32,
@@ -179,7 +172,7 @@ pub fn sample_pixel(
     y: usize,
     width: usize,
     height: usize,
-    camera: &CameraConfig,
+    camera: &Camera,
     pixel: &mut Pixel,
 ) {
     let u = x as f32 / width as f32;
@@ -197,3 +190,12 @@ pub fn sample_pixel(
     pixel.b += b;
     pixel.samples += 1;
 }
+
+pub struct PathTracerConfig {
+    pub width: usize,
+    pub height: usize,
+    pub camera: Camera,
+    pub scene: Scene,
+}
+
+pub struct PathTracer {}

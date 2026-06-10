@@ -22,33 +22,37 @@ pub fn list_assets<P: AsRef<Path>>(dir: P) -> Vec<PathBuf> {
     files
 }
 
+fn gltf_matrix_to_nalgebra(matrix: [[f32; 4]; 4]) -> Matrix4<f32> {
+    Matrix4::new(
+        matrix[0][0],
+        matrix[1][0],
+        matrix[2][0],
+        matrix[3][0],
+        matrix[0][1],
+        matrix[1][1],
+        matrix[2][1],
+        matrix[3][1],
+        matrix[0][2],
+        matrix[1][2],
+        matrix[2][2],
+        matrix[3][2],
+        matrix[0][3],
+        matrix[1][3],
+        matrix[2][3],
+        matrix[3][3],
+    )
+}
+
 /// Imports a GLB or glTF file and parses it into an rnpt::Scene.
 pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error::Error>> {
     let (document, buffers, _images) = gltf::import(path)?;
 
-    println!("--- Importing Scene Info ---");
-    println!("Document total nodes: {}", document.nodes().count());
-    println!(
-        "Document total lights: {}",
-        document.lights().map_or(0, |l| l.count())
-    );
-    println!("Document total cameras: {}", document.cameras().count());
-    println!("Document total materials: {}", document.materials().count());
-
     // 1. Load Materials
     let mut materials = Vec::new();
-    for (idx, mat) in document.materials().enumerate() {
+    for (_idx, mat) in document.materials().enumerate() {
         let pbr = mat.pbr_metallic_roughness();
         let base_color = pbr.base_color_factor(); // [f32; 4]
         let emissive = mat.emissive_factor(); // [f32; 3]
-
-        println!(
-            "  Material #{} ({}): albedo={:?}, emissive={:?}",
-            idx,
-            mat.name().unwrap_or("unnamed"),
-            [base_color[0], base_color[1], base_color[2]],
-            emissive
-        );
 
         materials.push(Material {
             albedo: [base_color[0], base_color[1], base_color[2]],
@@ -130,24 +134,7 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
         buffers: &[gltf::buffer::Data],
     ) {
         let local_matrix = node.transform().matrix(); // [[f32; 4]; 4]
-        let local_transform = Matrix4::new(
-            local_matrix[0][0],
-            local_matrix[1][0],
-            local_matrix[2][0],
-            local_matrix[3][0],
-            local_matrix[0][1],
-            local_matrix[1][1],
-            local_matrix[2][1],
-            local_matrix[3][1],
-            local_matrix[0][2],
-            local_matrix[1][2],
-            local_matrix[2][2],
-            local_matrix[3][2],
-            local_matrix[0][3],
-            local_matrix[1][3],
-            local_matrix[2][3],
-            local_matrix[3][3],
-        );
+        let local_transform = gltf_matrix_to_nalgebra(local_matrix);
         let world_transform = parent_transform * local_transform;
         node_world_transforms[node.index()] = world_transform;
 
@@ -226,24 +213,7 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
     // Construct the node list
     for node in document.nodes() {
         let matrix = node.transform().matrix();
-        let m = Matrix4::new(
-            matrix[0][0],
-            matrix[1][0],
-            matrix[2][0],
-            matrix[3][0],
-            matrix[0][1],
-            matrix[1][1],
-            matrix[2][1],
-            matrix[3][1],
-            matrix[0][2],
-            matrix[1][2],
-            matrix[2][2],
-            matrix[3][2],
-            matrix[0][3],
-            matrix[1][3],
-            matrix[2][3],
-            matrix[3][3],
-        );
+        let m = gltf_matrix_to_nalgebra(matrix);
         let transform = Transform3::from_matrix_unchecked(m);
         let children = node.children().map(|c| c.index() as u32).collect();
         let mesh = node.mesh().map(|m| m.index() as u32);
