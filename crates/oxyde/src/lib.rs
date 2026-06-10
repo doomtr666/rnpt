@@ -1,4 +1,4 @@
-use nalgebra::{Point3, Transform3, Vector3};
+use nalgebra::{Matrix4, Point3, Transform3, UnitVector3, Vector3};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LightType {
@@ -21,6 +21,44 @@ pub struct Camera {
     pub position: Point3<f32>,
     pub target: Point3<f32>,
     pub fov: f32, // FOV in degrees
+}
+
+impl Camera {
+    pub fn compute_camera_to_world(&self) -> Transform3<f32> {
+        let cam_z = (self.position - self.target).normalize();
+        let up = Vector3::new(0.0, 1.0, 0.0);
+        let cam_x = up.cross(&cam_z).normalize();
+        let cam_y = cam_z.cross(&cam_x);
+
+        let m = Matrix4::new(
+            cam_x.x,
+            cam_y.x,
+            cam_z.x,
+            self.position.x,
+            cam_x.y,
+            cam_y.y,
+            cam_z.y,
+            self.position.y,
+            cam_x.z,
+            cam_y.z,
+            cam_z.z,
+            self.position.z,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        );
+
+        Transform3::from_matrix_unchecked(m)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Ray {
+    pub origin: Point3<f32>,
+    pub direction: UnitVector3<f32>,
+    pub tmin: f32,
+    pub tmax: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +132,41 @@ impl Default for Pixel {
             samples: 0,
         }
     }
+}
+
+// English code comments as per instructions
+pub fn generate_ray_with_matrix(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    fov_degrees: f32,
+    c2w: &Transform3<f32>,
+) -> (Point3<f32>, Vector3<f32>) {
+    // 1. Coordonnées d'écran normalisées (-1 à 1) au centre du pixel
+    let ndc_x = (2.0 * (x + 0.5) / width) - 1.0;
+    let ndc_y = 1.0 - (2.0 * (y + 0.5) / height);
+
+    let aspect_ratio = width / height;
+    let fov_rad = (fov_degrees * std::f32::consts::PI) / 180.0;
+    let tan_half_fov = (fov_rad * 0.5).tan();
+
+    // 2. Direction du rayon dans l'espace local de la caméra
+    // La caméra regarde le long de son axe -Z local
+    let local_dir = Vector3::new(
+        ndc_x * aspect_ratio * tan_half_fov,
+        ndc_y * tan_half_fov,
+        -1.0,
+    );
+
+    // 3. Transformation par la matrice CameraToWorld
+    // transform_vector n'applique pas la translation (ce qu'on veut pour une direction)
+    let ray_dir = c2w.transform_vector(&local_dir).normalize();
+
+    // L'origine du rayon est la position de la caméra (la partie translation de la matrice)
+    let ray_origin = c2w.transform_point(&Point3::origin());
+
+    (ray_origin, ray_dir)
 }
 
 /// A stateless function that computes a sample for a pixel (x, y)
