@@ -7,6 +7,9 @@ pub use pcg32::*;
 mod scene;
 pub use scene::*;
 
+mod bvh;
+pub use bvh::*;
+
 mod tracer;
 pub use tracer::*;
 

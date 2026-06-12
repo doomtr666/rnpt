@@ -1,4 +1,4 @@
-use crate::{Camera, Color, ColorExt, Material, Pcg32, Ray, Scene, TriangleHit};
+use crate::{Bvh, BvhBuilder, Camera, Color, ColorExt, Material, Pcg32, Ray, Scene, TriangleHit};
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
 
 #[derive(Clone, Copy, Debug)]
@@ -32,61 +32,24 @@ pub struct PathTracerConfig {
 pub struct PathTracer {
     config: PathTracerConfig,
     cam2world: Transform3<f32>,
+    bvh: Bvh,
 }
 
 impl PathTracer {
     pub fn new(config: PathTracerConfig) -> Self {
         let cam2world = config.camera.compute_camera_to_world();
-        Self { config, cam2world }
+
+        let mut builder = BvhBuilder::new(&config.scene);
+
+        Self {
+            config,
+            cam2world,
+            bvh: builder.build(),
+        }
     }
 
-    fn trace_ray(&self, ray: &Ray) -> Option<(TriangleHit, u32, u32)> {
-        let mut closest_hit: Option<(TriangleHit, u32, u32)> = None; // (hit, mesh_index, triangle_index)
-        let mut t_max = ray.tmax;
-
-        let mut has_parent = vec![false; self.config.scene.nodes.len()];
-        for node in &self.config.scene.nodes {
-            for &child in &node.children {
-                if (child as usize) < has_parent.len() {
-                    has_parent[child as usize] = true;
-                }
-            }
-        }
-
-        let mut stack = Vec::new();
-        for (idx, &has_p) in has_parent.iter().enumerate() {
-            if !has_p {
-                stack.push((idx, Transform3::identity()));
-            }
-        }
-
-        while let Some((node_idx, parent_transform)) = stack.pop() {
-            let node = &self.config.scene.nodes[node_idx];
-            let world_transform = parent_transform * node.transform;
-
-            for &mesh_idx in &node.meshes {
-                let mesh = &self.config.scene.meshes[mesh_idx as usize];
-                for (tri_idx, tri) in mesh.triangles.iter().enumerate() {
-                    let v0 = world_transform.transform_point(&mesh.vertices[tri.v0 as usize]);
-                    let v1 = world_transform.transform_point(&mesh.vertices[tri.v1 as usize]);
-                    let v2 = world_transform.transform_point(&mesh.vertices[tri.v2 as usize]);
-
-                    let mut test_ray = ray.clone();
-                    test_ray.tmax = t_max;
-
-                    if let Some(hit) = test_ray.intersect_triangle(&v0, &v1, &v2) {
-                        t_max = hit.t;
-                        closest_hit = Some((hit, mesh_idx as u32, tri_idx as u32));
-                    }
-                }
-            }
-
-            for &child_idx in &node.children {
-                stack.push((child_idx as usize, world_transform));
-            }
-        }
-
-        closest_hit
+    fn trace_ray(&self, ray: &Ray) -> Option<crate::bvh::BvhHit> {
+        self.bvh.intersect(ray)
     }
 
     fn interpolate_normal(
@@ -306,17 +269,15 @@ impl PathTracer {
             };
 
             // Fetch surface data
-            let mesh = &self.config.scene.meshes[hit.1 as usize];
-            let mat = &self.config.scene.materials[mesh.material as usize];
-            let tri = &mesh.triangles[hit.2 as usize];
+            let mat = &self.config.scene.materials[hit.material as usize];
 
-            let n0 = mesh.normals[tri.v0 as usize];
-            let n1 = mesh.normals[tri.v1 as usize];
-            let n2 = mesh.normals[tri.v2 as usize];
+            let n0 = self.bvh.normals[hit.v0 as usize];
+            let n1 = self.bvh.normals[hit.v1 as usize];
+            let n2 = self.bvh.normals[hit.v2 as usize];
 
-            let normal = self.interpolate_normal(&n0, &n1, &n2, hit.0.u, hit.0.v);
+            let normal = self.interpolate_normal(&n0, &n1, &n2, hit.hit.u, hit.hit.v);
 
-            let hit_position = ray.at(hit.0.t);
+            let hit_position = ray.at(hit.hit.t);
 
             // ---------------------------------------------------------
             // STEP A: LOCAL RADIANCE (Direct view & Analytic Lights)

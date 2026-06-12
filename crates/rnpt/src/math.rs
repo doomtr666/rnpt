@@ -1,5 +1,6 @@
 use nalgebra::{Point3, UnitVector3};
 
+#[derive(Debug, Clone, Copy)]
 pub struct AABB {
     pub min: Point3<f32>,
     pub max: Point3<f32>,
@@ -8,6 +9,99 @@ pub struct AABB {
 impl AABB {
     pub fn new(min: Point3<f32>, max: Point3<f32>) -> Self {
         Self { min, max }
+    }
+
+    pub fn invalid() -> Self {
+        Self {
+            min: Point3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
+            max: Point3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+        }
+    }
+
+    pub fn extend(&mut self, point: Point3<f32>) {
+        self.min.x = self.min.x.min(point.x);
+        self.min.y = self.min.y.min(point.y);
+        self.min.z = self.min.z.min(point.z);
+
+        self.max.x = self.max.x.max(point.x);
+        self.max.y = self.max.y.max(point.y);
+        self.max.z = self.max.z.max(point.z);
+    }
+
+    pub fn contains(&self, point: Point3<f32>) -> bool {
+        point.x >= self.min.x
+            && point.x <= self.max.x
+            && point.y >= self.min.y
+            && point.y <= self.max.y
+            && point.z >= self.min.z
+            && point.z <= self.max.z
+    }
+
+    pub fn center(&self) -> Point3<f32> {
+        Point3::from((self.min.coords + self.max.coords) / 2.0)
+    }
+
+    // remap a point to [0, 1] based on the AABB extents
+    pub fn normalize(&self, v: Point3<f32>) -> Point3<f32> {
+        let extent = self.max - self.min;
+
+        // avoid division by 0
+        let ext_x = if extent.x > 0.0 { extent.x } else { 1.0 };
+        let ext_y = if extent.y > 0.0 { extent.y } else { 1.0 };
+        let ext_z = if extent.z > 0.0 { extent.z } else { 1.0 };
+
+        Point3::new(
+            (v.x - self.min.x) / ext_x,
+            (v.y - self.min.y) / ext_y,
+            (v.z - self.min.z) / ext_z,
+        )
+    }
+
+    /// Fast slab intersection method
+    pub fn intersect(&self, ray: &crate::Ray, current_t_max: f32) -> bool {
+        let mut tmin = ray.tmin;
+        let mut tmax = current_t_max;
+
+        // X axis
+        let inv_d = 1.0 / ray.direction.x;
+        let mut t0 = (self.min.x - ray.origin.x) * inv_d;
+        let mut t1 = (self.max.x - ray.origin.x) * inv_d;
+        if inv_d < 0.0 {
+            std::mem::swap(&mut t0, &mut t1);
+        }
+        tmin = tmin.max(t0);
+        tmax = tmax.min(t1);
+        if tmax < tmin {
+            return false;
+        }
+
+        // Y axis
+        let inv_d = 1.0 / ray.direction.y;
+        let mut t0 = (self.min.y - ray.origin.y) * inv_d;
+        let mut t1 = (self.max.y - ray.origin.y) * inv_d;
+        if inv_d < 0.0 {
+            std::mem::swap(&mut t0, &mut t1);
+        }
+        tmin = tmin.max(t0);
+        tmax = tmax.min(t1);
+        if tmax < tmin {
+            return false;
+        }
+
+        // Z axis
+        let inv_d = 1.0 / ray.direction.z;
+        let mut t0 = (self.min.z - ray.origin.z) * inv_d;
+        let mut t1 = (self.max.z - ray.origin.z) * inv_d;
+        if inv_d < 0.0 {
+            std::mem::swap(&mut t0, &mut t1);
+        }
+        tmin = tmin.max(t0);
+        tmax = tmax.min(t1);
+        if tmax < tmin {
+            return false;
+        }
+
+        true
     }
 }
 

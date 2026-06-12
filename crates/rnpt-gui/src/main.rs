@@ -114,6 +114,7 @@ impl RnptGuiApp {
             materials: vec![],
             lights: vec![],
             nodes: vec![],
+            roots: vec![],
             cameras: vec![],
         });
         let _ = cmd_tx.send(RenderCommand::Reset {
@@ -153,6 +154,7 @@ impl RnptGuiApp {
             materials: vec![],
             lights: vec![],
             nodes: vec![],
+            roots: vec![],
             cameras: vec![],
         });
         let _ = self.cmd_tx.send(RenderCommand::Reset {
@@ -610,6 +612,7 @@ fn run_renderer_thread(
         materials: vec![],
         lights: vec![],
         nodes: vec![],
+        roots: vec![],
         cameras: vec![],
     };
 
@@ -694,9 +697,9 @@ fn run_renderer_thread(
         let pass_rays = (width * height) as u64;
         rays_since_last_fps += pass_rays;
 
-        // Rate-limit updates to the GUI (e.g. 30 FPS / every 33 ms)
+        // Rate-limit updates to the GUI (e.g. 5 FPS / every 200 ms)
         let now = Instant::now();
-        if now.duration_since(last_update_time) >= Duration::from_millis(33) {
+        if now.duration_since(last_update_time) >= Duration::from_millis(200) {
             let elapsed_fps = now.duration_since(last_fps_time).as_secs_f64();
             if elapsed_fps >= 0.5 {
                 current_rays_per_sec = rays_since_last_fps as f64 / elapsed_fps;

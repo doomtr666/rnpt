@@ -70,7 +70,7 @@ pub struct Material {
     pub emissive: Color,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Triangle {
     pub v0: u32,
     pub v1: u32,
@@ -98,5 +98,6 @@ pub struct Scene {
     pub materials: Vec<Material>,
     pub lights: Vec<Light>,
     pub nodes: Vec<Node>,
+    pub roots: Vec<u32>,
     pub cameras: Vec<Camera>,
 }

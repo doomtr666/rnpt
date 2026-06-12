@@ -255,11 +255,15 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
         });
     }
 
+    // Extract roots
+    let roots = scene.nodes().map(|n| n.index() as u32).collect();
+
     Ok(Scene {
         meshes,
         materials,
         lights,
         nodes: nodes_list,
+        roots,
         cameras,
     })
 }
