@@ -5,6 +5,19 @@ use std::time::{Duration, Instant};
 
 mod asset_importer;
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum TonemapOperator {
+    Reinhard,
+    Aces,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum RenderView {
+    Combined,
+    Samples,
+    Variance,
+}
+
 enum RenderCommand {
     Reset {
         width: usize,
@@ -27,6 +40,8 @@ struct RnptGuiApp {
     camera: rnpt::Camera,
     resolution: [usize; 2],
     exposure: f32,
+    tonemapper: TonemapOperator,
+    view_mode: RenderView,
 
     cmd_tx: std::sync::mpsc::Sender<RenderCommand>,
     shared_state: Arc<Mutex<SharedRenderState>>,
@@ -38,6 +53,8 @@ struct RnptGuiApp {
 
     texture_handle: Option<egui::TextureHandle>,
     last_exposure: f32,
+    last_tonemapper: TonemapOperator,
+    last_view_mode: RenderView,
 
     // New fields
     asset_files: Vec<std::path::PathBuf>,
@@ -110,6 +127,8 @@ impl RnptGuiApp {
             camera,
             resolution: [width, height],
             exposure: 1.0,
+            tonemapper: TonemapOperator::Aces,
+            view_mode: RenderView::Combined,
             cmd_tx,
             shared_state,
             local_pixels: vec![rnpt::Pixel::default(); width * height],
@@ -118,6 +137,8 @@ impl RnptGuiApp {
             local_rays_per_sec: 0.0,
             texture_handle: None,
             last_exposure: 1.0,
+            last_tonemapper: TonemapOperator::Aces,
+            last_view_mode: RenderView::Combined,
             asset_files,
             selected_asset_index,
             current_scene,
@@ -178,10 +199,12 @@ impl eframe::App for RnptGuiApp {
 
         // 2. If pixels updated, or exposure changed, regenerate the texture
         let exposure_changed = self.exposure != self.last_exposure;
-        if pixels_updated || exposure_changed || self.texture_handle.is_none() {
+        let tonemapper_changed = self.tonemapper != self.last_tonemapper;
+        let view_mode_changed = self.view_mode != self.last_view_mode;
+        if pixels_updated || exposure_changed || tonemapper_changed || view_mode_changed || self.texture_handle.is_none() {
             let mut raw_rgba = vec![0u8; self.local_width * self.local_height * 4];
 
-            tonemap_and_convert(&self.local_pixels, self.exposure, &mut raw_rgba);
+            tonemap_and_convert(&self.local_pixels, self.exposure, self.tonemapper, self.view_mode, &mut raw_rgba);
 
             let color_image = egui::ColorImage::from_rgba_unmultiplied(
                 [self.local_width, self.local_height],
@@ -199,6 +222,8 @@ impl eframe::App for RnptGuiApp {
             }
 
             self.last_exposure = self.exposure;
+            self.last_tonemapper = self.tonemapper;
+            self.last_view_mode = self.view_mode;
         }
 
         // 3. UI Layout
@@ -321,18 +346,26 @@ impl eframe::App for RnptGuiApp {
                     if prev_auto_fit != self.auto_fit {
                         resolution_changed = true;
                     }
-                    
+
                     ui.add_space(4.0);
-                    
+
                     ui.add_enabled_ui(!self.auto_fit, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("W:");
-                            let r1 = ui.add(egui::DragValue::new(&mut self.resolution[0]).range(64..=2048));
+                            let r1 = ui.add(
+                                egui::DragValue::new(&mut self.resolution[0]).range(64..=2048),
+                            );
                             ui.label("H:");
-                            let r2 = ui.add(egui::DragValue::new(&mut self.resolution[1]).range(64..=2048));
+                            let r2 = ui.add(
+                                egui::DragValue::new(&mut self.resolution[1]).range(64..=2048),
+                            );
 
-                            let r1_changed_finished = r1.drag_stopped() || r1.lost_focus() || (r1.changed() && !r1.dragged());
-                            let r2_changed_finished = r2.drag_stopped() || r2.lost_focus() || (r2.changed() && !r2.dragged());
+                            let r1_changed_finished = r1.drag_stopped()
+                                || r1.lost_focus()
+                                || (r1.changed() && !r1.dragged());
+                            let r2_changed_finished = r2.drag_stopped()
+                                || r2.lost_focus()
+                                || (r2.changed() && !r2.dragged());
                             if r1_changed_finished || r2_changed_finished {
                                 resolution_changed = true;
                             }
@@ -352,6 +385,36 @@ impl eframe::App for RnptGuiApp {
                 ui.heading("Post-Processing");
                 ui.add_space(4.0);
                 ui.add(egui::Slider::new(&mut self.exposure, 0.1..=10.0).text("Exposure"));
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("View Mode:");
+                    egui::ComboBox::from_id_source("view_mode_selector")
+                        .selected_text(match self.view_mode {
+                            RenderView::Combined => "Combined",
+                            RenderView::Samples => "Samples Heatmap",
+                            RenderView::Variance => "Variance Map",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.view_mode, RenderView::Combined, "Combined");
+                            ui.selectable_value(&mut self.view_mode, RenderView::Samples, "Samples Heatmap");
+                            ui.selectable_value(&mut self.view_mode, RenderView::Variance, "Variance Map");
+                        });
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Tonemapper:");
+                    egui::ComboBox::from_id_source("tonemapper_selector")
+                        .selected_text(match self.tonemapper {
+                            TonemapOperator::Reinhard => "Reinhard",
+                            TonemapOperator::Aces => "ACES",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.tonemapper, TonemapOperator::Aces, "ACES");
+                            ui.selectable_value(&mut self.tonemapper, TonemapOperator::Reinhard, "Reinhard");
+                        });
+                });
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -374,7 +437,10 @@ impl eframe::App for RnptGuiApp {
                     total_samples as f64 / self.local_pixels.len() as f64
                 };
                 ui.label(format!("Samples/Pixel (avg): {:.1}", avg_samples));
-                ui.label(format!("Performance: {}", format_rays_per_sec(self.local_rays_per_sec)));
+                ui.label(format!(
+                    "Performance: {}",
+                    format_rays_per_sec(self.local_rays_per_sec)
+                ));
 
                 ui.add_space(6.0);
                 ui.collapsing("Scene Stats", |ui| {
@@ -437,7 +503,7 @@ impl eframe::App for RnptGuiApp {
     }
 }
 
-fn tonemap_and_convert(pixels: &[rnpt::Pixel], exposure: f32, output_rgba: &mut [u8]) {
+fn tonemap_and_convert(pixels: &[rnpt::Pixel], exposure: f32, operator: TonemapOperator, view_mode: RenderView, output_rgba: &mut [u8]) {
     use rayon::prelude::*;
 
     output_rgba
@@ -452,31 +518,72 @@ fn tonemap_and_convert(pixels: &[rnpt::Pixel], exposure: f32, output_rgba: &mut 
                 return;
             }
 
-            // Average radiance
-            let scale = 1.0 / pixel.samples as f32;
-            let r_linear = pixel.r * scale;
-            let g_linear = pixel.g * scale;
-            let b_linear = pixel.b * scale;
+            match view_mode {
+                RenderView::Combined => {
+                    // Average radiance
+                    let scale = 1.0 / pixel.samples as f32;
+                    let r_linear = pixel.accumulated_radiance[0] * scale;
+                    let g_linear = pixel.accumulated_radiance[1] * scale;
+                    let b_linear = pixel.accumulated_radiance[2] * scale;
 
-            // Exposure
-            let r_exp = r_linear * exposure;
-            let g_exp = g_linear * exposure;
-            let b_exp = b_linear * exposure;
+                    // Exposure
+                    let r_exp = r_linear * exposure;
+                    let g_exp = g_linear * exposure;
+                    let b_exp = b_linear * exposure;
 
-            // Reinhard tonemapping
-            let r_tone = r_exp / (r_exp + 1.0);
-            let g_tone = g_exp / (g_exp + 1.0);
-            let b_tone = b_exp / (b_exp + 1.0);
+                    // Tonemapping
+                    let (r_tone, g_tone, b_tone) = match operator {
+                        TonemapOperator::Reinhard => {
+                            (r_exp / (r_exp + 1.0), g_exp / (g_exp + 1.0), b_exp / (b_exp + 1.0))
+                        }
+                        TonemapOperator::Aces => {
+                            // Narkowicz ACES fit
+                            let a = 2.51f32;
+                            let b = 0.03f32;
+                            let c = 2.43f32;
+                            let d = 0.59f32;
+                            let e = 0.14f32;
+                            let aces = |v: f32| (v * (a * v + b)) / (v * (c * v + d) + e);
+                            (aces(r_exp), aces(g_exp), aces(b_exp))
+                        }
+                    };
 
-            // Gamma correction (gamma = 2.2)
-            let r_gamma = r_tone.powf(1.0 / 2.2);
-            let g_gamma = g_tone.powf(1.0 / 2.2);
-            let b_gamma = b_tone.powf(1.0 / 2.2);
+                    // Gamma correction (gamma = 2.2)
+                    let r_gamma = r_tone.powf(1.0 / 2.2);
+                    let g_gamma = g_tone.powf(1.0 / 2.2);
+                    let b_gamma = b_tone.powf(1.0 / 2.2);
 
-            rgba[0] = (r_gamma.clamp(0.0, 1.0) * 255.0) as u8;
-            rgba[1] = (g_gamma.clamp(0.0, 1.0) * 255.0) as u8;
-            rgba[2] = (b_gamma.clamp(0.0, 1.0) * 255.0) as u8;
-            rgba[3] = 255;
+                    rgba[0] = (r_gamma.clamp(0.0, 1.0) * 255.0) as u8;
+                    rgba[1] = (g_gamma.clamp(0.0, 1.0) * 255.0) as u8;
+                    rgba[2] = (b_gamma.clamp(0.0, 1.0) * 255.0) as u8;
+                    rgba[3] = 255;
+                }
+                RenderView::Samples => {
+                    // Heatmap from Blue (few samples) to Red (many samples)
+                    let max_samples = 512.0; // Base reference
+                    let v = (pixel.samples as f32 / max_samples).clamp(0.0, 1.0);
+                    let r = v;
+                    let g = 1.0 - (v - 0.5).abs() * 2.0;
+                    let b = 1.0 - v;
+                    
+                    rgba[0] = (r.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8;
+                    rgba[1] = (g.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8;
+                    rgba[2] = (b.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8;
+                    rgba[3] = 255;
+                }
+                RenderView::Variance => {
+                    let mut var = 0.0;
+                    if pixel.samples > 1 {
+                        var = pixel.m2_luminance / (pixel.samples as f32 - 1.0);
+                    }
+                    // Scale variance for visualization (variance is usually small)
+                    let v = (var * 50.0).clamp(0.0, 1.0);
+                    rgba[0] = (v.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8;
+                    rgba[1] = (v.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8;
+                    rgba[2] = (v.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8;
+                    rgba[3] = 255;
+                }
+            }
         });
 }
 

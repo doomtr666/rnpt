@@ -1,5 +1,5 @@
-use nalgebra::{Matrix4, Point3, Transform3, Vector3};
-use rnpt::{Camera, Light, LightType, Material, Mesh, Node, Scene, Triangle};
+use nalgebra::{Matrix4, Point3, Transform3, UnitVector3, Vector3};
+use rnpt::{Camera, Color, Light, LightType, Material, Mesh, Node, Scene, Triangle};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -52,10 +52,15 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
     for (_idx, mat) in document.materials().enumerate() {
         let pbr = mat.pbr_metallic_roughness();
         let base_color = pbr.base_color_factor(); // [f32; 4]
-        let emissive = mat.emissive_factor(); // [f32; 3]
+        let emissive_color = mat.emissive_factor(); // [f32; 3]
+        // Extract strength from KHR_materials_emissive_strength if available
+        let emissive_strength = mat.emissive_strength().unwrap_or(1.0);
+
+        let mut emissive = Color::from(emissive_color);
+        emissive *= emissive_strength;
 
         materials.push(Material {
-            albedo: [base_color[0], base_color[1], base_color[2]],
+            albedo: Color::from([base_color[0], base_color[1], base_color[2]]),
             emissive,
         });
     }
@@ -64,8 +69,11 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
     // In glTF, a single Mesh can contain multiple Primitives. Since each Primitive
     // can have a different material, we split them into individual rnpt::Mesh instances.
     let mut meshes = Vec::new();
+    let mut gltf_mesh_to_rnpt_meshes = Vec::new();
     for mesh in document.meshes() {
+        let mut rnpt_mesh_indices = Vec::new();
         for primitive in mesh.primitives() {
+            rnpt_mesh_indices.push(meshes.len() as u32);
             let mut vertices = Vec::new();
             let mut normals = Vec::new();
             let mut triangles = Vec::new();
@@ -83,7 +91,9 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
             // Read normals
             if let Some(norm_iter) = reader.read_normals() {
                 for norm in norm_iter {
-                    normals.push(Vector3::new(norm[0], norm[1], norm[2]));
+                    normals.push(UnitVector3::new_normalize(Vector3::new(
+                        norm[0], norm[1], norm[2],
+                    )));
                 }
             }
 
@@ -111,6 +121,7 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
                 material: material_idx,
             });
         }
+        gltf_mesh_to_rnpt_meshes.push(rnpt_mesh_indices);
     }
 
     // 3. Load Nodes, Cameras and Lights
@@ -177,11 +188,17 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
                 gltf::khr_lights_punctual::Kind::Spot { .. } => LightType::Spot,
             };
 
+            // Convert glTF intensity (Candelas/Lux) back to Blender's intuitive Watts/Strength
+            let intensity = match light_type {
+                LightType::Directional => gltf_light.intensity() / 683.0,
+                _ => gltf_light.intensity() / (683.0 / (4.0 * std::f32::consts::PI)),
+            };
+
             lights.push(Light {
                 position: pos,
                 direction: dir,
-                color: gltf_light.color(),
-                intensity: gltf_light.intensity(),
+                color: Color::from(gltf_light.color()),
+                intensity,
                 light_type,
             });
         }
@@ -216,12 +233,16 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
         let m = gltf_matrix_to_nalgebra(matrix);
         let transform = Transform3::from_matrix_unchecked(m);
         let children = node.children().map(|c| c.index() as u32).collect();
-        let mesh = node.mesh().map(|m| m.index() as u32);
+
+        let mut node_meshes = Vec::new();
+        if let Some(m) = node.mesh() {
+            node_meshes = gltf_mesh_to_rnpt_meshes[m.index()].clone();
+        }
 
         nodes_list.push(Node {
             transform,
             children,
-            mesh,
+            meshes: node_meshes,
         });
     }
 
