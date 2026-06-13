@@ -4,11 +4,30 @@ use crate::{AABB, Scene};
 use nalgebra::{Point3, Transform3, UnitVector3};
 
 pub struct FlatTriangle {
-    v0: u32,
-    v1: u32,
-    v2: u32,
-    material: u32,
-    morton_code: u64,
+    pub v0: u32,
+    pub v1: u32,
+    pub v2: u32,
+    pub material: u32,
+}
+
+#[repr(C, align(32))]
+#[derive(Clone, Copy)]
+pub struct FlatTriangles {
+    pub v0_x: [f32; 8], pub v0_y: [f32; 8], pub v0_z: [f32; 8],
+    pub e1_x: [f32; 8], pub e1_y: [f32; 8], pub e1_z: [f32; 8],
+    pub e2_x: [f32; 8], pub e2_y: [f32; 8], pub e2_z: [f32; 8],
+    pub first_triangle_idx: u32,
+}
+
+impl Default for FlatTriangles {
+    fn default() -> Self {
+        Self {
+            v0_x: [0.0; 8], v0_y: [0.0; 8], v0_z: [0.0; 8],
+            e1_x: [0.0; 8], e1_y: [0.0; 8], e1_z: [0.0; 8],
+            e2_x: [0.0; 8], e2_y: [0.0; 8], e2_z: [0.0; 8],
+            first_triangle_idx: 0,
+        }
+    }
 }
 
 pub struct BvhBuilder {
@@ -43,17 +62,19 @@ impl BvhBuilder {
             world_aabb.extend(vertex);
         }
 
-        // compute morton conde for each flat triangle
-        for flat_tri in &mut self.flat_triangles {
+        let vertices = &self.world_vertices;
+        
+        // sort by calculating morton code on the fly with cached keys
+        self.flat_triangles.sort_by_cached_key(|flat_tri| {
             let v0_idx = flat_tri.v0 as usize;
             let v1_idx = flat_tri.v1 as usize;
             let v2_idx = flat_tri.v2 as usize;
 
             // compute centroid
             let mut centroid = Point3::from(
-                (self.world_vertices[v0_idx].coords
-                    + self.world_vertices[v1_idx].coords
-                    + self.world_vertices[v2_idx].coords)
+                (vertices[v0_idx].coords
+                    + vertices[v1_idx].coords
+                    + vertices[v2_idx].coords)
                     / 3.0,
             );
 
@@ -61,13 +82,8 @@ impl BvhBuilder {
             centroid = world_aabb.normalize(centroid);
 
             // compute morton code
-            let morton_code = Self::morton_3d(centroid.x, centroid.y, centroid.z);
-
-            flat_tri.morton_code = morton_code;
-        }
-
-        // sort
-        self.flat_triangles.sort_by_key(|a| a.morton_code);
+            Self::morton_3d(centroid.x, centroid.y, centroid.z)
+        });
     }
 
     fn flatten_scene(&mut self, scene: &Scene) {
@@ -116,16 +132,16 @@ impl BvhBuilder {
                         })
                     };
 
-                    let v0_idx = get_or_add_vertex(tri.v0);
-                    let v1_idx = get_or_add_vertex(tri.v1);
-                    let v2_idx = get_or_add_vertex(tri.v2);
+                    let new_v0 = get_or_add_vertex(tri.v0) as u32;
+                    let new_v1 = get_or_add_vertex(tri.v1) as u32;
+                    let new_v2 = get_or_add_vertex(tri.v2) as u32;
+                    let m_idx = mesh.material;
 
                     self.flat_triangles.push(FlatTriangle {
-                        v0: v0_idx as u32,
-                        v1: v1_idx as u32,
-                        v2: v2_idx as u32,
-                        material: mesh.material,
-                        morton_code: 0,
+                        v0: new_v0,
+                        v1: new_v1,
+                        v2: new_v2,
+                        material: m_idx,
                     });
                 }
             }
@@ -156,11 +172,40 @@ impl BvhBuilder {
             self.subdivide(0, &mut nodes);
         }
 
+        let mut soa_chunks = Vec::new();
+        for node in &mut nodes {
+            if node.is_leaf() {
+                let first = node.left_first as usize;
+                let count = node.tri_count as usize;
+                
+                let mut soa = FlatTriangles::default();
+                soa.first_triangle_idx = first as u32;
+                
+                for i in 0..count {
+                    let tri = &self.flat_triangles[first + i];
+                    let v0 = self.world_vertices[tri.v0 as usize];
+                    let v1 = self.world_vertices[tri.v1 as usize];
+                    let v2 = self.world_vertices[tri.v2 as usize];
+                    let e1 = v1 - v0;
+                    let e2 = v2 - v0;
+                    soa.v0_x[i] = v0.x; soa.v0_y[i] = v0.y; soa.v0_z[i] = v0.z;
+                    soa.e1_x[i] = e1.x; soa.e1_y[i] = e1.y; soa.e1_z[i] = e1.z;
+                    soa.e2_x[i] = e2.x; soa.e2_y[i] = e2.y; soa.e2_z[i] = e2.z;
+                }
+                
+                node.left_first = soa_chunks.len() as u32;
+                // node.tri_count remains > 0 to identify it as a leaf.
+                // We don't change tri_count because the SIMD mask inherently ignores padded zero triangles.
+                soa_chunks.push(soa);
+            }
+        }
+
         Bvh {
             nodes,
             vertices: self.world_vertices,
             normals: self.world_normals,
             triangles: self.flat_triangles,
+            soa_chunks,
         }
     }
 
@@ -189,7 +234,7 @@ impl BvhBuilder {
 
     fn subdivide(&mut self, node_idx: usize, nodes: &mut Vec<BvhNode>) {
         let node = &nodes[node_idx];
-        if node.tri_count <= 2 {
+        if node.tri_count <= 8 {
             return;
         }
 
@@ -277,6 +322,7 @@ pub struct Bvh {
     pub vertices: Vec<Point3<f32>>,
     pub normals: Vec<UnitVector3<f32>>,
     pub triangles: Vec<FlatTriangle>,
+    pub soa_chunks: Vec<FlatTriangles>,
 }
 
 impl Bvh {
@@ -309,28 +355,21 @@ impl Bvh {
             let node = &self.nodes[node_idx];
 
             if node.is_leaf() {
-                let first = node.left_first as usize;
-                let count = node.tri_count as usize;
+                let chunk_idx = node.left_first as usize;
+                let chunk = &self.soa_chunks[chunk_idx];
 
-                for i in 0..count {
-                    let tri = &self.triangles[first + i];
-                    let v0 = self.vertices[tri.v0 as usize];
-                    let v1 = self.vertices[tri.v1 as usize];
-                    let v2 = self.vertices[tri.v2 as usize];
-
-                    let mut test_ray = ray.clone();
-                    test_ray.tmax = t_max;
-
-                    if let Some(hit) = test_ray.intersect_triangle(&v0, &v1, &v2) {
-                        t_max = hit.t;
-                        closest_hit = Some(BvhHit {
-                            hit,
-                            material: tri.material,
-                            v0: tri.v0,
-                            v1: tri.v1,
-                            v2: tri.v2,
-                        });
-                    }
+                if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
+                    t_max = simd_hit.hit.t;
+                    let tri_global_idx = chunk.first_triangle_idx as usize + simd_hit.lane;
+                    let tri = &self.triangles[tri_global_idx];
+                    
+                    closest_hit = Some(BvhHit {
+                        hit: simd_hit.hit,
+                        material: tri.material,
+                        v0: tri.v0,
+                        v1: tri.v1,
+                        v2: tri.v2,
+                    });
                 }
             } else {
                 if stack_ptr + 1 < 64 {
@@ -338,7 +377,7 @@ impl Bvh {
                     let right_idx = left_idx + 1;
                     let t_left_opt = ray.intersect_aabb(&self.nodes[left_idx].aabb, t_max);
                     let t_right_opt = ray.intersect_aabb(&self.nodes[right_idx].aabb, t_max);
-                    
+
                     match (t_left_opt, t_right_opt) {
                         (Some(t_left), Some(t_right)) => {
                             // Les deux boîtes sont touchées par le rayon.

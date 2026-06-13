@@ -1,4 +1,4 @@
-use crate::{Bvh, BvhBuilder, Camera, Color, ColorExt, Material, Pcg32, Ray, Scene, TriangleHit};
+use crate::{Bvh, BvhBuilder, Camera, Color, ColorExt, Material, Pcg32, Ray, Scene};
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
 
 #[derive(Clone, Copy, Debug)]
@@ -115,14 +115,6 @@ impl PathTracer {
         let ray_origin = self.cam2world.transform_point(&Point3::origin());
 
         Ray::new(ray_origin, UnitVector3::new_normalize(ray_dir))
-        /*
-        Ray {
-            origin: ray_origin,
-            direction: UnitVector3::new_normalize(ray_dir),
-            tmin: 0.0f32,
-            tmax: f32::INFINITY,
-        }
-        */
     }
 
     /// Samples the hemisphere uniformly.
