@@ -42,6 +42,23 @@ impl AABB {
         Point3::from((self.min.coords + self.max.coords) / 2.0)
     }
 
+    pub fn extend_aabb(&mut self, other: &AABB) {
+        self.min.x = self.min.x.min(other.min.x);
+        self.min.y = self.min.y.min(other.min.y);
+        self.min.z = self.min.z.min(other.min.z);
+        self.max.x = self.max.x.max(other.max.x);
+        self.max.y = self.max.y.max(other.max.y);
+        self.max.z = self.max.z.max(other.max.z);
+    }
+
+    pub fn surface_area(&self) -> f32 {
+        let extent = self.max - self.min;
+        if extent.x <= 0.0 || extent.y <= 0.0 || extent.z <= 0.0 {
+            return 0.0;
+        }
+        2.0 * (extent.x * extent.y + extent.y * extent.z + extent.z * extent.x)
+    }
+
     // remap a point to [0, 1] based on the AABB extents
     pub fn normalize(&self, v: Point3<f32>) -> Point3<f32> {
         let extent = self.max - self.min;

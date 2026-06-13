@@ -203,10 +203,21 @@ impl eframe::App for RnptGuiApp {
         let exposure_changed = self.exposure != self.last_exposure;
         let tonemapper_changed = self.tonemapper != self.last_tonemapper;
         let view_mode_changed = self.view_mode != self.last_view_mode;
-        if pixels_updated || exposure_changed || tonemapper_changed || view_mode_changed || self.texture_handle.is_none() {
+        if pixels_updated
+            || exposure_changed
+            || tonemapper_changed
+            || view_mode_changed
+            || self.texture_handle.is_none()
+        {
             let mut raw_rgba = vec![0u8; self.local_width * self.local_height * 4];
 
-            tonemap_and_convert(&self.local_pixels, self.exposure, self.tonemapper, self.view_mode, &mut raw_rgba);
+            tonemap_and_convert(
+                &self.local_pixels,
+                self.exposure,
+                self.tonemapper,
+                self.view_mode,
+                &mut raw_rgba,
+            );
 
             let color_image = egui::ColorImage::from_rgba_unmultiplied(
                 [self.local_width, self.local_height],
@@ -398,9 +409,21 @@ impl eframe::App for RnptGuiApp {
                             RenderView::Variance => "Variance Map",
                         })
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.view_mode, RenderView::Combined, "Combined");
-                            ui.selectable_value(&mut self.view_mode, RenderView::Samples, "Samples Heatmap");
-                            ui.selectable_value(&mut self.view_mode, RenderView::Variance, "Variance Map");
+                            ui.selectable_value(
+                                &mut self.view_mode,
+                                RenderView::Combined,
+                                "Combined",
+                            );
+                            ui.selectable_value(
+                                &mut self.view_mode,
+                                RenderView::Samples,
+                                "Samples Heatmap",
+                            );
+                            ui.selectable_value(
+                                &mut self.view_mode,
+                                RenderView::Variance,
+                                "Variance Map",
+                            );
                         });
                 });
 
@@ -413,8 +436,16 @@ impl eframe::App for RnptGuiApp {
                             TonemapOperator::Aces => "ACES",
                         })
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.tonemapper, TonemapOperator::Aces, "ACES");
-                            ui.selectable_value(&mut self.tonemapper, TonemapOperator::Reinhard, "Reinhard");
+                            ui.selectable_value(
+                                &mut self.tonemapper,
+                                TonemapOperator::Aces,
+                                "ACES",
+                            );
+                            ui.selectable_value(
+                                &mut self.tonemapper,
+                                TonemapOperator::Reinhard,
+                                "Reinhard",
+                            );
                         });
                 });
 
@@ -505,7 +536,13 @@ impl eframe::App for RnptGuiApp {
     }
 }
 
-fn tonemap_and_convert(pixels: &[rnpt::Pixel], exposure: f32, operator: TonemapOperator, view_mode: RenderView, output_rgba: &mut [u8]) {
+fn tonemap_and_convert(
+    pixels: &[rnpt::Pixel],
+    exposure: f32,
+    operator: TonemapOperator,
+    view_mode: RenderView,
+    output_rgba: &mut [u8],
+) {
     use rayon::prelude::*;
 
     output_rgba
@@ -535,9 +572,11 @@ fn tonemap_and_convert(pixels: &[rnpt::Pixel], exposure: f32, operator: TonemapO
 
                     // Tonemapping
                     let (r_tone, g_tone, b_tone) = match operator {
-                        TonemapOperator::Reinhard => {
-                            (r_exp / (r_exp + 1.0), g_exp / (g_exp + 1.0), b_exp / (b_exp + 1.0))
-                        }
+                        TonemapOperator::Reinhard => (
+                            r_exp / (r_exp + 1.0),
+                            g_exp / (g_exp + 1.0),
+                            b_exp / (b_exp + 1.0),
+                        ),
                         TonemapOperator::Aces => {
                             // Narkowicz ACES fit
                             let a = 2.51f32;
@@ -567,7 +606,7 @@ fn tonemap_and_convert(pixels: &[rnpt::Pixel], exposure: f32, operator: TonemapO
                     let r = v;
                     let g = 1.0 - (v - 0.5).abs() * 2.0;
                     let b = 1.0 - v;
-                    
+
                     rgba[0] = (r.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8;
                     rgba[1] = (g.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8;
                     rgba[2] = (b.powf(1.0 / 2.2).clamp(0.0, 1.0) * 255.0) as u8;
@@ -686,15 +725,18 @@ fn run_renderer_thread(
             continue;
         }
 
-        // Perform one sample pass over the whole image
+        // Perform multiple samples per frame to saturate the CPU at lower resolutions
+        let samples_per_frame = 1;
         use rayon::prelude::*;
         pixels.par_iter_mut().enumerate().for_each(|(idx, pixel)| {
             let x = idx % width;
             let y = idx / width;
-            path_tracer.sample_pixel(x, y, pixel);
+            for _ in 0..samples_per_frame {
+                path_tracer.sample_pixel(x, y, pixel);
+            }
         });
 
-        let pass_rays = (width * height) as u64;
+        let pass_rays = (width * height * samples_per_frame) as u64;
         rays_since_last_fps += pass_rays;
 
         // Rate-limit updates to the GUI (e.g. 5 FPS / every 200 ms)
