@@ -288,19 +288,25 @@ impl Bvh {
             return None;
         }
 
-        let mut stack = [0usize; 64];
+        let mut stack = [(0usize, 0.0f32); 64];
         let mut stack_ptr = 0;
-        stack[stack_ptr] = 0;
+
+        let root_t = ray.intersect_aabb(&self.nodes[0].aabb, t_max);
+        let Some(root_t) = root_t else {
+            return None;
+        };
+        stack[stack_ptr] = (0, root_t);
         stack_ptr += 1;
 
         while stack_ptr > 0 {
             stack_ptr -= 1;
-            let node_idx = stack[stack_ptr];
-            let node = &self.nodes[node_idx];
+            let (node_idx, node_t) = stack[stack_ptr];
 
-            if !node.aabb.intersect(ray, t_max) {
+            if node_t >= t_max {
                 continue;
             }
+
+            let node = &self.nodes[node_idx];
 
             if node.is_leaf() {
                 let first = node.left_first as usize;
@@ -328,11 +334,35 @@ impl Bvh {
                 }
             } else {
                 if stack_ptr + 1 < 64 {
-                    // Empiler les deux enfants
-                    // TODO: Optimisation (empiler le plus proche en dernier)
-                    stack[stack_ptr] = node.left_first as usize;
-                    stack[stack_ptr + 1] = node.left_first as usize + 1;
-                    stack_ptr += 2;
+                    let left_idx = node.left_first as usize;
+                    let right_idx = left_idx + 1;
+                    let t_left_opt = ray.intersect_aabb(&self.nodes[left_idx].aabb, t_max);
+                    let t_right_opt = ray.intersect_aabb(&self.nodes[right_idx].aabb, t_max);
+                    
+                    match (t_left_opt, t_right_opt) {
+                        (Some(t_left), Some(t_right)) => {
+                            // Les deux boîtes sont touchées par le rayon.
+                            // ORDRE FRONT-TO-BACK : On empile la plus lointaine d'abord.
+                            // Ainsi, la plus proche se retrouve au sommet de la pile et sera dépilée en premier !
+                            if t_left < t_right {
+                                stack[stack_ptr] = (right_idx, t_right);
+                                stack[stack_ptr + 1] = (left_idx, t_left);
+                            } else {
+                                stack[stack_ptr] = (left_idx, t_left);
+                                stack[stack_ptr + 1] = (right_idx, t_right);
+                            }
+                            stack_ptr += 2;
+                        }
+                        (Some(t_left), None) => {
+                            stack[stack_ptr] = (left_idx, t_left);
+                            stack_ptr += 1;
+                        }
+                        (None, Some(t_right)) => {
+                            stack[stack_ptr] = (right_idx, t_right);
+                            stack_ptr += 1;
+                        }
+                        (None, None) => {}
+                    }
                 }
             }
         }

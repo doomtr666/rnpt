@@ -57,52 +57,6 @@ impl AABB {
         )
     }
 
-    /// Fast slab intersection method
-    pub fn intersect(&self, ray: &crate::Ray, current_t_max: f32) -> bool {
-        let mut tmin = ray.tmin;
-        let mut tmax = current_t_max;
-
-        // X axis
-        let inv_d = 1.0 / ray.direction.x;
-        let mut t0 = (self.min.x - ray.origin.x) * inv_d;
-        let mut t1 = (self.max.x - ray.origin.x) * inv_d;
-        if inv_d < 0.0 {
-            std::mem::swap(&mut t0, &mut t1);
-        }
-        tmin = tmin.max(t0);
-        tmax = tmax.min(t1);
-        if tmax < tmin {
-            return false;
-        }
-
-        // Y axis
-        let inv_d = 1.0 / ray.direction.y;
-        let mut t0 = (self.min.y - ray.origin.y) * inv_d;
-        let mut t1 = (self.max.y - ray.origin.y) * inv_d;
-        if inv_d < 0.0 {
-            std::mem::swap(&mut t0, &mut t1);
-        }
-        tmin = tmin.max(t0);
-        tmax = tmax.min(t1);
-        if tmax < tmin {
-            return false;
-        }
-
-        // Z axis
-        let inv_d = 1.0 / ray.direction.z;
-        let mut t0 = (self.min.z - ray.origin.z) * inv_d;
-        let mut t1 = (self.max.z - ray.origin.z) * inv_d;
-        if inv_d < 0.0 {
-            std::mem::swap(&mut t0, &mut t1);
-        }
-        tmin = tmin.max(t0);
-        tmax = tmax.min(t1);
-        if tmax < tmin {
-            return false;
-        }
-
-        true
-    }
 }
 
 pub struct TriangleHit {
@@ -143,17 +97,45 @@ impl Ray {
         }
     }
 
-    /// Slab method (Kay & Kajiya). Returns true if the ray intersects the AABB
-    /// within [ray.tmin, ray.tmax].
-    pub fn intersect_box(&self, box_min: &Point3<f32>, box_max: &Point3<f32>) -> bool {
-        let inv_dir = self.direction.map(|c| 1.0 / c);
-        let t1 = (box_min - self.origin).component_mul(&inv_dir);
-        let t2 = (box_max - self.origin).component_mul(&inv_dir);
+    /// Fast slab intersection method. Returns the distance `t` to the intersection, or `None` if miss.
+    pub fn intersect_aabb(&self, aabb: &AABB, current_t_max: f32) -> Option<f32> {
+        let mut tmin = self.tmin;
+        let mut tmax = current_t_max;
 
-        let tenter = t1.zip_map(&t2, f32::min).max();
-        let texit = t1.zip_map(&t2, f32::max).min();
+        // X axis
+        let inv_d = 1.0 / self.direction.x;
+        let mut t0 = (aabb.min.x - self.origin.x) * inv_d;
+        let mut t1 = (aabb.max.x - self.origin.x) * inv_d;
+        if inv_d < 0.0 {
+            std::mem::swap(&mut t0, &mut t1);
+        }
+        tmin = if t0 > tmin { t0 } else { tmin };
+        tmax = if t1 < tmax { t1 } else { tmax };
+        if tmax < tmin { return None; }
 
-        tenter <= texit && texit >= self.tmin && tenter <= self.tmax
+        // Y axis
+        let inv_d = 1.0 / self.direction.y;
+        let mut t0 = (aabb.min.y - self.origin.y) * inv_d;
+        let mut t1 = (aabb.max.y - self.origin.y) * inv_d;
+        if inv_d < 0.0 {
+            std::mem::swap(&mut t0, &mut t1);
+        }
+        tmin = if t0 > tmin { t0 } else { tmin };
+        tmax = if t1 < tmax { t1 } else { tmax };
+        if tmax < tmin { return None; }
+
+        // Z axis
+        let inv_d = 1.0 / self.direction.z;
+        let mut t0 = (aabb.min.z - self.origin.z) * inv_d;
+        let mut t1 = (aabb.max.z - self.origin.z) * inv_d;
+        if inv_d < 0.0 {
+            std::mem::swap(&mut t0, &mut t1);
+        }
+        tmin = if t0 > tmin { t0 } else { tmin };
+        tmax = if t1 < tmax { t1 } else { tmax };
+        if tmax < tmin { return None; }
+
+        Some(tmin)
     }
 
     /// Möller–Trumbore algorithm.

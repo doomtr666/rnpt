@@ -39,7 +39,7 @@ impl PathTracer {
     pub fn new(config: PathTracerConfig) -> Self {
         let cam2world = config.camera.compute_camera_to_world();
 
-        let mut builder = BvhBuilder::new(&config.scene);
+        let builder = BvhBuilder::new(&config.scene);
 
         Self {
             config,
@@ -114,12 +114,15 @@ impl PathTracer {
         // L'origine du rayon est la position de la caméra (la partie translation de la matrice)
         let ray_origin = self.cam2world.transform_point(&Point3::origin());
 
+        Ray::new(ray_origin, UnitVector3::new_normalize(ray_dir))
+        /*
         Ray {
             origin: ray_origin,
             direction: UnitVector3::new_normalize(ray_dir),
             tmin: 0.0f32,
             tmax: f32::INFINITY,
         }
+        */
     }
 
     /// Samples the hemisphere uniformly.
@@ -224,12 +227,12 @@ impl PathTracer {
             // 4. Setup the Shadow Ray to query visibility
             // Self-intersection prevention: offset origin along the normal by 0.001
             // Overshoot prevention: reduce tmax by 0.001 to avoid hitting the light geometry itself
-            let shadow_ray = Ray {
-                origin: hit_position + normal.into_inner() * 0.001,
-                direction: light_dir,
-                tmin: 0.0,
-                tmax: distance - 0.001,
-            };
+            let shadow_ray = Ray::new_with_minmax(
+                hit_position + normal.into_inner() * 0.001,
+                light_dir,
+                0.0,
+                distance - 0.001,
+            );
 
             // 5. Ray visibility query
             if self.trace_ray(&shadow_ray).is_none() {
@@ -325,12 +328,10 @@ impl PathTracer {
 
             // Setup the secondary ray for the next loop iteration
             // Offset origin along the normal to prevent self-intersection
-            ray = Ray {
-                origin: hit_position + normal.into_inner() * 0.001,
-                direction: UnitVector3::new_unchecked(next_dir),
-                tmin: 0.0,
-                tmax: f32::INFINITY,
-            };
+            ray = Ray::new(
+                hit_position + normal.into_inner() * 0.001,
+                UnitVector3::new_unchecked(next_dir),
+            );
 
             // Russian Roulette to terminate paths that carry no energy
             if bounce > 3 {
@@ -354,9 +355,9 @@ impl PathTracer {
     /// This function is thread-safe as long as distinct threads operate
     /// on distinct pixel references.
     pub fn sample_pixel(&self, x: usize, y: usize, pixel: &mut Pixel) {
-        if pixel.converged {
-            return;
-        }
+        //if pixel.converged {
+        //    return;
+        //}
 
         let mut rng = self.init_pixel_rng(x as u32, y as u32, pixel.samples);
         let ray = self.generate_ray(&mut rng, x as f32, y as f32);
@@ -365,32 +366,33 @@ impl PathTracer {
 
         pixel.accumulated_radiance += sample_color;
         pixel.samples += 1;
+        /*
+                // 1. Compute luminance of the current sample (ITU-R BT.709 weights)
+                let luminance = sample_color.x * 0.2126 + sample_color.y * 0.7152 + sample_color.z * 0.0722;
 
-        // 1. Compute luminance of the current sample (ITU-R BT.709 weights)
-        let luminance = sample_color.x * 0.2126 + sample_color.y * 0.7152 + sample_color.z * 0.0722;
+                // 2. Online update of variance using Welford's algorithm
+                let n = pixel.samples as f32;
+                let delta = luminance - pixel.mean_luminance;
+                pixel.mean_luminance += delta / n;
+                let delta2 = luminance - pixel.mean_luminance;
+                pixel.m2_luminance += delta * delta2;
 
-        // 2. Online update of variance using Welford's algorithm
-        let n = pixel.samples as f32;
-        let delta = luminance - pixel.mean_luminance;
-        pixel.mean_luminance += delta / n;
-        let delta2 = luminance - pixel.mean_luminance;
-        pixel.m2_luminance += delta * delta2;
+                // 3. Statistical test for convergence (only after a baseline of samples)
+                if pixel.samples >= 64 {
+                    let variance = pixel.m2_luminance / (n - 1.0);
+                    let std_dev = variance.max(0.0).sqrt();
 
-        // 3. Statistical test for convergence (only after a baseline of samples)
-        if pixel.samples >= 64 {
-            let variance = pixel.m2_luminance / (n - 1.0);
-            let std_dev = variance.max(0.0).sqrt();
+                    // Standard error of the mean using a 95% confidence interval (z = 1.96)
+                    let error = 1.96 * std_dev / n.sqrt();
 
-            // Standard error of the mean using a 95% confidence interval (z = 1.96)
-            let error = 1.96 * std_dev / n.sqrt();
+                    // Target threshold: 2% of the running mean + a small absolute epsilon
+                    // The epsilon prevents the test from stalling in pure pitch-black shadow zones
+                    let threshold = 0.02 * pixel.mean_luminance + 0.001;
 
-            // Target threshold: 2% of the running mean + a small absolute epsilon
-            // The epsilon prevents the test from stalling in pure pitch-black shadow zones
-            let threshold = 0.02 * pixel.mean_luminance + 0.001;
-
-            if error < threshold {
-                pixel.converged = true;
-            }
-        }
+                    if error < threshold {
+                        pixel.converged = true;
+                    }
+                }
+        */
     }
 }
