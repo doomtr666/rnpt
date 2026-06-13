@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use crate::{Bvh, BvhBuilder, Camera, Color, ColorExt, Material, Pcg32, Ray, Scene};
+use crate::{Bvh, Camera, Color, ColorExt, Pcg32, Ray, Scene};
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
 
 #[derive(Clone, Copy, Debug)]
@@ -256,14 +256,13 @@ impl PathTracer {
 
             let has_textures = mat.albedo_texture.is_some() || mat.emissive_texture.is_some();
             let mut hit_uv = nalgebra::Vector2::zeros();
-            let mut vertex_color = Color::new(1.0, 1.0, 1.0);
             
             let w = 1.0 - hit.hit.u - hit.hit.v;
             
             let c0 = self.config.bvh.colors[hit.v0 as usize];
             let c1 = self.config.bvh.colors[hit.v1 as usize];
             let c2 = self.config.bvh.colors[hit.v2 as usize];
-            vertex_color = c0 * w + c1 * hit.hit.u + c2 * hit.hit.v;
+            let vertex_color = c0 * w + c1 * hit.hit.u + c2 * hit.hit.v;
 
             if has_textures {
                 let uv0 = self.config.bvh.uvs[hit.v0 as usize];

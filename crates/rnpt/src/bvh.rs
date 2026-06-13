@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{AABB, Scene};
-use nalgebra::{Point3, Transform3, UnitVector3, Vector2, Vector3};
+use nalgebra::{Point3, Transform3, UnitVector3, Vector2};
 use crate::Color;
 
 const MAX_TRAVERSAL_DEPTH: usize = 64;
@@ -167,10 +167,8 @@ impl BvhBuilder {
                         *vertex_map.entry(key).or_insert_with(|| {
                             let p =
                                 world_transform.transform_point(&mesh.vertices[local_idx as usize]);
-                            let n = UnitVector3::new_normalize(
-                                normal_matrix * mesh.normals[local_idx as usize].into_inner(),
-                            );
-                            self.world_normals.push(n);
+                            let normal = normal_matrix * mesh.normals[local_idx as usize].into_inner();
+                            self.world_normals.push(UnitVector3::new_normalize(normal));
 
                             let uv = if !mesh.uvs.is_empty() {
                                 mesh.uvs[local_idx as usize]

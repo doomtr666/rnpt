@@ -125,7 +125,6 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
             let mut uvs = Vec::new();
             let mut mesh_colors = Vec::new();
             let mut triangles = Vec::new();
-            let mut material_idx = 0;
 
             let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
 
