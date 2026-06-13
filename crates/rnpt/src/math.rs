@@ -308,10 +308,10 @@ impl Ray {
 
 use nalgebra::Vector3;
 
-// 1. Define the type alias
+// Define the type alias
 pub type Color = Vector3<f32>;
 
-// 2. Create an extension trait to add color semantics to Vector3
+// Create an extension trait to add color semantics to Vector3
 pub trait ColorExt {
     fn black() -> Self;
     fn white() -> Self;
@@ -321,7 +321,7 @@ pub trait ColorExt {
     fn b(&self) -> f32;
 }
 
-// 3. Implement the trait for Vector3<f32>
+// Implement the trait for Vector3<f32>
 impl ColorExt for Color {
     #[inline]
     fn black() -> Self {

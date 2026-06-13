@@ -46,16 +46,16 @@ impl Pcg32 {
     pub fn next_u32(&mut self) -> u32 {
         let old_state = self.state;
 
-        // 1. Advance the internal Linear Congruential Generator (LCG)
+        // Advance the internal Linear Congruential Generator (LCG)
         self.state = old_state
             .wrapping_mul(Self::MULTIPLIER)
             .wrapping_add(self.inc);
 
-        // 2. Apply the XSH (XorShift High) transformation
+        // Apply the XSH (XorShift High) transformation
         // Bring high-entropy bits down to the middle
         let xorshifted = (((old_state >> 18) ^ old_state) >> 27) as u32;
 
-        // 3. Apply the RR (Random Rotate) transformation
+        // Apply the RR (Random Rotate) transformation
         // Use the topmost 5 bits of the old state to determine the rotation count
         let rot = (old_state >> 59) as u32;
 

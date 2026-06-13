@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use crate::{AABB, Scene};
 use nalgebra::{Point3, Transform3, UnitVector3};
 
+const MAX_TRAVERSAL_DEPTH: usize = 64;
+const SAH_BINS: usize = 16;
+const MAX_LEAF_TRIANGLES: u32 = 8;
+
 #[derive(Clone, Copy)]
 pub struct FlatTriangle {
     pub v0: u32,
@@ -78,7 +82,7 @@ impl BvhBuilder {
 
     fn split_clusters(indices: &mut [usize], centroids: &[Point3<f32>], start: usize, end: usize) {
         let count = end - start;
-        if count <= 8 {
+        if count as u32 <= MAX_LEAF_TRIANGLES {
             return;
         }
 
@@ -109,19 +113,15 @@ impl BvhBuilder {
     }
 
     fn flatten_scene(&mut self, scene: &Scene) {
-        let mut stack = [(0usize, Transform3::identity()); 4096];
-        let mut stack_ptr = 0;
+        let mut stack = Vec::new();
 
         let mut vertex_map: HashMap<(usize, u32, u32), usize> = HashMap::new();
 
         for &root_idx in &scene.roots {
-            stack[stack_ptr] = (root_idx as usize, Transform3::identity());
-            stack_ptr += 1;
+            stack.push((root_idx as usize, Transform3::identity()));
         }
 
-        while stack_ptr > 0 {
-            stack_ptr -= 1;
-            let (node_idx, parent_transform) = stack[stack_ptr];
+        while let Some((node_idx, parent_transform)) = stack.pop() {
             let node = &scene.nodes[node_idx];
             let world_transform = parent_transform * node.transform;
 
@@ -143,33 +143,27 @@ impl BvhBuilder {
                             let n = UnitVector3::new_normalize(
                                 normal_matrix * mesh.normals[local_idx as usize].into_inner(),
                             );
-
-                            let global_idx = self.world_vertices.len();
                             self.world_vertices.push(p);
                             self.world_normals.push(n);
-                            global_idx
+                            self.world_vertices.len() - 1
                         })
                     };
 
-                    let new_v0 = get_or_add_vertex(tri.v0) as u32;
-                    let new_v1 = get_or_add_vertex(tri.v1) as u32;
-                    let new_v2 = get_or_add_vertex(tri.v2) as u32;
-                    let m_idx = mesh.material;
+                    let v0 = get_or_add_vertex(tri.v0);
+                    let v1 = get_or_add_vertex(tri.v1);
+                    let v2 = get_or_add_vertex(tri.v2);
 
                     self.flat_triangles.push(FlatTriangle {
-                        v0: new_v0,
-                        v1: new_v1,
-                        v2: new_v2,
-                        material: m_idx,
+                        v0: v0 as u32,
+                        v1: v1 as u32,
+                        v2: v2 as u32,
+                        material: mesh.material,
                     });
                 }
             }
 
             for &child_idx in &node.children {
-                if stack_ptr < 64 {
-                    stack[stack_ptr] = (child_idx as usize, world_transform);
-                    stack_ptr += 1;
-                }
+                stack.push((child_idx as usize, world_transform));
             }
         }
     }
@@ -284,7 +278,6 @@ impl BvhBuilder {
             return;
         }
 
-        const BINS: usize = 8;
         let mut best_cost = f32::MAX;
         let mut best_axis = 0;
         let mut best_split_bin = 0;
@@ -312,26 +305,26 @@ impl BvhBuilder {
                 aabb: AABB,
                 count: usize,
             }
-            let mut bins = [Bin { aabb: AABB::invalid(), count: 0 }; BINS];
+            let mut bins = [Bin { aabb: AABB::invalid(), count: 0 }; SAH_BINS];
 
             for i in 0..count {
                 let chunk_idx = chunk_indices[first + i];
                 let centroid = chunk_centroids[chunk_idx];
-                let mut bin_idx = (((centroid[axis] - bounds_min) / bounds_extent) * (BINS as f32)) as usize;
-                bin_idx = bin_idx.min(BINS - 1);
+                let t = (centroid[axis] - bounds_min) / bounds_extent;
+                let bin_idx = (SAH_BINS as f32 * t).min(SAH_BINS as f32 - 1.0) as usize;
 
                 bins[bin_idx].aabb.extend_aabb(&chunk_aabbs[chunk_idx]);
                 bins[bin_idx].count += 1;
             }
 
-            let mut left_aabbs = [AABB::invalid(); BINS - 1];
-            let mut left_counts = [0; BINS - 1];
-            let mut right_aabbs = [AABB::invalid(); BINS - 1];
-            let mut right_counts = [0; BINS - 1];
+            let mut left_aabbs = [AABB::invalid(); SAH_BINS - 1];
+            let mut left_counts = [0; SAH_BINS - 1];
+            let mut right_aabbs = [AABB::invalid(); SAH_BINS - 1];
+            let mut right_counts = [0; SAH_BINS - 1];
 
             let mut left_box = AABB::invalid();
             let mut left_count = 0;
-            for i in 0..BINS - 1 {
+            for i in 0..SAH_BINS - 1 {
                 left_count += bins[i].count;
                 left_box.extend_aabb(&bins[i].aabb);
                 left_counts[i] = left_count;
@@ -340,7 +333,7 @@ impl BvhBuilder {
 
             let mut right_box = AABB::invalid();
             let mut right_count = 0;
-            for i in (1..BINS).rev() {
+            for i in (1..SAH_BINS).rev() {
                 right_count += bins[i].count;
                 right_box.extend_aabb(&bins[i].aabb);
                 right_counts[i - 1] = right_count;
@@ -349,7 +342,7 @@ impl BvhBuilder {
 
             let inv_total_area = 1.0 / nodes[node_idx].aabb.surface_area();
 
-            for i in 0..BINS - 1 {
+            for i in 0..SAH_BINS - 1 {
                 if left_counts[i] > 0 && right_counts[i] > 0 {
                     let cost = 1.0 + 
                         (left_aabbs[i].surface_area() * left_counts[i] as f32 + 
@@ -379,8 +372,8 @@ impl BvhBuilder {
         while left <= right {
             let chunk_idx = chunk_indices[left];
             let centroid = chunk_centroids[chunk_idx];
-            let mut bin_idx = (((centroid[best_axis] - bounds_min) / bounds_extent) * (BINS as f32)) as usize;
-            bin_idx = bin_idx.min(BINS - 1);
+            let mut bin_idx = (((centroid[best_axis] - bounds_min) / bounds_extent) * (SAH_BINS as f32)) as usize;
+            bin_idx = bin_idx.min(SAH_BINS - 1);
             
             if bin_idx <= best_split_bin {
                 left += 1;
@@ -460,7 +453,7 @@ impl Bvh {
             return None;
         }
 
-        let mut stack = [(0usize, 0.0f32); 64];
+        let mut stack = [(0usize, 0.0f32); MAX_TRAVERSAL_DEPTH];
         let mut stack_ptr = 0;
 
         let root_t = ray.intersect_aabb(&self.nodes[0].aabb, t_max);
@@ -490,7 +483,7 @@ impl Bvh {
 
                     if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
                         t_max = simd_hit.hit.t;
-                        // L'index se calcule trivialement : chunk_idx * 8 + lane !
+                        // Calculate global triangle index from chunk index and SIMD lane
                         let tri_global_idx = chunk_idx * 8 + simd_hit.lane;
                         let tri = &self.triangles[tri_global_idx];
                         
@@ -505,7 +498,7 @@ impl Bvh {
                     }
                 }
             } else {
-                if stack_ptr + 1 < 64 {
+                if stack_ptr + 1 < MAX_TRAVERSAL_DEPTH {
                     let left_idx = node.left_first as usize;
                     let right_idx = left_idx + 1;
                     let t_left_opt = ray.intersect_aabb(&self.nodes[left_idx].aabb, t_max);
@@ -513,9 +506,9 @@ impl Bvh {
 
                     match (t_left_opt, t_right_opt) {
                         (Some(t_left), Some(t_right)) => {
-                            // Les deux boîtes sont touchées par le rayon.
-                            // ORDRE FRONT-TO-BACK : On empile la plus lointaine d'abord.
-                            // Ainsi, la plus proche se retrouve au sommet de la pile et sera dépilée en premier !
+                            // Both child boxes are hit by the ray.
+                            // FRONT-TO-BACK ORDER: Push the furthest node first.
+                            // This ensures the closest node is at the top of the stack and processed first.
                             if t_left < t_right {
                                 stack[stack_ptr] = (right_idx, t_right);
                                 stack[stack_ptr + 1] = (left_idx, t_left);

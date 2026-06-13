@@ -3,6 +3,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+const TILE_SIZE: usize = 16;
+const BATCH_SIZE: u64 = 1024;
+
 /// A lock-free pixel buffer that multiple threads can write to concurrently.
 /// This is safe because each worker thread writes to a unique disjoint set of pixels.
 /// The GUI thread can also read from it concurrently, which might cause slight "tearing"
@@ -133,7 +136,7 @@ impl ParallelTracer {
         // How many samples to compute before checking the epoch and updating stats.
         // Larger = more CPU efficiency (less atomic contention), smaller = lower UI latency.
         // 1024 is still less than 1ms, so UI latency is invisible, but atomic overhead vanishes.
-        let batch_size = 1024;
+        // using BATCH_SIZE
 
         while running_atomic.load(Ordering::Relaxed) {
             let current_epoch = epoch_atomic.load(Ordering::Relaxed);
@@ -163,9 +166,8 @@ impl ParallelTracer {
             // Block-based rendering (Tiles)
             // We use contiguous block assignment (Thread 0 gets the first N blocks, Thread 1 the next N, etc.)
             // This maximizes spatial coherence across the entire thread's workload.
-            let block_size = 16;
-            let blocks_x = (width + block_size - 1) / block_size;
-            let blocks_y = (height + block_size - 1) / block_size;
+            let blocks_x = (width + TILE_SIZE - 1) / TILE_SIZE;
+            let blocks_y = (height + TILE_SIZE - 1) / TILE_SIZE;
             let total_blocks = blocks_x * blocks_y;
             let base_count = total_blocks / num_threads;
             let remainder = total_blocks % num_threads;
@@ -184,17 +186,17 @@ impl ParallelTracer {
                 let bx = block_idx % blocks_x;
                 let by = block_idx / blocks_x;
 
-                let start_x = bx * block_size;
-                let start_y = by * block_size;
-                let end_x = (start_x + block_size).min(width);
-                let end_y = (start_y + block_size).min(height);
+                let start_x = bx * TILE_SIZE;
+                let start_y = by * TILE_SIZE;
+                let end_x = (start_x + TILE_SIZE).min(width);
+                let end_y = (start_y + TILE_SIZE).min(height);
 
                 for y in start_y..end_y {
                     for x in start_x..end_x {
                         let i = y * width + x;
 
                         // Periodically check if we need to abort this pass early
-                        if rays_traced >= batch_size {
+                        if rays_traced >= BATCH_SIZE {
                             if epoch_atomic.load(Ordering::Relaxed) != local_epoch
                                 || !running_atomic.load(Ordering::Relaxed)
                             {

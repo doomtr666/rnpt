@@ -25,6 +25,10 @@ pub struct PathTracerConfig {
     pub scene: Scene,
 }
 
+const MAX_BOUNCES: u32 = 5;
+const RAY_EPSILON: f32 = 0.001;
+const LIGHT_ATTENUATION_EPSILON: f32 = 1e-4;
+
 pub struct PathTracer {
     config: PathTracerConfig,
     cam2world: Transform3<f32>,
@@ -62,20 +66,20 @@ impl PathTracer {
     }
 
     fn init_pixel_rng(&self, x: u32, y: u32, frame_index: u32) -> Pcg32 {
-        // 1. Pack everything into a single 128-bit primitive
+        // Pack everything into a single 128-bit primitive
         // High 64 bits: Spatial coordinates (X, Y)
         // Low 64 bits: Temporal coordinate (Frame)
         let mut packed_seed: u128 =
             ((x as u128) << 96) | ((y as u128) << 64) | (frame_index as u128);
 
-        // 2. Quick 128-bit bit-mixing (MurmurHash3 finalizer style for 128-bit blocks)
+        // Quick 128-bit bit-mixing (MurmurHash3 finalizer style for 128-bit blocks)
         packed_seed ^= packed_seed >> 33;
         packed_seed = packed_seed.wrapping_mul(0xff51afd7ed558ccd_u128);
         packed_seed ^= packed_seed >> 33;
         packed_seed = packed_seed.wrapping_mul(0xc4ceb9fe1a85ec53_u128);
         packed_seed ^= packed_seed >> 33;
 
-        // 3. Pass the single 128-bit block to the RNG
+        // Pass the single 128-bit block to the RNG
         Pcg32::from_seed_128(packed_seed)
     }
 
@@ -84,7 +88,7 @@ impl PathTracer {
         let width = self.config.width as f32;
         let height = self.config.height as f32;
 
-        // 1. Coordonnées d'écran normalisées (-1 à 1) au centre du pixel
+        // Normalized screen coordinates (-1 to 1) at the center of the pixel
         let jitter_x = rng.next_f32();
         let jitter_y = rng.next_f32();
 
@@ -95,7 +99,7 @@ impl PathTracer {
         let fov_rad = (self.config.camera.fov * std::f32::consts::PI) / 180.0;
         let tan_half_fov = (fov_rad * 0.5).tan();
 
-        // 2. Direction du rayon dans l'espace local de la caméra
+        // Ray direction in camera local space
         // La caméra regarde le long de son axe -Z local
         let local_dir = Vector3::new(
             ndc_x * aspect_ratio * tan_half_fov,
@@ -103,7 +107,7 @@ impl PathTracer {
             -1.0,
         );
 
-        // 3. Transformation par la matrice CameraToWorld
+        // Transform by CameraToWorld matrix
         // transform_vector n'applique pas la translation (ce qu'on veut pour une direction)
         let ray_dir = self.cam2world.transform_vector(&local_dir).normalize();
 
@@ -121,7 +125,7 @@ impl PathTracer {
             u1: f32, // Random number in [0, 1)
             u2: f32, // Random number in [0, 1)
         ) -> (Vector3<f32>, f32) {
-            // 1. Generate local coordinates on the hemisphere (Z-up axis)
+            // Generate local coordinates on the hemisphere (Z-up axis)
             let phi = 2.0 * std::f32::consts::PI * u2;
             let local_z = u1; // cos(theta) = u1
             let sin_theta = (1.0 - local_z * local_z).max(0.0).sqrt();
@@ -129,7 +133,7 @@ impl PathTracer {
             let local_x = sin_theta * phi.cos();
             let local_y = sin_theta * phi.sin();
 
-            // 2. Build a stable orthonormal basis (TBN) from the world normal (Frisvad's method)
+            // Build a stable orthonormal basis (TBN) from the world normal (Frisvad's method)
             let n = normal.into_inner();
             let sign = if n.z >= 0.0 { 1.0 } else { -1.0 };
             let a = -1.0 / (sign + n.z);
@@ -138,10 +142,10 @@ impl PathTracer {
             let tangent = Vector3::new(1.0 + sign * n.x * n.x * a, sign * b, -sign * n.x);
             let bitangent = Vector3::new(b, sign + n.y * n.y * a, -n.y);
 
-            // 3. Transform the local sample direction into world space
+            // Transform the local sample direction into world space
             let world_dir = (tangent * local_x + bitangent * local_y + n * local_z).normalize();
 
-            // 4. The PDF for a uniform hemisphere distribution is a constant: 1 / (2 * PI)
+            // The PDF for a uniform hemisphere distribution is a constant: 1 / (2 * PI)
             let pdf = 1.0 / (2.0 * std::f32::consts::PI);
 
             (world_dir, pdf)
@@ -153,7 +157,7 @@ impl PathTracer {
         u1: f32, // Random number in [0, 1)
         u2: f32, // Random number in [0, 1)
     ) -> (Vector3<f32>, f32) {
-        // 1. Local sampling on a disk, then project up to the hemisphere (Malley's method)
+        // Local sampling on a disk, then project up to the hemisphere (Malley's method)
         let r = u1.sqrt();
         let phi = 2.0 * std::f32::consts::PI * u2;
 
@@ -164,7 +168,7 @@ impl PathTracer {
             (1.0 - u1).sqrt(), // local_z is exactly cos(theta)
         );
 
-        // 2. Build a stable orthonormal basis (TBN) from the world normal (Frisvad's method)
+        // Build a stable orthonormal basis (TBN) from the world normal (Frisvad's method)
         let n = normal.into_inner();
         let sign = if n.z >= 0.0 { 1.0 } else { -1.0 };
         let a = -1.0 / (sign + n.z);
@@ -173,11 +177,11 @@ impl PathTracer {
         let tangent = Vector3::new(1.0 + sign * n.x * n.x * a, sign * b, -sign * n.x);
         let bitangent = Vector3::new(b, sign + n.y * n.y * a, -n.y);
 
-        // 3. Transform the local sample direction into world space
+        // Transform the local sample direction into world space
         let world_dir =
             (tangent * local_dir.x + bitangent * local_dir.y + n * local_dir.z).normalize();
 
-        // 4. The PDF for a cosine-weighted distribution is cos(theta) / PI
+        // The PDF for a cosine-weighted distribution is cos(theta) / PI
         let cos_theta = local_dir.z;
         let pdf = cos_theta / std::f32::consts::PI;
 
@@ -194,17 +198,17 @@ impl PathTracer {
     ) -> Color {
         let mut total_direct = Color::zeros();
 
-        // 1. Evaluate the Lambertian BRDF (constant for the entire surface loop)
+        // Evaluate the Lambertian BRDF (constant for the entire surface loop)
         let brdf = mat.albedo / std::f32::consts::PI;
 
-        // 2. Iterate through all analytical light sources in the scene
+        // Iterate through all analytical light sources in the scene
         for light in &self.config.scene.lights {
             let hit_to_light = light.position - hit_position;
             let distance_squared = hit_to_light.norm_squared();
             let distance = distance_squared.sqrt();
             let light_dir = UnitVector3::new_normalize(hit_to_light);
 
-            // 3. Compute the geometric cosine term (N . L)
+            // Compute the geometric cosine term (N . L)
             let cos_theta = normal.dot(&light_dir).max(0.0);
 
             // Early out if the light source is behind the surface
@@ -212,17 +216,17 @@ impl PathTracer {
                 continue;
             }
 
-            // 4. Setup the Shadow Ray to query visibility
+            // Setup the Shadow Ray to query visibility
             let shadow_ray = Ray::new_with_minmax(
-                hit_position + normal.into_inner() * 0.001,
+                hit_position + normal.into_inner() * RAY_EPSILON,
                 light_dir,
                 0.0,
-                distance - 0.001,
+                distance - RAY_EPSILON,
             );
 
-            // 5. Ray visibility query
+            // Ray visibility query
             if self.trace_ray(&shadow_ray).is_none() {
-                let attenuation = 1.0 / (4.0 * std::f32::consts::PI * distance_squared).max(1e-4);
+                let attenuation = 1.0 / (4.0 * std::f32::consts::PI * distance_squared).max(LIGHT_ATTENUATION_EPSILON);
                 let incident_radiance = light.color * light.intensity * attenuation;
                 total_direct += brdf.component_mul(&incident_radiance) * cos_theta;
             }
@@ -235,8 +239,8 @@ impl PathTracer {
         let mut accumulated_radiance = Color::black();
         let mut throughput = Color::white(); // Current path attenuation factor
 
-        for bounce in 0..5 {
-            // 1. Ray intersection
+        for bounce in 0..MAX_BOUNCES {
+            // Ray intersection
             let hit_opt = self.trace_ray(&ray);
 
             let Some(hit) = hit_opt else {
@@ -256,18 +260,16 @@ impl PathTracer {
 
             let hit_position = ray.at(hit.hit.t);
 
-            // ---------------------------------------------------------
-            // STEP A: LOCAL RADIANCE (Direct view & Analytic Lights)
-            // ---------------------------------------------------------
+            // Direct Lighting Calculation
             let mut local_radiance = Color::black();
 
-            // 1. Self-emission (Only counted directly if we "fall" on it)
+            // Self-emission (Only counted directly if we "fall" on it)
             //if mat.is_emissive() {
             //    local_radiance += mat.evaluate_emissive(hit.uv);
             //}
             local_radiance += mat.emissive;
 
-            // 2. Next Event Estimation (Analytic lights loop)
+            // Next Event Estimation (Analytic lights loop)
             // This calculates the direct lighting at this specific vertex
             let direct_radiance = self.compute_direct_lighting(&hit_position, &normal, mat);
             local_radiance += direct_radiance;
@@ -275,9 +277,7 @@ impl PathTracer {
             // Add the local contribution of this vertex to the pixel, modulated by previous bounces
             accumulated_radiance += throughput.component_mul(&local_radiance);
 
-            // ---------------------------------------------------------
-            // STEP B: INDIRECT RADIANCE PREPARATION (Secondary Ray)
-            // ---------------------------------------------------------
+            // Bounce Setup
 
             // If no cache query, we sample the BRDF to continue the path
             let (next_dir, pdf) =
@@ -304,7 +304,7 @@ impl PathTracer {
             // Setup the secondary ray for the next loop iteration
             // Offset origin along the normal to prevent self-intersection
             ray = Ray::new(
-                hit_position + normal.into_inner() * 0.001,
+                hit_position + normal.into_inner() * RAY_EPSILON,
                 UnitVector3::new_unchecked(next_dir),
             );
 

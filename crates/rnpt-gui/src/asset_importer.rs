@@ -47,7 +47,7 @@ fn gltf_matrix_to_nalgebra(matrix: [[f32; 4]; 4]) -> Matrix4<f32> {
 pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error::Error>> {
     let (document, buffers, _images) = gltf::import(path)?;
 
-    // 1. Load Materials
+    // Load Materials
     let mut materials = Vec::new();
     for (_idx, mat) in document.materials().enumerate() {
         let pbr = mat.pbr_metallic_roughness();
@@ -65,7 +65,7 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
         });
     }
 
-    // 2. Load Meshes
+    // Load Meshes
     // In glTF, a single Mesh can contain multiple Primitives. Since each Primitive
     // can have a different material, we split them into individual rnpt::Mesh instances.
     let mut meshes = Vec::new();
@@ -124,7 +124,7 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
         gltf_mesh_to_rnpt_meshes.push(rnpt_mesh_indices);
     }
 
-    // 3. Load Nodes, Cameras and Lights
+    // Load Nodes, Cameras and Lights
     let scene = document
         .default_scene()
         .or_else(|| document.scenes().next())

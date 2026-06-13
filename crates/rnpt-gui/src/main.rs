@@ -147,7 +147,7 @@ impl eframe::App for RnptGuiApp {
             }
         }
 
-        // 1. Fetch new pixels from tracer
+        // Fetch new pixels from tracer
         let mut pixels_updated = false;
         if let Some(tracer) = &self.tracer {
             tracer.fetch_pixels(&mut self.local_pixels);
@@ -167,7 +167,7 @@ impl eframe::App for RnptGuiApp {
 
         ctx.request_repaint();
 
-        // 2. If pixels updated, or exposure changed, regenerate the texture
+        // If pixels updated, or exposure changed, regenerate the texture
         let exposure_changed = self.exposure != self.last_exposure;
         let tonemapper_changed = self.tonemapper != self.last_tonemapper;
         if pixels_updated
@@ -203,7 +203,7 @@ impl eframe::App for RnptGuiApp {
             self.last_tonemapper = self.tonemapper;
         }
 
-        // 3. UI Layout
+        // UI Layout
         egui::SidePanel::left("controls_panel")
             .resizable(true)
             .default_width(260.0)
