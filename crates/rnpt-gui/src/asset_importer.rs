@@ -1,4 +1,4 @@
-use nalgebra::{Matrix4, Point3, Transform3, UnitVector3, Vector3};
+use nalgebra::{Matrix4, Point3, Transform3, UnitVector3, Vector2, Vector3};
 use rnpt::{Camera, Color, Light, LightType, Material, Mesh, Node, Scene, Triangle};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,7 +45,47 @@ fn gltf_matrix_to_nalgebra(matrix: [[f32; 4]; 4]) -> Matrix4<f32> {
 
 /// Imports a GLB or glTF file and parses it into an rnpt::Scene.
 pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error::Error>> {
-    let (document, buffers, _images) = gltf::import(path)?;
+    let (document, buffers, images) = gltf::import(path)?;
+
+    // Load Textures
+    let mut textures = Vec::new();
+    for img in images {
+        let mut pixels = vec![[255u8; 4]; (img.width * img.height) as usize];
+        
+        let bytes = &img.pixels;
+        match img.format {
+            gltf::image::Format::R8G8B8 => {
+                for i in 0..(img.width * img.height) as usize {
+                    pixels[i] = [bytes[i * 3], bytes[i * 3 + 1], bytes[i * 3 + 2], 255];
+                }
+            }
+            gltf::image::Format::R8G8B8A8 => {
+                for i in 0..(img.width * img.height) as usize {
+                    pixels[i] = [bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]];
+                }
+            }
+            gltf::image::Format::R8 => {
+                for i in 0..(img.width * img.height) as usize {
+                    pixels[i] = [bytes[i], bytes[i], bytes[i], 255];
+                }
+            }
+            gltf::image::Format::R8G8 => {
+                for i in 0..(img.width * img.height) as usize {
+                    pixels[i] = [bytes[i * 2], bytes[i * 2 + 1], 0, 255];
+                }
+            }
+            _ => {
+                eprintln!("Unsupported texture format: {:?}", img.format);
+                // Unsupported or less common formats, keep it white for now
+            }
+        }
+
+        textures.push(rnpt::Texture {
+            width: img.width,
+            height: img.height,
+            pixels,
+        });
+    }
 
     // Load Materials
     let mut materials = Vec::new();
@@ -62,6 +102,12 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
         materials.push(Material {
             albedo: Color::from([base_color[0], base_color[1], base_color[2]]),
             emissive,
+            albedo_texture: pbr
+                .base_color_texture()
+                .map(|info| info.texture().source().index() as u32),
+            emissive_texture: mat
+                .emissive_texture()
+                .map(|info| info.texture().source().index() as u32),
         });
     }
 
@@ -76,6 +122,8 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
             rnpt_mesh_indices.push(meshes.len() as u32);
             let mut vertices = Vec::new();
             let mut normals = Vec::new();
+            let mut uvs = Vec::new();
+            let mut mesh_colors = Vec::new();
             let mut triangles = Vec::new();
             let mut material_idx = 0;
 
@@ -97,6 +145,21 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
                 }
             }
 
+            // Read UVs
+            if let Some(tex_coords) = reader.read_tex_coords(0).map(|v| v.into_f32()) {
+                for uv in tex_coords {
+                    uvs.push(Vector2::new(uv[0], uv[1]));
+                }
+            }
+
+            // Colors
+            if let Some(colors) = reader.read_colors(0) {
+                let colors_f32 = colors.into_rgba_f32();
+                for c in colors_f32 {
+                    mesh_colors.push(rnpt::Color::new(c[0], c[1], c[2]));
+                }
+            }
+
             // Read indices
             if let Some(indices_iter) = reader.read_indices() {
                 let indices: Vec<u32> = indices_iter.into_u32().collect();
@@ -109,16 +172,13 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
                 }
             }
 
-            // Material index
-            if let Some(mat) = primitive.material().index() {
-                material_idx = mat as u32;
-            }
-
             meshes.push(Mesh {
                 vertices,
                 normals,
+                uvs,
+                colors: mesh_colors,
                 triangles,
-                material: material_idx,
+                material: primitive.material().index().unwrap_or(0) as u32,
             });
         }
         gltf_mesh_to_rnpt_meshes.push(rnpt_mesh_indices);
@@ -261,6 +321,7 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
     Ok(Scene {
         meshes,
         materials,
+        textures,
         lights,
         nodes: nodes_list,
         roots,

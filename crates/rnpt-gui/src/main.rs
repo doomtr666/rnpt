@@ -31,7 +31,8 @@ struct RnptGuiApp {
     // New fields
     asset_files: Vec<std::path::PathBuf>,
     selected_asset_index: usize,
-    current_scene: Option<rnpt::Scene>,
+    current_scene: Option<std::sync::Arc<rnpt::Scene>>,
+    current_bvh: Option<std::sync::Arc<rnpt::Bvh>>,
 
     auto_fit: bool,
     resize_timeout: Option<Instant>,
@@ -51,6 +52,7 @@ impl RnptGuiApp {
             .unwrap_or(0);
 
         let mut current_scene = None;
+        let mut current_bvh = None;
         if !asset_files.is_empty() {
             if let Ok(scene) = asset_importer::import_scene(&asset_files[selected_asset_index]) {
                 if !scene.cameras.is_empty() {
@@ -59,24 +61,30 @@ impl RnptGuiApp {
                     camera.target = first_cam.target;
                     camera.fov = first_cam.fov;
                 }
-                current_scene = Some(scene);
+                let scene_arc = std::sync::Arc::new(scene);
+                let bvh_arc = std::sync::Arc::new(rnpt::BvhBuilder::new(&scene_arc).build());
+                current_scene = Some(scene_arc);
+                current_bvh = Some(bvh_arc);
             }
         }
 
-        let scene = current_scene.clone().unwrap_or_else(|| rnpt::Scene {
-            meshes: vec![],
-            materials: vec![],
-            lights: vec![],
-            nodes: vec![],
-            roots: vec![],
-            cameras: vec![],
-        });
+        let scene = current_scene.clone().unwrap_or_else(|| std::sync::Arc::new(rnpt::Scene {
+            meshes: Vec::new(),
+            materials: Vec::new(),
+            textures: Vec::new(),
+            lights: Vec::new(),
+            nodes: Vec::new(),
+            roots: Vec::new(),
+            cameras: vec![rnpt::Camera::default()],
+        }));
+        let bvh = current_bvh.clone().unwrap_or_else(|| std::sync::Arc::new(rnpt::BvhBuilder::new(&scene).build()));
 
         let config = rnpt::PathTracerConfig {
             width,
             height,
             camera: camera.clone(),
             scene,
+            bvh,
         };
 
         let tracer = Some(rnpt::ParallelTracer::new(config));
@@ -99,39 +107,38 @@ impl RnptGuiApp {
             asset_files,
             selected_asset_index,
             current_scene,
+            current_bvh,
             auto_fit: true,
             resize_timeout: None,
         }
     }
 
     fn trigger_reset(&mut self) {
-        let scene = self.current_scene.clone().unwrap_or_else(|| rnpt::Scene {
-            meshes: vec![],
-            materials: vec![],
-            lights: vec![],
-            nodes: vec![],
-            roots: vec![],
-            cameras: vec![],
-        });
+        let scene = self.current_scene.clone().unwrap_or_else(|| std::sync::Arc::new(rnpt::Scene {
+            meshes: Vec::new(),
+            materials: Vec::new(),
+            textures: Vec::new(),
+            lights: Vec::new(),
+            nodes: Vec::new(),
+            roots: Vec::new(),
+            cameras: vec![rnpt::Camera::default()],
+        }));
+        let bvh = self.current_bvh.clone().unwrap_or_else(|| std::sync::Arc::new(rnpt::BvhBuilder::new(&scene).build()));
 
         let config = rnpt::PathTracerConfig {
             width: self.resolution[0],
             height: self.resolution[1],
             camera: self.camera.clone(),
             scene,
+            bvh,
         };
 
-        if self.local_width != self.resolution[0] || self.local_height != self.resolution[1] {
-            // Recreate tracer and buffer if resolution changed
-            self.tracer = None; // Drop old threads
-            self.tracer = Some(rnpt::ParallelTracer::new(config));
-            self.local_width = self.resolution[0];
-            self.local_height = self.resolution[1];
-            self.local_pixels = vec![rnpt::Pixel::default(); self.local_width * self.local_height];
-        } else if let Some(tracer) = &mut self.tracer {
-            // Fast reset via epoch
-            tracer.update_scene(config);
-        }
+        // Always recreate tracer to ensure clean memory state and no race conditions
+        self.tracer = None;
+        self.tracer = Some(rnpt::ParallelTracer::new(config));
+        self.local_width = self.resolution[0];
+        self.local_height = self.resolution[1];
+        self.local_pixels = vec![rnpt::Pixel::default(); self.local_width * self.local_height];
 
         self.rays_since_last_fps = 0;
         self.local_rays_per_sec = 0.0;
@@ -235,17 +242,25 @@ impl eframe::App for RnptGuiApp {
                             });
 
                         if scene_changed {
-                            if let Ok(scene) = asset_importer::import_scene(
+                            match asset_importer::import_scene(
                                 &self.asset_files[self.selected_asset_index],
                             ) {
-                                if !scene.cameras.is_empty() {
-                                    let first_cam = &scene.cameras[0];
-                                    self.camera.position = first_cam.position;
-                                    self.camera.target = first_cam.target;
-                                    self.camera.fov = first_cam.fov;
+                                Ok(scene) => {
+                                    if !scene.cameras.is_empty() {
+                                        let first_cam = &scene.cameras[0];
+                                        self.camera.position = first_cam.position;
+                                        self.camera.target = first_cam.target;
+                                        self.camera.fov = first_cam.fov;
+                                    }
+                                    let scene_arc = std::sync::Arc::new(scene);
+                                    let bvh_arc = std::sync::Arc::new(rnpt::BvhBuilder::new(&scene_arc).build());
+                                    self.current_scene = Some(scene_arc);
+                                    self.current_bvh = Some(bvh_arc);
+                                    self.trigger_reset();
                                 }
-                                self.current_scene = Some(scene);
-                                self.trigger_reset();
+                                Err(e) => {
+                                    eprintln!("Failed to load scene: {}", e);
+                                }
                             }
                         }
                     });

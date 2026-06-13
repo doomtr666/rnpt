@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::{AABB, Scene};
-use nalgebra::{Point3, Transform3, UnitVector3};
+use nalgebra::{Point3, Transform3, UnitVector3, Vector2, Vector3};
+use crate::Color;
 
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 const SAH_BINS: usize = 16;
@@ -48,6 +49,8 @@ impl Default for FlatTriangles {
 pub struct BvhBuilder {
     world_vertices: Vec<Point3<f32>>,
     world_normals: Vec<UnitVector3<f32>>,
+    world_uvs: Vec<Vector2<f32>>,
+    world_colors: Vec<Color>,
     flat_triangles: Vec<FlatTriangle>,
 }
 
@@ -55,11 +58,15 @@ impl BvhBuilder {
     pub fn new(scene: &Scene) -> Self {
         let world_vertices = Vec::new();
         let world_normals = Vec::new();
+        let world_uvs = Vec::new();
+        let world_colors = Vec::new();
         let flat_triangles = Vec::new();
 
         let mut builder = Self {
             world_vertices,
             world_normals,
+            world_uvs,
+            world_colors,
             flat_triangles,
         };
 
@@ -163,9 +170,25 @@ impl BvhBuilder {
                             let n = UnitVector3::new_normalize(
                                 normal_matrix * mesh.normals[local_idx as usize].into_inner(),
                             );
-                            self.world_vertices.push(p);
                             self.world_normals.push(n);
-                            self.world_vertices.len() - 1
+
+                            let uv = if !mesh.uvs.is_empty() {
+                                mesh.uvs[local_idx as usize]
+                            } else {
+                                Vector2::new(0.0, 0.0)
+                            };
+                            self.world_uvs.push(uv);
+
+                            let color = if !mesh.colors.is_empty() {
+                                mesh.colors[local_idx as usize]
+                            } else {
+                                Color::new(1.0, 1.0, 1.0)
+                            };
+                            self.world_colors.push(color);
+
+                            let idx = self.world_vertices.len();
+                            self.world_vertices.push(p);
+                            idx
                         })
                     };
 
@@ -280,6 +303,8 @@ impl BvhBuilder {
             nodes,
             vertices: self.world_vertices,
             normals: self.world_normals,
+            uvs: self.world_uvs,
+            colors: self.world_colors,
             triangles: ordered_triangles,
             soa_chunks: ordered_soa_chunks,
         }
@@ -502,6 +527,8 @@ pub struct Bvh {
     pub nodes: Vec<BvhNode>,
     pub vertices: Vec<Point3<f32>>,
     pub normals: Vec<UnitVector3<f32>>,
+    pub uvs: Vec<Vector2<f32>>,
+    pub colors: Vec<Color>,
     pub triangles: Vec<FlatTriangle>,
     pub soa_chunks: Vec<FlatTriangles>,
 }

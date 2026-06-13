@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use crate::{Bvh, BvhBuilder, Camera, Color, ColorExt, Material, Pcg32, Ray, Scene};
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
 
@@ -22,7 +23,8 @@ pub struct PathTracerConfig {
     pub width: usize,
     pub height: usize,
     pub camera: Camera,
-    pub scene: Scene,
+    pub scene: Arc<Scene>,
+    pub bvh: Arc<Bvh>,
 }
 
 const MAX_BOUNCES: u32 = 5;
@@ -32,24 +34,16 @@ const LIGHT_ATTENUATION_EPSILON: f32 = 1e-4;
 pub struct PathTracer {
     config: PathTracerConfig,
     cam2world: Transform3<f32>,
-    bvh: Bvh,
 }
 
 impl PathTracer {
     pub fn new(config: PathTracerConfig) -> Self {
         let cam2world = config.camera.compute_camera_to_world();
-
-        let builder = BvhBuilder::new(&config.scene);
-
-        Self {
-            config,
-            cam2world,
-            bvh: builder.build(),
-        }
+        Self { config, cam2world }
     }
 
     fn trace_ray(&self, ray: &Ray) -> Option<crate::bvh::BvhHit> {
-        self.bvh.intersect(ray)
+        self.config.bvh.intersect(ray)
     }
 
     fn interpolate_normal(
@@ -194,12 +188,12 @@ impl PathTracer {
         &self,
         hit_position: &Point3<f32>,
         normal: &UnitVector3<f32>,
-        mat: &Material,
+        albedo: Color,
     ) -> Color {
         let mut total_direct = Color::zeros();
 
         // Evaluate the Lambertian BRDF (constant for the entire surface loop)
-        let brdf = mat.albedo / std::f32::consts::PI;
+        let brdf = albedo / std::f32::consts::PI;
 
         // Iterate through all analytical light sources in the scene
         for light in &self.config.scene.lights {
@@ -252,26 +246,56 @@ impl PathTracer {
             // Fetch surface data
             let mat = &self.config.scene.materials[hit.material as usize];
 
-            let n0 = self.bvh.normals[hit.v0 as usize];
-            let n1 = self.bvh.normals[hit.v1 as usize];
-            let n2 = self.bvh.normals[hit.v2 as usize];
+            let n0 = self.config.bvh.normals[hit.v0 as usize];
+            let n1 = self.config.bvh.normals[hit.v1 as usize];
+            let n2 = self.config.bvh.normals[hit.v2 as usize];
 
             let normal = self.interpolate_normal(&n0, &n1, &n2, hit.hit.u, hit.hit.v);
 
             let hit_position = ray.at(hit.hit.t);
 
+            let has_textures = mat.albedo_texture.is_some() || mat.emissive_texture.is_some();
+            let mut hit_uv = nalgebra::Vector2::zeros();
+            let mut vertex_color = Color::new(1.0, 1.0, 1.0);
+            
+            let w = 1.0 - hit.hit.u - hit.hit.v;
+            
+            let c0 = self.config.bvh.colors[hit.v0 as usize];
+            let c1 = self.config.bvh.colors[hit.v1 as usize];
+            let c2 = self.config.bvh.colors[hit.v2 as usize];
+            vertex_color = c0 * w + c1 * hit.hit.u + c2 * hit.hit.v;
+
+            if has_textures {
+                let uv0 = self.config.bvh.uvs[hit.v0 as usize];
+                let uv1 = self.config.bvh.uvs[hit.v1 as usize];
+                let uv2 = self.config.bvh.uvs[hit.v2 as usize];
+                hit_uv = uv0 * w + uv1 * hit.hit.u + uv2 * hit.hit.v;
+            }
+
+            let mut albedo = mat.albedo.component_mul(&vertex_color);
+            if let Some(tex_idx) = mat.albedo_texture {
+                if tex_idx < self.config.scene.textures.len() as u32 {
+                    let tex = &self.config.scene.textures[tex_idx as usize];
+                    albedo = albedo.component_mul(&tex.sample_bilinear(hit_uv));
+                }
+            }
+
             // Direct Lighting Calculation
             let mut local_radiance = Color::black();
 
-            // Self-emission (Only counted directly if we "fall" on it)
-            //if mat.is_emissive() {
-            //    local_radiance += mat.evaluate_emissive(hit.uv);
-            //}
-            local_radiance += mat.emissive;
+            // Self-emission
+            let mut local_emissive = mat.emissive;
+            if let Some(tex_idx) = mat.emissive_texture {
+                if tex_idx < self.config.scene.textures.len() as u32 {
+                    let tex = &self.config.scene.textures[tex_idx as usize];
+                    local_emissive = local_emissive.component_mul(&tex.sample_bilinear(hit_uv));
+                }
+            }
+            local_radiance += local_emissive;
 
             // Next Event Estimation (Analytic lights loop)
             // This calculates the direct lighting at this specific vertex
-            let direct_radiance = self.compute_direct_lighting(&hit_position, &normal, mat);
+            let direct_radiance = self.compute_direct_lighting(&hit_position, &normal, albedo);
             local_radiance += direct_radiance;
 
             // Add the local contribution of this vertex to the pixel, modulated by previous bounces
@@ -294,7 +318,7 @@ impl PathTracer {
             }
 
             // Evaluate the Lambertian BRDF
-            let brdf = mat.albedo / std::f32::consts::PI;
+            let brdf = albedo / std::f32::consts::PI;
 
             // Update the path throughput for the next bounce
             // New Throughput = Old Throughput * (BRDF * cos_theta / PDF)
