@@ -5,7 +5,7 @@ use nalgebra::{Point3, Transform3, UnitVector3};
 
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 const SAH_BINS: usize = 16;
-const MAX_LEAF_TRIANGLES: u32 = 8;
+const MAX_LEAF_CHUNKS: u32 = 1; // 1 chunk = 8 triangles
 
 #[derive(Clone, Copy)]
 pub struct FlatTriangle {
@@ -18,17 +18,29 @@ pub struct FlatTriangle {
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
 pub struct FlatTriangles {
-    pub v0_x: [f32; 8], pub v0_y: [f32; 8], pub v0_z: [f32; 8],
-    pub e1_x: [f32; 8], pub e1_y: [f32; 8], pub e1_z: [f32; 8],
-    pub e2_x: [f32; 8], pub e2_y: [f32; 8], pub e2_z: [f32; 8],
+    pub v0_x: [f32; 8],
+    pub v0_y: [f32; 8],
+    pub v0_z: [f32; 8],
+    pub e1_x: [f32; 8],
+    pub e1_y: [f32; 8],
+    pub e1_z: [f32; 8],
+    pub e2_x: [f32; 8],
+    pub e2_y: [f32; 8],
+    pub e2_z: [f32; 8],
 }
 
 impl Default for FlatTriangles {
     fn default() -> Self {
         Self {
-            v0_x: [0.0; 8], v0_y: [0.0; 8], v0_z: [0.0; 8],
-            e1_x: [0.0; 8], e1_y: [0.0; 8], e1_z: [0.0; 8],
-            e2_x: [0.0; 8], e2_y: [0.0; 8], e2_z: [0.0; 8],
+            v0_x: [0.0; 8],
+            v0_y: [0.0; 8],
+            v0_z: [0.0; 8],
+            e1_x: [0.0; 8],
+            e1_y: [0.0; 8],
+            e1_z: [0.0; 8],
+            e2_x: [0.0; 8],
+            e2_y: [0.0; 8],
+            e2_z: [0.0; 8],
         }
     }
 }
@@ -62,12 +74,15 @@ impl BvhBuilder {
         let vertices = &self.world_vertices;
         let triangles = &self.flat_triangles;
 
-        let centroids: Vec<Point3<f32>> = triangles.iter().map(|tri| {
-            let v0 = vertices[tri.v0 as usize];
-            let v1 = vertices[tri.v1 as usize];
-            let v2 = vertices[tri.v2 as usize];
-            Point3::from((v0.coords + v1.coords + v2.coords) / 3.0)
-        }).collect();
+        let centroids: Vec<Point3<f32>> = triangles
+            .iter()
+            .map(|tri| {
+                let v0 = vertices[tri.v0 as usize];
+                let v1 = vertices[tri.v1 as usize];
+                let v2 = vertices[tri.v2 as usize];
+                Point3::from((v0.coords + v1.coords + v2.coords) / 3.0)
+            })
+            .collect();
 
         let len = indices.len();
         Self::split_clusters(&mut indices, &centroids, 0, len);
@@ -82,7 +97,7 @@ impl BvhBuilder {
 
     fn split_clusters(indices: &mut [usize], centroids: &[Point3<f32>], start: usize, end: usize) {
         let count = end - start;
-        if count as u32 <= MAX_LEAF_TRIANGLES {
+        if count as u32 <= MAX_LEAF_CHUNKS {
             return;
         }
 
@@ -93,8 +108,12 @@ impl BvhBuilder {
 
         let extent = centroid_bounds.max - centroid_bounds.min;
         let mut axis = 0;
-        if extent.y > extent.x { axis = 1; }
-        if extent.z > extent[axis] { axis = 2; }
+        if extent.y > extent.x {
+            axis = 1;
+        }
+        if extent.z > extent[axis] {
+            axis = 2;
+        }
 
         let mid = count / 2;
         let mut split_offset = (mid / 8) * 8;
@@ -139,7 +158,8 @@ impl BvhBuilder {
                     let mut get_or_add_vertex = |local_idx: u32| -> usize {
                         let key = (node_idx, mesh_idx, local_idx);
                         *vertex_map.entry(key).or_insert_with(|| {
-                            let p = world_transform.transform_point(&mesh.vertices[local_idx as usize]);
+                            let p =
+                                world_transform.transform_point(&mesh.vertices[local_idx as usize]);
                             let n = UnitVector3::new_normalize(
                                 normal_matrix * mesh.normals[local_idx as usize].into_inner(),
                             );
@@ -170,11 +190,16 @@ impl BvhBuilder {
 
     pub fn build(mut self) -> Bvh {
         let num_triangles = self.flat_triangles.len();
-        
+
         let remainder = num_triangles % 8;
         if remainder != 0 {
             for _ in 0..(8 - remainder) {
-                self.flat_triangles.push(FlatTriangle { v0: 0, v1: 0, v2: 0, material: 0 });
+                self.flat_triangles.push(FlatTriangle {
+                    v0: 0,
+                    v1: 0,
+                    v2: 0,
+                    material: 0,
+                });
             }
         }
 
@@ -185,31 +210,37 @@ impl BvhBuilder {
         for chunk_start in (0..self.flat_triangles.len()).step_by(8) {
             let mut soa = FlatTriangles::default();
             let mut chunk_aabb = AABB::invalid();
-            
+
             for i in 0..8 {
                 let tri = &self.flat_triangles[chunk_start + i];
-                
+
                 let v0 = self.world_vertices[tri.v0 as usize];
                 let v1 = self.world_vertices[tri.v1 as usize];
                 let v2 = self.world_vertices[tri.v2 as usize];
                 let e1 = v1 - v0;
                 let e2 = v2 - v0;
-                
-                soa.v0_x[i] = v0.x; soa.v0_y[i] = v0.y; soa.v0_z[i] = v0.z;
-                soa.e1_x[i] = e1.x; soa.e1_y[i] = e1.y; soa.e1_z[i] = e1.z;
-                soa.e2_x[i] = e2.x; soa.e2_y[i] = e2.y; soa.e2_z[i] = e2.z;
-                
+
+                soa.v0_x[i] = v0.x;
+                soa.v0_y[i] = v0.y;
+                soa.v0_z[i] = v0.z;
+                soa.e1_x[i] = e1.x;
+                soa.e1_y[i] = e1.y;
+                soa.e1_z[i] = e1.z;
+                soa.e2_x[i] = e2.x;
+                soa.e2_y[i] = e2.y;
+                soa.e2_z[i] = e2.z;
+
                 if chunk_start + i < num_triangles {
                     chunk_aabb.extend(v0);
                     chunk_aabb.extend(v1);
                     chunk_aabb.extend(v2);
                 }
             }
-            
+
             let eps = nalgebra::Vector3::new(1e-5, 1e-5, 1e-5);
             chunk_aabb.min -= eps;
             chunk_aabb.max += eps;
-            
+
             soa_chunks.push(soa);
             chunk_aabbs.push(chunk_aabb);
             chunk_centroids.push(chunk_aabb.center());
@@ -226,7 +257,13 @@ impl BvhBuilder {
 
         if !chunk_indices.is_empty() {
             self.update_node_bounds(0, &mut nodes, &chunk_indices, &chunk_aabbs);
-            self.subdivide_sah(0, &mut nodes, &mut chunk_indices, &chunk_aabbs, &chunk_centroids);
+            self.subdivide_sah(
+                0,
+                &mut nodes,
+                &mut chunk_indices,
+                &chunk_aabbs,
+                &chunk_centroids,
+            );
         }
 
         let mut ordered_soa_chunks = Vec::with_capacity(soa_chunks.len());
@@ -248,7 +285,13 @@ impl BvhBuilder {
         }
     }
 
-    fn update_node_bounds(&self, node_idx: usize, nodes: &mut Vec<BvhNode>, chunk_indices: &[usize], chunk_aabbs: &[AABB]) {
+    fn update_node_bounds(
+        &self,
+        node_idx: usize,
+        nodes: &mut Vec<BvhNode>,
+        chunk_indices: &[usize],
+        chunk_aabbs: &[AABB],
+    ) {
         let node = &mut nodes[node_idx];
         let mut aabb = AABB::invalid();
         let first = node.left_first as usize;
@@ -286,7 +329,7 @@ impl BvhBuilder {
         for i in 0..count {
             centroid_bounds.extend(chunk_centroids[chunk_indices[first + i]]);
         }
-        
+
         let extent = centroid_bounds.max - centroid_bounds.min;
         if extent.x == 0.0 && extent.y == 0.0 && extent.z == 0.0 {
             return; // All centroids are identical
@@ -305,7 +348,10 @@ impl BvhBuilder {
                 aabb: AABB,
                 count: usize,
             }
-            let mut bins = [Bin { aabb: AABB::invalid(), count: 0 }; SAH_BINS];
+            let mut bins = [Bin {
+                aabb: AABB::invalid(),
+                count: 0,
+            }; SAH_BINS];
 
             for i in 0..count {
                 let chunk_idx = chunk_indices[first + i];
@@ -344,10 +390,11 @@ impl BvhBuilder {
 
             for i in 0..SAH_BINS - 1 {
                 if left_counts[i] > 0 && right_counts[i] > 0 {
-                    let cost = 1.0 + 
-                        (left_aabbs[i].surface_area() * left_counts[i] as f32 + 
-                         right_aabbs[i].surface_area() * right_counts[i] as f32) * inv_total_area;
-                    
+                    let cost = 1.0
+                        + (left_aabbs[i].surface_area() * left_counts[i] as f32
+                            + right_aabbs[i].surface_area() * right_counts[i] as f32)
+                            * inv_total_area;
+
                     if cost < best_cost {
                         best_cost = cost;
                         best_axis = axis;
@@ -365,21 +412,24 @@ impl BvhBuilder {
 
         let bounds_min = centroid_bounds.min[best_axis];
         let bounds_extent = centroid_bounds.max[best_axis] - centroid_bounds.min[best_axis];
-        
+
         let mut left = first;
         let mut right = first + count - 1;
-        
+
         while left <= right {
             let chunk_idx = chunk_indices[left];
             let centroid = chunk_centroids[chunk_idx];
-            let mut bin_idx = (((centroid[best_axis] - bounds_min) / bounds_extent) * (SAH_BINS as f32)) as usize;
+            let mut bin_idx =
+                (((centroid[best_axis] - bounds_min) / bounds_extent) * (SAH_BINS as f32)) as usize;
             bin_idx = bin_idx.min(SAH_BINS - 1);
-            
+
             if bin_idx <= best_split_bin {
                 left += 1;
             } else {
                 chunk_indices.swap(left, right);
-                if right == 0 { break; }
+                if right == 0 {
+                    break;
+                }
                 right -= 1;
             }
         }
@@ -409,8 +459,20 @@ impl BvhBuilder {
         self.update_node_bounds(left_child_idx, nodes, chunk_indices, chunk_aabbs);
         self.update_node_bounds(right_child_idx, nodes, chunk_indices, chunk_aabbs);
 
-        self.subdivide_sah(left_child_idx, nodes, chunk_indices, chunk_aabbs, chunk_centroids);
-        self.subdivide_sah(right_child_idx, nodes, chunk_indices, chunk_aabbs, chunk_centroids);
+        self.subdivide_sah(
+            left_child_idx,
+            nodes,
+            chunk_indices,
+            chunk_aabbs,
+            chunk_centroids,
+        );
+        self.subdivide_sah(
+            right_child_idx,
+            nodes,
+            chunk_indices,
+            chunk_aabbs,
+            chunk_centroids,
+        );
     }
 }
 
@@ -476,7 +538,7 @@ impl Bvh {
             if node.is_leaf() {
                 let start_chunk = node.left_first as usize;
                 let chunk_count = node.tri_count as usize;
-                
+
                 for i in 0..chunk_count {
                     let chunk_idx = start_chunk + i;
                     let chunk = &self.soa_chunks[chunk_idx];
@@ -486,7 +548,7 @@ impl Bvh {
                         // Calculate global triangle index from chunk index and SIMD lane
                         let tri_global_idx = chunk_idx * 8 + simd_hit.lane;
                         let tri = &self.triangles[tri_global_idx];
-                        
+
                         closest_hit = Some(BvhHit {
                             hit: simd_hit.hit,
                             material: tri.material,

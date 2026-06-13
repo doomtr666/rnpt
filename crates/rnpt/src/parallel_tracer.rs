@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-const TILE_SIZE: usize = 16;
+const TILE_SIZE: usize = 128;
 const BATCH_SIZE: u64 = 1024;
 
 /// A lock-free pixel buffer that multiple threads can write to concurrently.
