@@ -2,12 +2,10 @@ use crate::{Bvh, BvhBuilder, Camera, Color, ColorExt, Material, Pcg32, Ray, Scen
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
 
 #[derive(Clone, Copy, Debug)]
+#[repr(align(16))]
 pub struct Pixel {
     pub accumulated_radiance: Color,
     pub samples: u32,
-    pub mean_luminance: f32, // Running mean of luminance
-    pub m2_luminance: f32,   // Running sum of squares of differences
-    pub converged: bool,     // Adaptive sampling early-out flag
 }
 
 impl Default for Pixel {
@@ -15,13 +13,11 @@ impl Default for Pixel {
         Self {
             accumulated_radiance: Color::black(),
             samples: 0,
-            mean_luminance: 0.0,
-            m2_luminance: 0.0,
-            converged: false,
         }
     }
 }
 
+#[derive(Clone)]
 pub struct PathTracerConfig {
     pub width: usize,
     pub height: usize,
@@ -116,41 +112,41 @@ impl PathTracer {
 
         Ray::new(ray_origin, UnitVector3::new_normalize(ray_dir))
     }
+    /*
+        /// Samples the hemisphere uniformly.
+        /// Returns the world-space direction and the associated probability density function (PDF).
+        fn sample_uniform_hemisphere(
+            &self,
+            normal: &UnitVector3<f32>,
+            u1: f32, // Random number in [0, 1)
+            u2: f32, // Random number in [0, 1)
+        ) -> (Vector3<f32>, f32) {
+            // 1. Generate local coordinates on the hemisphere (Z-up axis)
+            let phi = 2.0 * std::f32::consts::PI * u2;
+            let local_z = u1; // cos(theta) = u1
+            let sin_theta = (1.0 - local_z * local_z).max(0.0).sqrt();
 
-    /// Samples the hemisphere uniformly.
-    /// Returns the world-space direction and the associated probability density function (PDF).
-    fn sample_uniform_hemisphere(
-        &self,
-        normal: &UnitVector3<f32>,
-        u1: f32, // Random number in [0, 1)
-        u2: f32, // Random number in [0, 1)
-    ) -> (Vector3<f32>, f32) {
-        // 1. Generate local coordinates on the hemisphere (Z-up axis)
-        let phi = 2.0 * std::f32::consts::PI * u2;
-        let local_z = u1; // cos(theta) = u1
-        let sin_theta = (1.0 - local_z * local_z).max(0.0).sqrt();
+            let local_x = sin_theta * phi.cos();
+            let local_y = sin_theta * phi.sin();
 
-        let local_x = sin_theta * phi.cos();
-        let local_y = sin_theta * phi.sin();
+            // 2. Build a stable orthonormal basis (TBN) from the world normal (Frisvad's method)
+            let n = normal.into_inner();
+            let sign = if n.z >= 0.0 { 1.0 } else { -1.0 };
+            let a = -1.0 / (sign + n.z);
+            let b = n.x * n.y * a;
 
-        // 2. Build a stable orthonormal basis (TBN) from the world normal (Frisvad's method)
-        let n = normal.into_inner();
-        let sign = if n.z >= 0.0 { 1.0 } else { -1.0 };
-        let a = -1.0 / (sign + n.z);
-        let b = n.x * n.y * a;
+            let tangent = Vector3::new(1.0 + sign * n.x * n.x * a, sign * b, -sign * n.x);
+            let bitangent = Vector3::new(b, sign + n.y * n.y * a, -n.y);
 
-        let tangent = Vector3::new(1.0 + sign * n.x * n.x * a, sign * b, -sign * n.x);
-        let bitangent = Vector3::new(b, sign + n.y * n.y * a, -n.y);
+            // 3. Transform the local sample direction into world space
+            let world_dir = (tangent * local_x + bitangent * local_y + n * local_z).normalize();
 
-        // 3. Transform the local sample direction into world space
-        let world_dir = (tangent * local_x + bitangent * local_y + n * local_z).normalize();
+            // 4. The PDF for a uniform hemisphere distribution is a constant: 1 / (2 * PI)
+            let pdf = 1.0 / (2.0 * std::f32::consts::PI);
 
-        // 4. The PDF for a uniform hemisphere distribution is a constant: 1 / (2 * PI)
-        let pdf = 1.0 / (2.0 * std::f32::consts::PI);
-
-        (world_dir, pdf)
-    }
-
+            (world_dir, pdf)
+        }
+    */
     fn sample_cosine_hemisphere(
         &self,
         normal: &UnitVector3<f32>,
@@ -217,8 +213,6 @@ impl PathTracer {
             }
 
             // 4. Setup the Shadow Ray to query visibility
-            // Self-intersection prevention: offset origin along the normal by 0.001
-            // Overshoot prevention: reduce tmax by 0.001 to avoid hitting the light geometry itself
             let shadow_ray = Ray::new_with_minmax(
                 hit_position + normal.into_inner() * 0.001,
                 light_dir,
@@ -228,19 +222,8 @@ impl PathTracer {
 
             // 5. Ray visibility query
             if self.trace_ray(&shadow_ray).is_none() {
-                // 6. Calculate physical distance attenuation (Inverse Square Law)
-                // 1e-4 safeguard prevents division by zero if the ray is on top of the light
-                //let attenuation = 1.0 / distance_squared.max(1e-4);
-
-                // Distance attenuation matching Blender Cycles (Power distributed over a sphere: 4 * PI * d^2)
-                // 1e-4 safeguard prevents division by zero if the ray is on top of the light
                 let attenuation = 1.0 / (4.0 * std::f32::consts::PI * distance_squared).max(1e-4);
-
-                // 7. Calculate the incident radiance reaching this specific point
                 let incident_radiance = light.color * light.intensity * attenuation;
-
-                // 8. Accumulate the reflected radiance contribution
-                // Outgoing Radiance = BRDF * Incident Radiance * cos_theta
                 total_direct += brdf.component_mul(&incident_radiance) * cos_theta;
             }
         }
@@ -253,11 +236,10 @@ impl PathTracer {
         let mut throughput = Color::white(); // Current path attenuation factor
 
         for bounce in 0..5 {
-            // 1. Scene Intersection Query
-            let hit_result = self.trace_ray(&ray);
+            // 1. Ray intersection
+            let hit_opt = self.trace_ray(&ray);
 
-            // If the ray escapes the scene, sample the sky/environment
-            let Some(hit) = hit_result else {
+            let Some(hit) = hit_opt else {
                 let sky_radiance = Color::black(); //scene.sample_sky(&ray);
                 accumulated_radiance += throughput.component_mul(&sky_radiance);
                 break;
@@ -287,7 +269,8 @@ impl PathTracer {
 
             // 2. Next Event Estimation (Analytic lights loop)
             // This calculates the direct lighting at this specific vertex
-            local_radiance += self.compute_direct_lighting(&hit_position, &normal, mat);
+            let direct_radiance = self.compute_direct_lighting(&hit_position, &normal, mat);
+            local_radiance += direct_radiance;
 
             // Add the local contribution of this vertex to the pixel, modulated by previous bounces
             accumulated_radiance += throughput.component_mul(&local_radiance);
@@ -347,10 +330,6 @@ impl PathTracer {
     /// This function is thread-safe as long as distinct threads operate
     /// on distinct pixel references.
     pub fn sample_pixel(&self, x: usize, y: usize, pixel: &mut Pixel) {
-        //if pixel.converged {
-        //    return;
-        //}
-
         let mut rng = self.init_pixel_rng(x as u32, y as u32, pixel.samples);
         let ray = self.generate_ray(&mut rng, x as f32, y as f32);
 
@@ -358,33 +337,5 @@ impl PathTracer {
 
         pixel.accumulated_radiance += sample_color;
         pixel.samples += 1;
-        /*
-                // 1. Compute luminance of the current sample (ITU-R BT.709 weights)
-                let luminance = sample_color.x * 0.2126 + sample_color.y * 0.7152 + sample_color.z * 0.0722;
-
-                // 2. Online update of variance using Welford's algorithm
-                let n = pixel.samples as f32;
-                let delta = luminance - pixel.mean_luminance;
-                pixel.mean_luminance += delta / n;
-                let delta2 = luminance - pixel.mean_luminance;
-                pixel.m2_luminance += delta * delta2;
-
-                // 3. Statistical test for convergence (only after a baseline of samples)
-                if pixel.samples >= 64 {
-                    let variance = pixel.m2_luminance / (n - 1.0);
-                    let std_dev = variance.max(0.0).sqrt();
-
-                    // Standard error of the mean using a 95% confidence interval (z = 1.96)
-                    let error = 1.96 * std_dev / n.sqrt();
-
-                    // Target threshold: 2% of the running mean + a small absolute epsilon
-                    // The epsilon prevents the test from stalling in pure pitch-black shadow zones
-                    let threshold = 0.02 * pixel.mean_luminance + 0.001;
-
-                    if error < threshold {
-                        pixel.converged = true;
-                    }
-                }
-        */
     }
 }
