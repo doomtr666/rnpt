@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::{AABB, Scene};
 use nalgebra::{Point3, Transform3, UnitVector3};
 
+#[derive(Clone, Copy)]
 pub struct FlatTriangle {
     pub v0: u32,
     pub v1: u32,
@@ -16,7 +17,6 @@ pub struct FlatTriangles {
     pub v0_x: [f32; 8], pub v0_y: [f32; 8], pub v0_z: [f32; 8],
     pub e1_x: [f32; 8], pub e1_y: [f32; 8], pub e1_z: [f32; 8],
     pub e2_x: [f32; 8], pub e2_y: [f32; 8], pub e2_z: [f32; 8],
-    pub first_triangle_idx: u32,
 }
 
 impl Default for FlatTriangles {
@@ -25,7 +25,6 @@ impl Default for FlatTriangles {
             v0_x: [0.0; 8], v0_y: [0.0; 8], v0_z: [0.0; 8],
             e1_x: [0.0; 8], e1_y: [0.0; 8], e1_z: [0.0; 8],
             e2_x: [0.0; 8], e2_y: [0.0; 8], e2_z: [0.0; 8],
-            first_triangle_idx: 0,
         }
     }
 }
@@ -156,48 +155,65 @@ impl BvhBuilder {
     }
 
     pub fn build(mut self) -> Bvh {
-        let mut nodes = Vec::new();
+        let mut soa_chunks = Vec::new();
+        let mut chunk_aabbs = Vec::new();
 
-        let tri_count = self.flat_triangles.len() as u32;
+        let num_triangles = self.flat_triangles.len();
+        
+        // Ensure flat_triangles is padded to a multiple of 8
+        let remainder = num_triangles % 8;
+        if remainder != 0 {
+            for _ in 0..(8 - remainder) {
+                self.flat_triangles.push(FlatTriangle { v0: 0, v1: 0, v2: 0, material: 0 });
+            }
+        }
+
+        for chunk_start in (0..self.flat_triangles.len()).step_by(8) {
+            let mut soa = FlatTriangles::default();
+            let mut chunk_aabb = AABB::invalid();
+            
+            for i in 0..8 {
+                let tri = &self.flat_triangles[chunk_start + i];
+                
+                let v0 = self.world_vertices[tri.v0 as usize];
+                let v1 = self.world_vertices[tri.v1 as usize];
+                let v2 = self.world_vertices[tri.v2 as usize];
+                let e1 = v1 - v0;
+                let e2 = v2 - v0;
+                
+                soa.v0_x[i] = v0.x; soa.v0_y[i] = v0.y; soa.v0_z[i] = v0.z;
+                soa.e1_x[i] = e1.x; soa.e1_y[i] = e1.y; soa.e1_z[i] = e1.z;
+                soa.e2_x[i] = e2.x; soa.e2_y[i] = e2.y; soa.e2_z[i] = e2.z;
+                
+                // Don't expand AABB with dummy triangles
+                if chunk_start + i < num_triangles {
+                    chunk_aabb.extend(v0);
+                    chunk_aabb.extend(v1);
+                    chunk_aabb.extend(v2);
+                }
+            }
+            
+            let eps = nalgebra::Vector3::new(1e-5, 1e-5, 1e-5);
+            chunk_aabb.min -= eps;
+            chunk_aabb.max += eps;
+            
+            soa_chunks.push(soa);
+            chunk_aabbs.push(chunk_aabb);
+        }
+
+        let mut nodes = Vec::new();
+        let chunk_count = soa_chunks.len() as u32;
 
         // Node 0 is the root
         nodes.push(BvhNode {
             aabb: AABB::invalid(),
             left_first: 0,
-            tri_count,
+            tri_count: chunk_count, // tri_count represents the number of chunks
         });
 
-        if tri_count > 0 {
-            self.update_node_bounds(0, &mut nodes);
-            self.subdivide(0, &mut nodes);
-        }
-
-        let mut soa_chunks = Vec::new();
-        for node in &mut nodes {
-            if node.is_leaf() {
-                let first = node.left_first as usize;
-                let count = node.tri_count as usize;
-                
-                let mut soa = FlatTriangles::default();
-                soa.first_triangle_idx = first as u32;
-                
-                for i in 0..count {
-                    let tri = &self.flat_triangles[first + i];
-                    let v0 = self.world_vertices[tri.v0 as usize];
-                    let v1 = self.world_vertices[tri.v1 as usize];
-                    let v2 = self.world_vertices[tri.v2 as usize];
-                    let e1 = v1 - v0;
-                    let e2 = v2 - v0;
-                    soa.v0_x[i] = v0.x; soa.v0_y[i] = v0.y; soa.v0_z[i] = v0.z;
-                    soa.e1_x[i] = e1.x; soa.e1_y[i] = e1.y; soa.e1_z[i] = e1.z;
-                    soa.e2_x[i] = e2.x; soa.e2_y[i] = e2.y; soa.e2_z[i] = e2.z;
-                }
-                
-                node.left_first = soa_chunks.len() as u32;
-                // node.tri_count remains > 0 to identify it as a leaf.
-                // We don't change tri_count because the SIMD mask inherently ignores padded zero triangles.
-                soa_chunks.push(soa);
-            }
+        if chunk_count > 0 {
+            self.update_node_bounds(0, &mut nodes, &chunk_aabbs);
+            self.subdivide(0, &mut nodes, &chunk_aabbs);
         }
 
         Bvh {
@@ -209,39 +225,34 @@ impl BvhBuilder {
         }
     }
 
-    fn update_node_bounds(&self, node_idx: usize, nodes: &mut Vec<BvhNode>) {
+    fn update_node_bounds(&self, node_idx: usize, nodes: &mut Vec<BvhNode>, chunk_aabbs: &[AABB]) {
         let node = &mut nodes[node_idx];
         let mut aabb = AABB::invalid();
         let first = node.left_first as usize;
         let count = node.tri_count as usize;
 
         for i in 0..count {
-            let tri = &self.flat_triangles[first + i];
-            let v0 = self.world_vertices[tri.v0 as usize];
-            let v1 = self.world_vertices[tri.v1 as usize];
-            let v2 = self.world_vertices[tri.v2 as usize];
-            aabb.extend(v0);
-            aabb.extend(v1);
-            aabb.extend(v2);
+            let chunk_aabb = &chunk_aabbs[first + i];
+            aabb.min.x = aabb.min.x.min(chunk_aabb.min.x);
+            aabb.min.y = aabb.min.y.min(chunk_aabb.min.y);
+            aabb.min.z = aabb.min.z.min(chunk_aabb.min.z);
+            aabb.max.x = aabb.max.x.max(chunk_aabb.max.x);
+            aabb.max.y = aabb.max.y.max(chunk_aabb.max.y);
+            aabb.max.z = aabb.max.z.max(chunk_aabb.max.z);
         }
-        // Expand AABB slightly to avoid precision issues with flat triangles
-        let eps = nalgebra::Vector3::new(1e-5, 1e-5, 1e-5);
-        aabb.min -= eps;
-        aabb.max += eps;
 
         node.aabb = aabb;
     }
 
-    fn subdivide(&mut self, node_idx: usize, nodes: &mut Vec<BvhNode>) {
+    fn subdivide(&mut self, node_idx: usize, nodes: &mut Vec<BvhNode>, chunk_aabbs: &[AABB]) {
         let node = &nodes[node_idx];
-        if node.tri_count <= 8 {
+        if node.tri_count <= 1 {
             return;
         }
 
         let first = node.left_first as usize;
         let count = node.tri_count as usize;
 
-        // Split in the middle (array is already sorted by morton code)
         let split_idx = first + count / 2;
         let left_count = split_idx - first;
         let right_count = count - left_count;
@@ -264,11 +275,11 @@ impl BvhBuilder {
         nodes[node_idx].left_first = left_child_idx as u32;
         nodes[node_idx].tri_count = 0;
 
-        self.update_node_bounds(left_child_idx, nodes);
-        self.update_node_bounds(right_child_idx, nodes);
+        self.update_node_bounds(left_child_idx, nodes, chunk_aabbs);
+        self.update_node_bounds(right_child_idx, nodes, chunk_aabbs);
 
-        self.subdivide(left_child_idx, nodes);
-        self.subdivide(right_child_idx, nodes);
+        self.subdivide(left_child_idx, nodes, chunk_aabbs);
+        self.subdivide(right_child_idx, nodes, chunk_aabbs);
     }
 
     /// Expands a 21-bit integer into 64 bits, inserting two zeros between each bit.
@@ -315,6 +326,7 @@ pub struct BvhHit {
     pub v0: u32,
     pub v1: u32,
     pub v2: u32,
+    pub chunk_idx: u32,
 }
 
 pub struct Bvh {
@@ -360,7 +372,8 @@ impl Bvh {
 
                 if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
                     t_max = simd_hit.hit.t;
-                    let tri_global_idx = chunk.first_triangle_idx as usize + simd_hit.lane;
+                    // L'index se calcule trivialement : chunk_idx * 8 + lane !
+                    let tri_global_idx = chunk_idx * 8 + simd_hit.lane;
                     let tri = &self.triangles[tri_global_idx];
                     
                     closest_hit = Some(BvhHit {
@@ -369,6 +382,7 @@ impl Bvh {
                         v0: tri.v0,
                         v1: tri.v1,
                         v2: tri.v2,
+                        chunk_idx: chunk_idx as u32,
                     });
                 }
             } else {
