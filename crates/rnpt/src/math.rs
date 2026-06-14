@@ -254,18 +254,18 @@ impl Ray {
         let mut best_t = current_t_max;
         let mut best_lane = None;
 
-        // Parcourir uniquement les lanes valides grâce au bitmask
+        // Loop over valid lanes only using the bitmask
         while bitmask != 0 {
             let lane = bitmask.trailing_zeros() as usize;
             if t_arr[lane] < best_t {
                 best_t = t_arr[lane];
                 best_lane = Some(lane);
             }
-            bitmask &= bitmask - 1; // Efface le bit de poids faible
+            bitmask &= bitmask - 1; // Clear the lowest set bit
         }
 
         best_lane.map(|lane| {
-            // On extrait u et v uniquement pour la lane gagnante !
+            // Extract u and v only for the winning lane!
             let u_arr = u.to_array();
             let v_arr = v.to_array();
 

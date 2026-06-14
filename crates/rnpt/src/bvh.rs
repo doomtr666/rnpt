@@ -532,6 +532,47 @@ pub struct Bvh {
     pub soa_chunks: Vec<FlatTriangles>,
 }
 
+struct BvhStack {
+    data: [(u32, f32); MAX_TRAVERSAL_DEPTH],
+    ptr: usize,
+}
+
+impl BvhStack {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            data: [(0, 0.0); MAX_TRAVERSAL_DEPTH],
+            ptr: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, node_idx: u32, t: f32) {
+        unsafe {
+            *self.data.get_unchecked_mut(self.ptr) = (node_idx, t);
+        }
+        self.ptr += 1;
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> (u32, f32) {
+        self.ptr -= 1;
+        unsafe {
+            *self.data.get_unchecked(self.ptr)
+        }
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.ptr == 0
+    }
+    
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.ptr
+    }
+}
+
 impl Bvh {
     #[inline(always)]
     fn get_node(&self, idx: u32) -> &BvhNode {
@@ -546,19 +587,16 @@ impl Bvh {
             return None;
         }
 
-        let mut stack = [(0u32, 0.0f32); MAX_TRAVERSAL_DEPTH];
-        let mut stack_ptr = 0;
+        let mut stack = BvhStack::new();
 
         let root_t = ray.intersect_aabb(&self.nodes[0].aabb, t_max);
         let Some(root_t) = root_t else {
             return None;
         };
-        stack[stack_ptr] = (0, root_t);
-        stack_ptr += 1;
+        stack.push(0, root_t);
 
-        while stack_ptr > 0 {
-            stack_ptr -= 1;
-            let (node_idx, node_t) = stack[stack_ptr];
+        while !stack.is_empty() {
+            let (node_idx, node_t) = stack.pop();
 
             if node_t >= t_max {
                 continue;
@@ -591,7 +629,7 @@ impl Bvh {
                     }
                 }
             } else {
-                if stack_ptr + 1 < MAX_TRAVERSAL_DEPTH {
+                if stack.len() + 1 < MAX_TRAVERSAL_DEPTH {
                     let left_idx = node.left_first;
                     let right_idx = left_idx + 1;
 
@@ -604,22 +642,15 @@ impl Bvh {
                             // FRONT-TO-BACK ORDER: Push the furthest node first.
                             // This ensures the closest node is at the top of the stack and processed first.
                             if t_left < t_right {
-                                stack[stack_ptr] = (right_idx, t_right);
-                                stack[stack_ptr + 1] = (left_idx, t_left);
+                                stack.push(right_idx, t_right);
+                                stack.push(left_idx, t_left);
                             } else {
-                                stack[stack_ptr] = (left_idx, t_left);
-                                stack[stack_ptr + 1] = (right_idx, t_right);
+                                stack.push(left_idx, t_left);
+                                stack.push(right_idx, t_right);
                             }
-                            stack_ptr += 2;
                         }
-                        (Some(t_left), None) => {
-                            stack[stack_ptr] = (left_idx, t_left);
-                            stack_ptr += 1;
-                        }
-                        (None, Some(t_right)) => {
-                            stack[stack_ptr] = (right_idx, t_right);
-                            stack_ptr += 1;
-                        }
+                        (Some(t_left), None) => stack.push(left_idx, t_left),
+                        (None, Some(t_right)) => stack.push(right_idx, t_right),
                         (None, None) => {}
                     }
                 }
