@@ -250,20 +250,18 @@ impl Ray {
             return None;
         }
 
-        let t_arr = t.to_array();
-        let mut bitmask = final_mask.to_bitmask();
+        // Missed lanes become +inf so they can never win: no need to skip them.
+        let t_valid = final_mask.blend(t, f32x8::splat(f32::INFINITY));
 
+        // Horizontal min: 8 unconditional comparisons, no bit twiddling.
+        let t_arr = t_valid.to_array();
         let mut best_t = current_t_max;
         let mut best_lane = None;
-
-        // Loop over valid lanes only using the bitmask
-        while bitmask != 0 {
-            let lane = bitmask.trailing_zeros() as usize;
-            if t_arr[lane] < best_t {
-                best_t = t_arr[lane];
+        for (lane, &ti) in t_arr.iter().enumerate() {
+            if ti < best_t {
+                best_t = ti;
                 best_lane = Some(lane);
             }
-            bitmask &= bitmask - 1; // Clear the lowest set bit
         }
 
         best_lane.map(|lane| {

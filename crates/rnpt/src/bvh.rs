@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
 
 use crate::Color;
 use crate::{AABB, Ray, Scene, TriangleHit};
@@ -7,6 +8,12 @@ use nalgebra::{Point3, Transform3, UnitVector3, Vector2};
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 const SAH_BINS: usize = 16;
 const MAX_LEAF_CHUNKS: u32 = 1; // 1 chunk = 8 triangles
+
+// SAH cost model. Only the ratio matters. Raising TRAVERSAL_COST relative to
+// INTERSECT_COST biases the builder toward shallower trees with bigger leaves
+// (fewer internal nodes visited, more SIMD chunk tests per leaf).
+const TRAVERSAL_COST: f32 = 1.0; // Ct: cost of visiting a node
+const INTERSECT_COST: f32 = 1.0; // Ci: cost of one SIMD-8 chunk intersection
 
 #[derive(Clone, Copy)]
 pub struct FlatTriangle {
@@ -417,9 +424,10 @@ impl BvhBuilder {
 
             for i in 0..SAH_BINS - 1 {
                 if left_counts[i] > 0 && right_counts[i] > 0 {
-                    let cost = 1.0
-                        + (left_aabbs[i].surface_area() * left_counts[i] as f32
-                            + right_aabbs[i].surface_area() * right_counts[i] as f32)
+                    let cost = TRAVERSAL_COST
+                        + INTERSECT_COST
+                            * (left_aabbs[i].surface_area() * left_counts[i] as f32
+                                + right_aabbs[i].surface_area() * right_counts[i] as f32)
                             * inv_total_area;
 
                     if cost < best_cost {
@@ -431,7 +439,7 @@ impl BvhBuilder {
             }
         }
 
-        let leaf_cost = count as f32; // Each chunk costs 1.0 (SIMD efficiency!)
+        let leaf_cost = count as f32 * INTERSECT_COST; // count chunks, each one SIMD test
 
         if best_cost >= leaf_cost {
             return;
@@ -547,12 +555,12 @@ impl BvhBuilder {
             node8.p_max_z[i] = bvh2_node.aabb.max.z;
 
             if bvh2_node.is_leaf() {
-                node8.child_indices[i] = bvh2_node.left_first;
-                node8.chunk_counts[i] = bvh2_node.chunk_count;
+                let idx = bvh2_node.left_first;
+                let count = bvh2_node.chunk_count;
+                // count is always > 0 for a leaf, so the leaf flag is always set.
+                node8.children[i] = idx | (count << 24) | 0x8000_0000;
             } else {
-                let child8_idx = Self::collapse_to_bvh8(c_idx, bvh2, bvh8);
-                node8.child_indices[i] = child8_idx;
-                node8.chunk_counts[i] = 0;
+                node8.children[i] = Self::collapse_to_bvh8(c_idx, bvh2, bvh8);
             }
         }
 
@@ -570,8 +578,10 @@ pub struct Bvh8Node {
     pub p_max_x: [f32; 8],
     pub p_max_y: [f32; 8],
     pub p_max_z: [f32; 8],
-    pub child_indices: [u32; 8],
-    pub chunk_counts: [u32; 8],
+    // Pre-encoded child references (computed once at build): for a leaf,
+    // `idx | (chunk_count << 24) | 0x8000_0000`; for an internal node, the
+    // plain Bvh8 node index. `u32::MAX` marks an empty lane.
+    pub children: [u32; 8],
 }
 
 impl Default for Bvh8Node {
@@ -583,8 +593,7 @@ impl Default for Bvh8Node {
             p_max_x: [f32::NAN; 8],
             p_max_y: [f32::NAN; 8],
             p_max_z: [f32::NAN; 8],
-            child_indices: [u32::MAX; 8],
-            chunk_counts: [0; 8],
+            children: [u32::MAX; 8],
         }
     }
 }
@@ -626,7 +635,10 @@ pub struct Bvh {
 }
 
 struct BvhStack {
-    data: [(u32, f32); MAX_TRAVERSAL_DEPTH],
+    // Uninitialized on purpose: every slot is written by `push` before it can
+    // be read by `pop`, so zero-initializing it per ray was a dead 512-byte
+    // memset (one per Bvh::intersect call).
+    data: [MaybeUninit<(u32, f32)>; MAX_TRAVERSAL_DEPTH],
     ptr: usize,
 }
 
@@ -634,7 +646,7 @@ impl BvhStack {
     #[inline(always)]
     fn new() -> Self {
         Self {
-            data: [(0, 0.0); MAX_TRAVERSAL_DEPTH],
+            data: [const { MaybeUninit::uninit() }; MAX_TRAVERSAL_DEPTH],
             ptr: 0,
         }
     }
@@ -642,7 +654,7 @@ impl BvhStack {
     #[inline(always)]
     fn push(&mut self, node_idx: u32, t: f32) {
         unsafe {
-            *self.data.get_unchecked_mut(self.ptr) = (node_idx, t);
+            self.data.get_unchecked_mut(self.ptr).write((node_idx, t));
         }
         self.ptr += 1;
     }
@@ -650,26 +662,33 @@ impl BvhStack {
     #[inline(always)]
     fn pop(&mut self) -> (u32, f32) {
         self.ptr -= 1;
-        unsafe {
-            *self.data.get_unchecked(self.ptr)
-        }
+        unsafe { self.data.get_unchecked(self.ptr).assume_init() }
     }
+
 
     #[inline(always)]
     fn is_empty(&self) -> bool {
         self.ptr == 0
     }
-    
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.ptr
-    }
 }
 
 impl Bvh {
+    // Unchecked accessors for the traversal hot path. Indices are always valid
+    // by construction (encoded at build time / derived from in-range lanes), so
+    // we skip bounds checks while keeping `intersect` readable.
     #[inline(always)]
     fn get_node(&self, idx: u32) -> &Bvh8Node {
         unsafe { self.nodes.get_unchecked(idx as usize) }
+    }
+
+    #[inline(always)]
+    fn get_chunk(&self, idx: usize) -> &FlatTriangles {
+        unsafe { self.soa_chunks.get_unchecked(idx) }
+    }
+
+    #[inline(always)]
+    fn get_triangle(&self, idx: usize) -> &FlatTriangle {
+        unsafe { self.triangles.get_unchecked(idx) }
     }
 
     pub fn intersect(&self, ray: &Ray) -> Option<BvhHit> {
@@ -682,7 +701,6 @@ impl Bvh {
 
         let mut stack = BvhStack::new();
         stack.push(0, 0.0); // push root
-
 
         while !stack.is_empty() {
             let (encoded_idx, node_t) = stack.pop();
@@ -698,12 +716,12 @@ impl Bvh {
 
                 for i in 0..chunk_count {
                     let chunk_idx = start_chunk as usize + i as usize;
-                    let chunk = &self.soa_chunks[chunk_idx];
+                    let chunk = self.get_chunk(chunk_idx);
 
                     if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
                         t_max = simd_hit.hit.t;
                         let tri_global_idx = chunk_idx * 8 + simd_hit.lane;
-                        let tri = &self.triangles[tri_global_idx];
+                        let tri = self.get_triangle(tri_global_idx);
 
                         closest_hit = Some(BvhHit {
                             hit: simd_hit.hit,
@@ -727,19 +745,11 @@ impl Bvh {
                     let lane = bitmask.trailing_zeros() as usize;
                     bitmask &= bitmask - 1;
 
-                    let idx = node.child_indices[lane];
-                    if idx == u32::MAX {
-                        continue; // Empty lane
-                    }
-
+                    // Encoded once at build time. Guard against empty lanes
+                    // (u32::MAX) in case a NaN slips through min/max in the mask.
+                    let encoded = node.children[lane];
                     let t = t_arr[lane];
-                    if t < t_max {
-                        let count = node.chunk_counts[lane];
-                        let encoded = if count > 0 {
-                            idx | (count << 24) | 0x8000_0000
-                        } else {
-                            idx
-                        };
+                    if encoded != u32::MAX && t < t_max {
                         hits[hit_count] = (encoded, t);
                         hit_count += 1;
                     }

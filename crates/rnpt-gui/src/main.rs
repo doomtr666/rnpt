@@ -423,7 +423,7 @@ impl eframe::App for RnptGuiApp {
                 ui.label(format!("Samples/Pixel (avg): {:.1}", avg_samples));
                 ui.label(format!(
                     "Performance: {}",
-                    format_rays_per_sec(self.local_rays_per_sec)
+                    format_paths_per_sec(self.local_rays_per_sec)
                 ));
 
                 ui.add_space(6.0);
@@ -542,13 +542,15 @@ fn tonemap_and_convert(
         });
 }
 
-fn format_rays_per_sec(rays_per_sec: f64) -> String {
-    if rays_per_sec >= 1_000_000.0 {
-        format!("{:.2} Mrays/s", rays_per_sec / 1_000_000.0)
-    } else if rays_per_sec >= 1_000.0 {
-        format!("{:.1} Krays/s", rays_per_sec / 1_000.0)
+// Note: the counter is incremented once per `sample_pixel` (one full path:
+// camera ray + bounces + shadow rays), so this is paths/s, not rays/s.
+fn format_paths_per_sec(paths_per_sec: f64) -> String {
+    if paths_per_sec >= 1_000_000.0 {
+        format!("{:.2} Mpaths/s", paths_per_sec / 1_000_000.0)
+    } else if paths_per_sec >= 1_000.0 {
+        format!("{:.1} Kpaths/s", paths_per_sec / 1_000.0)
     } else {
-        format!("{:.0} rays/s", rays_per_sec)
+        format!("{:.0} paths/s", paths_per_sec)
     }
 }
 
