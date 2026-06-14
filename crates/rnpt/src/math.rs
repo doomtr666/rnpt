@@ -280,6 +280,59 @@ impl Ray {
         })
     }
 
+    /// Any-hit test for shadow rays: returns true as soon as any of the 8
+    /// triangles is hit within [tmin, t_max]. Same masks as `intersect_simd_8`
+    /// (incl. front-face culling, to match the closest-hit render exactly), but
+    /// no min/argmin/uv reduction — we only need "is anything there?".
+    #[inline(always)]
+    pub fn occluded_simd_8(&self, soa: &crate::bvh::FlatTriangles, t_max: f32) -> bool {
+        let v0_x = f32x8::from(soa.v0_x);
+        let v0_y = f32x8::from(soa.v0_y);
+        let v0_z = f32x8::from(soa.v0_z);
+
+        let e1_x = f32x8::from(soa.e1_x);
+        let e1_y = f32x8::from(soa.e1_y);
+        let e1_z = f32x8::from(soa.e1_z);
+
+        let e2_x = f32x8::from(soa.e2_x);
+        let e2_y = f32x8::from(soa.e2_y);
+        let e2_z = f32x8::from(soa.e2_z);
+
+        let dir_x = f32x8::splat(self.direction.x);
+        let dir_y = f32x8::splat(self.direction.y);
+        let dir_z = f32x8::splat(self.direction.z);
+
+        let h_x = dir_y * e2_z - dir_z * e2_y;
+        let h_y = dir_z * e2_x - dir_x * e2_z;
+        let h_z = dir_x * e2_y - dir_y * e2_x;
+
+        let det = e1_x * h_x + e1_y * h_y + e1_z * h_z;
+        let det_mask = det.simd_ge(f32x8::splat(1e-7));
+
+        let inv_det = f32x8::splat(1.0) / det;
+
+        let s_x = f32x8::splat(self.origin.x) - v0_x;
+        let s_y = f32x8::splat(self.origin.y) - v0_y;
+        let s_z = f32x8::splat(self.origin.z) - v0_z;
+
+        let u = inv_det * (s_x * h_x + s_y * h_y + s_z * h_z);
+        let u_mask = u.simd_ge(f32x8::ZERO) & u.simd_le(f32x8::splat(1.0));
+
+        let q_x = s_y * e1_z - s_z * e1_y;
+        let q_y = s_z * e1_x - s_x * e1_z;
+        let q_z = s_x * e1_y - s_y * e1_x;
+
+        let v = inv_det * (dir_x * q_x + dir_y * q_y + dir_z * q_z);
+        let uv_mask = v.simd_ge(f32x8::ZERO) & (u + v).simd_le(f32x8::splat(1.0));
+
+        let t = inv_det * (e2_x * q_x + e2_y * q_y + e2_z * q_z);
+        let tmin_mask = t.simd_ge(f32x8::splat(self.tmin));
+        let tmax_mask = t.simd_le(f32x8::splat(t_max));
+
+        let final_mask = det_mask & u_mask & uv_mask & tmin_mask & tmax_mask;
+        final_mask.to_bitmask() != 0
+    }
+
     #[inline(always)]
     pub fn intersect_bvh8_dist(&self, node: &crate::bvh::Bvh8Node, t_max: f32) -> (u32, [f32; 8]) {
         use wide::f32x8;

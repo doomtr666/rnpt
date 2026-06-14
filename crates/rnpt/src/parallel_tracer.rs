@@ -37,7 +37,9 @@ pub struct ParallelTracer {
     threads: Vec<thread::JoinHandle<()>>,
 
     // Performance metrics
-    total_rays: Arc<AtomicU64>,
+    total_rays: Arc<AtomicU64>,        // paths (one per sample_pixel)
+    total_real_rays: Arc<AtomicU64>,   // closest-hit rays (primary + bounces)
+    total_shadow_rays: Arc<AtomicU64>, // any-hit shadow rays
     // We keep a flag to terminate threads on drop
     running: Arc<AtomicBool>,
 }
@@ -55,6 +57,8 @@ impl ParallelTracer {
         let config = Arc::new(Mutex::new(config));
         let epoch = Arc::new(AtomicU32::new(1));
         let total_rays = Arc::new(AtomicU64::new(0));
+        let total_real_rays = Arc::new(AtomicU64::new(0));
+        let total_shadow_rays = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicBool::new(true));
 
         let num_threads = thread::available_parallelism()
@@ -67,6 +71,8 @@ impl ParallelTracer {
             let config_mutex = config.clone();
             let epoch_atomic = epoch.clone();
             let rays_atomic = total_rays.clone();
+            let real_rays_atomic = total_real_rays.clone();
+            let shadow_rays_atomic = total_shadow_rays.clone();
             let running_atomic = running.clone();
 
             threads.push(thread::spawn(move || {
@@ -77,6 +83,8 @@ impl ParallelTracer {
                     config_mutex,
                     epoch_atomic,
                     rays_atomic,
+                    real_rays_atomic,
+                    shadow_rays_atomic,
                     running_atomic,
                 )
             }));
@@ -88,6 +96,8 @@ impl ParallelTracer {
             pixels,
             threads,
             total_rays,
+            total_real_rays,
+            total_shadow_rays,
             running,
         }
     }
@@ -119,6 +129,14 @@ impl ParallelTracer {
         self.total_rays.swap(0, Ordering::Relaxed)
     }
 
+    pub fn pop_real_rays_traced(&self) -> u64 {
+        self.total_real_rays.swap(0, Ordering::Relaxed)
+    }
+
+    pub fn pop_shadow_rays_traced(&self) -> u64 {
+        self.total_shadow_rays.swap(0, Ordering::Relaxed)
+    }
+
     fn worker_loop(
         thread_idx: usize,
         num_threads: usize,
@@ -126,6 +144,8 @@ impl ParallelTracer {
         config_mutex: Arc<Mutex<PathTracerConfig>>,
         epoch_atomic: Arc<AtomicU32>,
         rays_atomic: Arc<AtomicU64>,
+        real_rays_atomic: Arc<AtomicU64>,
+        shadow_rays_atomic: Arc<AtomicU64>,
         running_atomic: Arc<AtomicBool>,
     ) {
         let mut local_epoch = 0;
@@ -161,7 +181,9 @@ impl ParallelTracer {
             let tracer = path_tracer.as_ref().unwrap();
 
             // Trace a batch of rays
-            let mut rays_traced = 0;
+            let mut rays_traced = 0; // paths (also drives the batch flush cadence)
+            let mut real_rays_traced = 0; // closest-hit rays (primary + bounces)
+            let mut shadow_rays_traced = 0; // any-hit shadow rays
 
             // Block-based rendering (Tiles)
             // We use contiguous block assignment (Thread 0 gets the first N blocks, Thread 1 the next N, etc.)
@@ -203,12 +225,18 @@ impl ParallelTracer {
                                 break; // Abort and restart/exit
                             }
                             rays_atomic.fetch_add(rays_traced, Ordering::Relaxed);
+                            real_rays_atomic.fetch_add(real_rays_traced, Ordering::Relaxed);
+                            shadow_rays_atomic.fetch_add(shadow_rays_traced, Ordering::Relaxed);
                             rays_traced = 0;
+                            real_rays_traced = 0;
+                            shadow_rays_traced = 0;
                         }
 
                         unsafe {
                             let pixel = buffer.get_mut(i);
-                            tracer.sample_pixel(x, y, pixel);
+                            let (r, s) = tracer.sample_pixel(x, y, pixel);
+                            real_rays_traced += r;
+                            shadow_rays_traced += s;
                         }
 
                         rays_traced += 1;
@@ -230,6 +258,8 @@ impl ParallelTracer {
 
             if rays_traced > 0 {
                 rays_atomic.fetch_add(rays_traced, Ordering::Relaxed);
+                real_rays_atomic.fetch_add(real_rays_traced, Ordering::Relaxed);
+                shadow_rays_atomic.fetch_add(shadow_rays_traced, Ordering::Relaxed);
             }
         }
     }

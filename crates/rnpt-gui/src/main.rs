@@ -18,11 +18,15 @@ struct RnptGuiApp {
     tracer: Option<rnpt::ParallelTracer>,
     last_fps_time: Instant,
     rays_since_last_fps: u64,
+    real_rays_since_last_fps: u64,
+    shadow_rays_since_last_fps: u64,
 
     local_pixels: Vec<rnpt::Pixel>,
     local_width: usize,
     local_height: usize,
     local_rays_per_sec: f64,
+    local_real_rays_per_sec: f64,
+    local_shadow_rays_per_sec: f64,
 
     texture_handle: Option<egui::TextureHandle>,
     last_exposure: f32,
@@ -97,10 +101,14 @@ impl RnptGuiApp {
             tracer,
             last_fps_time: Instant::now(),
             rays_since_last_fps: 0,
+            real_rays_since_last_fps: 0,
+            shadow_rays_since_last_fps: 0,
             local_pixels: vec![rnpt::Pixel::default(); width * height],
             local_width: width,
             local_height: height,
             local_rays_per_sec: 0.0,
+            local_real_rays_per_sec: 0.0,
+            local_shadow_rays_per_sec: 0.0,
             texture_handle: None,
             last_exposure: 1.0,
             last_tonemapper: TonemapOperator::Aces,
@@ -141,7 +149,11 @@ impl RnptGuiApp {
         self.local_pixels = vec![rnpt::Pixel::default(); self.local_width * self.local_height];
 
         self.rays_since_last_fps = 0;
+        self.real_rays_since_last_fps = 0;
+        self.shadow_rays_since_last_fps = 0;
         self.local_rays_per_sec = 0.0;
+        self.local_real_rays_per_sec = 0.0;
+        self.local_shadow_rays_per_sec = 0.0;
     }
 }
 
@@ -159,15 +171,21 @@ impl eframe::App for RnptGuiApp {
         if let Some(tracer) = &self.tracer {
             tracer.fetch_pixels(&mut self.local_pixels);
 
-            let rays = tracer.pop_rays_traced();
-            self.rays_since_last_fps += rays;
+            self.rays_since_last_fps += tracer.pop_rays_traced();
+            self.real_rays_since_last_fps += tracer.pop_real_rays_traced();
+            self.shadow_rays_since_last_fps += tracer.pop_shadow_rays_traced();
             pixels_updated = true;
 
             let now = Instant::now();
             let elapsed_fps = now.duration_since(self.last_fps_time).as_secs_f64();
             if elapsed_fps >= 0.5 {
                 self.local_rays_per_sec = self.rays_since_last_fps as f64 / elapsed_fps;
+                self.local_real_rays_per_sec = self.real_rays_since_last_fps as f64 / elapsed_fps;
+                self.local_shadow_rays_per_sec =
+                    self.shadow_rays_since_last_fps as f64 / elapsed_fps;
                 self.rays_since_last_fps = 0;
+                self.real_rays_since_last_fps = 0;
+                self.shadow_rays_since_last_fps = 0;
                 self.last_fps_time = now;
             }
         }
@@ -426,6 +444,32 @@ impl eframe::App for RnptGuiApp {
                     format_paths_per_sec(self.local_rays_per_sec)
                 ));
 
+                let total_rays_per_sec =
+                    self.local_real_rays_per_sec + self.local_shadow_rays_per_sec;
+                ui.label(format!("Rays: {}", format_rays_per_sec(total_rays_per_sec)));
+
+                let shadow_pct = if total_rays_per_sec > 0.0 {
+                    100.0 * self.local_shadow_rays_per_sec / total_rays_per_sec
+                } else {
+                    0.0
+                };
+                ui.label(format!(
+                    "  ├ closest: {}",
+                    format_rays_per_sec(self.local_real_rays_per_sec)
+                ));
+                ui.label(format!(
+                    "  └ shadow:  {} ({:.0}%)",
+                    format_rays_per_sec(self.local_shadow_rays_per_sec),
+                    shadow_pct
+                ));
+
+                let rays_per_path = if self.local_rays_per_sec > 0.0 {
+                    total_rays_per_sec / self.local_rays_per_sec
+                } else {
+                    0.0
+                };
+                ui.label(format!("Rays/Path (avg): {:.1}", rays_per_path));
+
                 ui.add_space(6.0);
                 ui.collapsing("Scene Stats", |ui| {
                     if let Some(ref scene) = self.current_scene {
@@ -542,8 +586,7 @@ fn tonemap_and_convert(
         });
 }
 
-// Note: the counter is incremented once per `sample_pixel` (one full path:
-// camera ray + bounces + shadow rays), so this is paths/s, not rays/s.
+// paths/s: one path per `sample_pixel` (camera ray + bounces + shadow rays).
 fn format_paths_per_sec(paths_per_sec: f64) -> String {
     if paths_per_sec >= 1_000_000.0 {
         format!("{:.2} Mpaths/s", paths_per_sec / 1_000_000.0)
@@ -551,6 +594,17 @@ fn format_paths_per_sec(paths_per_sec: f64) -> String {
         format!("{:.1} Kpaths/s", paths_per_sec / 1_000.0)
     } else {
         format!("{:.0} paths/s", paths_per_sec)
+    }
+}
+
+// rays/s: actual rays traced (primary + bounces + shadow), the real BVH throughput.
+fn format_rays_per_sec(rays_per_sec: f64) -> String {
+    if rays_per_sec >= 1_000_000.0 {
+        format!("{:.2} Mrays/s", rays_per_sec / 1_000_000.0)
+    } else if rays_per_sec >= 1_000.0 {
+        format!("{:.1} Krays/s", rays_per_sec / 1_000.0)
+    } else {
+        format!("{:.0} rays/s", rays_per_sec)
     }
 }
 

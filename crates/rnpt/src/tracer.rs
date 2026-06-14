@@ -189,6 +189,7 @@ impl PathTracer {
         hit_position: &Point3<f32>,
         normal: &UnitVector3<f32>,
         albedo: Color,
+        shadow_rays: &mut u64,
     ) -> Color {
         let mut total_direct = Color::zeros();
 
@@ -218,8 +219,9 @@ impl PathTracer {
                 distance - RAY_EPSILON,
             );
 
-            // Ray visibility query
-            if self.trace_ray(&shadow_ray).is_none() {
+            // Ray visibility query (any-hit, no closest-hit work)
+            *shadow_rays += 1;
+            if !self.config.bvh.is_occluded(&shadow_ray) {
                 let attenuation = 1.0 / (4.0 * std::f32::consts::PI * distance_squared).max(LIGHT_ATTENUATION_EPSILON);
                 let incident_radiance = light.color * light.intensity * attenuation;
                 total_direct += brdf.component_mul(&incident_radiance) * cos_theta;
@@ -229,12 +231,19 @@ impl PathTracer {
         total_direct
     }
 
-    fn trace_path(&self, mut ray: Ray, rng: &mut Pcg32) -> Color {
+    fn trace_path(
+        &self,
+        mut ray: Ray,
+        rng: &mut Pcg32,
+        rays: &mut u64,
+        shadow_rays: &mut u64,
+    ) -> Color {
         let mut accumulated_radiance = Color::black();
         let mut throughput = Color::white(); // Current path attenuation factor
 
         for bounce in 0..MAX_BOUNCES {
             // Ray intersection
+            *rays += 1;
             let hit_opt = self.trace_ray(&ray);
 
             let Some(hit) = hit_opt else {
@@ -294,7 +303,8 @@ impl PathTracer {
 
             // Next Event Estimation (Analytic lights loop)
             // This calculates the direct lighting at this specific vertex
-            let direct_radiance = self.compute_direct_lighting(&hit_position, &normal, albedo);
+            let direct_radiance =
+                self.compute_direct_lighting(&hit_position, &normal, albedo, shadow_rays);
             local_radiance += direct_radiance;
 
             // Add the local contribution of this vertex to the pixel, modulated by previous bounces
@@ -360,13 +370,18 @@ impl PathTracer {
     ///
     /// This function is thread-safe as long as distinct threads operate
     /// on distinct pixel references.
-    pub fn sample_pixel(&self, x: usize, y: usize, pixel: &mut Pixel) {
+    /// Traces one sample and returns `(rays, shadow_rays)`: closest-hit rays
+    /// (primary + bounces) and any-hit shadow rays respectively.
+    pub fn sample_pixel(&self, x: usize, y: usize, pixel: &mut Pixel) -> (u64, u64) {
         let mut rng = self.init_pixel_rng(x as u32, y as u32, pixel.samples);
         let ray = self.generate_ray(&mut rng, x as f32, y as f32);
 
-        let sample_color = self.trace_path(ray, &mut rng);
+        let mut rays = 0;
+        let mut shadow_rays = 0;
+        let sample_color = self.trace_path(ray, &mut rng, &mut rays, &mut shadow_rays);
 
         pixel.accumulated_radiance += sample_color;
         pixel.samples += 1;
+        (rays, shadow_rays)
     }
 }
