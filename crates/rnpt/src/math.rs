@@ -74,7 +74,6 @@ impl AABB {
             (v.z - self.min.z) / ext_z,
         )
     }
-
 }
 
 pub struct TriangleHit {
@@ -92,6 +91,7 @@ pub struct TriangleHitSimd {
 pub struct Ray {
     pub origin: Point3<f32>,
     pub direction: UnitVector3<f32>,
+    pub inv_direction: Vector3<f32>,
     pub tmin: f32,
     pub tmax: f32,
 }
@@ -101,6 +101,7 @@ impl Ray {
         Self {
             origin,
             direction,
+            inv_direction: Vector3::new(1.0 / direction.x, 1.0 / direction.y, 1.0 / direction.z),
             tmin: 0.0,
             tmax: f32::INFINITY,
         }
@@ -115,6 +116,7 @@ impl Ray {
         Self {
             origin,
             direction,
+            inv_direction: Vector3::new(1.0 / direction.x, 1.0 / direction.y, 1.0 / direction.z),
             tmin,
             tmax,
         }
@@ -122,43 +124,16 @@ impl Ray {
 
     /// Fast slab intersection method. Returns the distance `t` to the intersection, or `None` if miss.
     pub fn intersect_aabb(&self, aabb: &AABB, current_t_max: f32) -> Option<f32> {
-        let mut tmin = self.tmin;
-        let mut tmax = current_t_max;
+        let t0 = (aabb.min - self.origin).component_mul(&self.inv_direction);
+        let t1 = (aabb.max - self.origin).component_mul(&self.inv_direction);
 
-        // X axis
-        let inv_d = 1.0 / self.direction.x;
-        let mut t0 = (aabb.min.x - self.origin.x) * inv_d;
-        let mut t1 = (aabb.max.x - self.origin.x) * inv_d;
-        if inv_d < 0.0 {
-            std::mem::swap(&mut t0, &mut t1);
-        }
-        tmin = if t0 > tmin { t0 } else { tmin };
-        tmax = if t1 < tmax { t1 } else { tmax };
-        if tmax < tmin { return None; }
+        let tmin_v = t0.inf(&t1);
+        let tmax_v = t0.sup(&t1);
 
-        // Y axis
-        let inv_d = 1.0 / self.direction.y;
-        let mut t0 = (aabb.min.y - self.origin.y) * inv_d;
-        let mut t1 = (aabb.max.y - self.origin.y) * inv_d;
-        if inv_d < 0.0 {
-            std::mem::swap(&mut t0, &mut t1);
-        }
-        tmin = if t0 > tmin { t0 } else { tmin };
-        tmax = if t1 < tmax { t1 } else { tmax };
-        if tmax < tmin { return None; }
+        let tmin = tmin_v.max().max(self.tmin);
+        let tmax = tmax_v.min().min(current_t_max);
 
-        // Z axis
-        let inv_d = 1.0 / self.direction.z;
-        let mut t0 = (aabb.min.z - self.origin.z) * inv_d;
-        let mut t1 = (aabb.max.z - self.origin.z) * inv_d;
-        if inv_d < 0.0 {
-            std::mem::swap(&mut t0, &mut t1);
-        }
-        tmin = if t0 > tmin { t0 } else { tmin };
-        tmax = if t1 < tmax { t1 } else { tmax };
-        if tmax < tmin { return None; }
-
-        Some(tmin)
+        if tmax < tmin { None } else { Some(tmin) }
     }
 
     /// Möller–Trumbore algorithm.
@@ -206,75 +181,79 @@ impl Ray {
     }
 
     /// SIMD intersection for 8 triangles at once.
-    pub fn intersect_simd_8(&self, soa: &crate::bvh::FlatTriangles, current_t_max: f32) -> Option<TriangleHitSimd> {
+    pub fn intersect_simd_8(
+        &self,
+        soa: &crate::bvh::FlatTriangles,
+        current_t_max: f32,
+    ) -> Option<TriangleHitSimd> {
         let v0_x = f32x8::from(soa.v0_x);
         let v0_y = f32x8::from(soa.v0_y);
         let v0_z = f32x8::from(soa.v0_z);
-        
+
         let e1_x = f32x8::from(soa.e1_x);
         let e1_y = f32x8::from(soa.e1_y);
         let e1_z = f32x8::from(soa.e1_z);
-        
+
         let e2_x = f32x8::from(soa.e2_x);
         let e2_y = f32x8::from(soa.e2_y);
         let e2_z = f32x8::from(soa.e2_z);
-        
+
         let dir_x = f32x8::splat(self.direction.x);
         let dir_y = f32x8::splat(self.direction.y);
         let dir_z = f32x8::splat(self.direction.z);
-        
+
         // h = dir x e2
         let h_x = dir_y * e2_z - dir_z * e2_y;
         let h_y = dir_z * e2_x - dir_x * e2_z;
         let h_z = dir_x * e2_y - dir_y * e2_x;
-        
+
         // det = e1 . h
         let det = e1_x * h_x + e1_y * h_y + e1_z * h_z;
-        
+
         let epsilon = f32x8::splat(1e-7);
         let det_mask = det.simd_ge(epsilon); // culling backfaces
         // Note: wide cmp_* returns a f32x8 where bits are all 1 for true, 0 for false.
-        
+
         let inv_det = f32x8::splat(1.0) / det;
-        
+
         let origin_x = f32x8::splat(self.origin.x);
         let origin_y = f32x8::splat(self.origin.y);
         let origin_z = f32x8::splat(self.origin.z);
-        
+
         // s = origin - v0
         let s_x = origin_x - v0_x;
         let s_y = origin_y - v0_y;
         let s_z = origin_z - v0_z;
-        
+
         // u = inv_det * (s . h)
         let u = inv_det * (s_x * h_x + s_y * h_y + s_z * h_z);
         let u_mask = u.simd_ge(f32x8::ZERO) & u.simd_le(f32x8::splat(1.0));
-        
+
         // q = s x e1
         let q_x = s_y * e1_z - s_z * e1_y;
         let q_y = s_z * e1_x - s_x * e1_z;
         let q_z = s_x * e1_y - s_y * e1_x;
-        
+
         // v = inv_det * (dir . q)
         let v = inv_det * (dir_x * q_x + dir_y * q_y + dir_z * q_z);
         let uv_mask = v.simd_ge(f32x8::ZERO) & (u + v).simd_le(f32x8::splat(1.0));
-        
+
         // t = inv_det * (e2 . q)
         let t = inv_det * (e2_x * q_x + e2_y * q_y + e2_z * q_z);
         let tmin_mask = t.simd_ge(f32x8::splat(self.tmin));
         let tmax_mask = t.simd_le(f32x8::splat(current_t_max));
-        
+
         let final_mask = det_mask & u_mask & uv_mask & tmin_mask & tmax_mask;
-        
+
         let mut bitmask = final_mask.to_bitmask();
         if bitmask == 0 {
             return None;
         }
-        
+
         let t_arr = t.to_array();
         let mut best_t = current_t_max;
         let mut best_lane = None;
-        
+
         // Parcourir uniquement les lanes valides grâce au bitmask
         while bitmask != 0 {
             let lane = bitmask.trailing_zeros() as usize;
@@ -284,12 +263,12 @@ impl Ray {
             }
             bitmask &= bitmask - 1; // Efface le bit de poids faible
         }
-        
+
         best_lane.map(|lane| {
             // On extrait u et v uniquement pour la lane gagnante !
             let u_arr = u.to_array();
             let v_arr = v.to_array();
-            
+
             TriangleHitSimd {
                 hit: TriangleHit {
                     t: best_t,

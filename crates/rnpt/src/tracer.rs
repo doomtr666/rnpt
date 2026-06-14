@@ -298,7 +298,15 @@ impl PathTracer {
             local_radiance += direct_radiance;
 
             // Add the local contribution of this vertex to the pixel, modulated by previous bounces
-            accumulated_radiance += throughput.component_mul(&local_radiance);
+            let mut sample_radiance = throughput.component_mul(&local_radiance);
+            
+            // Clamp extreme fireflies
+            let max_radiance = 10.0;
+            sample_radiance.x = sample_radiance.x.min(max_radiance);
+            sample_radiance.y = sample_radiance.y.min(max_radiance);
+            sample_radiance.z = sample_radiance.z.min(max_radiance);
+
+            accumulated_radiance += sample_radiance;
 
             // Bounce Setup
 

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use crate::{AABB, Scene};
-use nalgebra::{Point3, Transform3, UnitVector3, Vector2};
 use crate::Color;
+use crate::{AABB, Ray, Scene, TriangleHit};
+use nalgebra::{Point3, Transform3, UnitVector3, Vector2};
 
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 const SAH_BINS: usize = 16;
@@ -167,7 +167,8 @@ impl BvhBuilder {
                         *vertex_map.entry(key).or_insert_with(|| {
                             let p =
                                 world_transform.transform_point(&mesh.vertices[local_idx as usize]);
-                            let normal = normal_matrix * mesh.normals[local_idx as usize].into_inner();
+                            let normal =
+                                normal_matrix * mesh.normals[local_idx as usize].into_inner();
                             self.world_normals.push(UnitVector3::new_normalize(normal));
 
                             let uv = if !mesh.uvs.is_empty() {
@@ -513,7 +514,7 @@ impl BvhNode {
 }
 
 pub struct BvhHit {
-    pub hit: crate::math::TriangleHit,
+    pub hit: TriangleHit,
     pub material: u32,
     pub v0: u32,
     pub v1: u32,
@@ -532,7 +533,12 @@ pub struct Bvh {
 }
 
 impl Bvh {
-    pub fn intersect(&self, ray: &crate::Ray) -> Option<BvhHit> {
+    #[inline(always)]
+    fn get_node(&self, idx: u32) -> &BvhNode {
+        unsafe { self.nodes.get_unchecked(idx as usize) }
+    }
+
+    pub fn intersect(&self, ray: &Ray) -> Option<BvhHit> {
         let mut closest_hit: Option<BvhHit> = None;
         let mut t_max = ray.tmax;
 
@@ -540,7 +546,7 @@ impl Bvh {
             return None;
         }
 
-        let mut stack = [(0usize, 0.0f32); MAX_TRAVERSAL_DEPTH];
+        let mut stack = [(0u32, 0.0f32); MAX_TRAVERSAL_DEPTH];
         let mut stack_ptr = 0;
 
         let root_t = ray.intersect_aabb(&self.nodes[0].aabb, t_max);
@@ -558,7 +564,7 @@ impl Bvh {
                 continue;
             }
 
-            let node = &self.nodes[node_idx];
+            let node = self.get_node(node_idx);
 
             if node.is_leaf() {
                 let start_chunk = node.left_first as usize;
@@ -586,10 +592,11 @@ impl Bvh {
                 }
             } else {
                 if stack_ptr + 1 < MAX_TRAVERSAL_DEPTH {
-                    let left_idx = node.left_first as usize;
+                    let left_idx = node.left_first;
                     let right_idx = left_idx + 1;
-                    let t_left_opt = ray.intersect_aabb(&self.nodes[left_idx].aabb, t_max);
-                    let t_right_opt = ray.intersect_aabb(&self.nodes[right_idx].aabb, t_max);
+
+                    let t_left_opt = ray.intersect_aabb(&self.get_node(left_idx).aabb, t_max);
+                    let t_right_opt = ray.intersect_aabb(&self.get_node(right_idx).aabb, t_max);
 
                     match (t_left_opt, t_right_opt) {
                         (Some(t_left), Some(t_right)) => {
