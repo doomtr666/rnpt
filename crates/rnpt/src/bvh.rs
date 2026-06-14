@@ -274,7 +274,7 @@ impl BvhBuilder {
         nodes.push(BvhNode {
             aabb: AABB::invalid(),
             left_first: 0,
-            tri_count: chunk_indices.len() as u32,
+            chunk_count: chunk_indices.len() as u32,
         });
 
         if !chunk_indices.is_empty() {
@@ -298,8 +298,11 @@ impl BvhBuilder {
             }
         }
 
+        let mut bvh8_nodes = Vec::new();
+        Self::collapse_to_bvh8(0, &nodes, &mut bvh8_nodes);
+
         Bvh {
-            nodes,
+            nodes: bvh8_nodes,
             vertices: self.world_vertices,
             normals: self.world_normals,
             uvs: self.world_uvs,
@@ -319,7 +322,7 @@ impl BvhBuilder {
         let node = &mut nodes[node_idx];
         let mut aabb = AABB::invalid();
         let first = node.left_first as usize;
-        let count = node.tri_count as usize;
+        let count = node.chunk_count as usize;
 
         for i in 0..count {
             let chunk_idx = chunk_indices[first + i];
@@ -339,7 +342,7 @@ impl BvhBuilder {
     ) {
         let node = &nodes[node_idx];
         let first = node.left_first as usize;
-        let count = node.tri_count as usize;
+        let count = node.chunk_count as usize;
 
         if count <= 1 {
             return;
@@ -467,18 +470,18 @@ impl BvhBuilder {
         nodes.push(BvhNode {
             aabb: AABB::invalid(),
             left_first: first as u32,
-            tri_count: left_count as u32,
+            chunk_count: left_count as u32,
         });
 
         let right_child_idx = nodes.len();
         nodes.push(BvhNode {
             aabb: AABB::invalid(),
             left_first: left as u32,
-            tri_count: (count - left_count) as u32,
+            chunk_count: (count - left_count) as u32,
         });
 
         nodes[node_idx].left_first = left_child_idx as u32;
-        nodes[node_idx].tri_count = 0;
+        nodes[node_idx].chunk_count = 0;
 
         self.update_node_bounds(left_child_idx, nodes, chunk_indices, chunk_aabbs);
         self.update_node_bounds(right_child_idx, nodes, chunk_indices, chunk_aabbs);
@@ -498,18 +501,108 @@ impl BvhBuilder {
             chunk_centroids,
         );
     }
+
+    fn collapse_to_bvh8(node_idx: usize, bvh2: &[BvhNode], bvh8: &mut Vec<Bvh8Node>) -> u32 {
+        let bvh8_idx = bvh8.len() as u32;
+        bvh8.push(Bvh8Node::default());
+
+        let mut children = vec![node_idx];
+
+        while children.len() < 8 {
+            let mut best_idx = None;
+            let mut best_area = -1.0;
+
+            for (i, &c_idx) in children.iter().enumerate() {
+                let node = &bvh2[c_idx];
+                if !node.is_leaf() {
+                    let area = node.aabb.surface_area();
+                    if area > best_area {
+                        best_area = area;
+                        best_idx = Some(i);
+                    }
+                }
+            }
+
+            if let Some(i) = best_idx {
+                let node = &bvh2[children[i]];
+                let left = node.left_first as usize;
+                let right = left + 1;
+                children.swap_remove(i);
+                children.push(left);
+                children.push(right);
+            } else {
+                break;
+            }
+        }
+
+        let mut node8 = Bvh8Node::default();
+
+        for (i, &c_idx) in children.iter().enumerate() {
+            let bvh2_node = &bvh2[c_idx];
+            node8.p_min_x[i] = bvh2_node.aabb.min.x;
+            node8.p_min_y[i] = bvh2_node.aabb.min.y;
+            node8.p_min_z[i] = bvh2_node.aabb.min.z;
+            node8.p_max_x[i] = bvh2_node.aabb.max.x;
+            node8.p_max_y[i] = bvh2_node.aabb.max.y;
+            node8.p_max_z[i] = bvh2_node.aabb.max.z;
+
+            if bvh2_node.is_leaf() {
+                node8.child_indices[i] = bvh2_node.left_first;
+                node8.chunk_counts[i] = bvh2_node.chunk_count;
+            } else {
+                let child8_idx = Self::collapse_to_bvh8(c_idx, bvh2, bvh8);
+                node8.child_indices[i] = child8_idx;
+                node8.chunk_counts[i] = 0;
+            }
+        }
+
+        bvh8[bvh8_idx as usize] = node8;
+        bvh8_idx
+    }
 }
+
+#[repr(C, align(32))]
+#[derive(Clone, Copy)]
+pub struct Bvh8Node {
+    pub p_min_x: [f32; 8],
+    pub p_min_y: [f32; 8],
+    pub p_min_z: [f32; 8],
+    pub p_max_x: [f32; 8],
+    pub p_max_y: [f32; 8],
+    pub p_max_z: [f32; 8],
+    pub child_indices: [u32; 8],
+    pub chunk_counts: [u32; 8],
+}
+
+impl Default for Bvh8Node {
+    fn default() -> Self {
+        Self {
+            p_min_x: [f32::NAN; 8],
+            p_min_y: [f32::NAN; 8],
+            p_min_z: [f32::NAN; 8],
+            p_max_x: [f32::NAN; 8],
+            p_max_y: [f32::NAN; 8],
+            p_max_z: [f32::NAN; 8],
+            child_indices: [u32::MAX; 8],
+            chunk_counts: [0; 8],
+        }
+    }
+}
+
+// ... skipped down to Bvh::intersect ...
+// Wait, I need to replace from Bvh8Node::default to Bvh::intersect end.
+// Let's be precise.
 
 #[derive(Clone, Copy)]
 pub struct BvhNode {
     pub aabb: AABB,
     pub left_first: u32,
-    pub tri_count: u32,
+    pub chunk_count: u32,
 }
 
 impl BvhNode {
     pub fn is_leaf(&self) -> bool {
-        self.tri_count > 0
+        self.chunk_count > 0
     }
 }
 
@@ -523,7 +616,7 @@ pub struct BvhHit {
 }
 
 pub struct Bvh {
-    pub nodes: Vec<BvhNode>,
+    pub nodes: Vec<Bvh8Node>,
     pub vertices: Vec<Point3<f32>>,
     pub normals: Vec<UnitVector3<f32>>,
     pub uvs: Vec<Vector2<f32>>,
@@ -575,7 +668,7 @@ impl BvhStack {
 
 impl Bvh {
     #[inline(always)]
-    fn get_node(&self, idx: u32) -> &BvhNode {
+    fn get_node(&self, idx: u32) -> &Bvh8Node {
         unsafe { self.nodes.get_unchecked(idx as usize) }
     }
 
@@ -588,33 +681,27 @@ impl Bvh {
         }
 
         let mut stack = BvhStack::new();
+        stack.push(0, 0.0); // push root
 
-        let root_t = ray.intersect_aabb(&self.nodes[0].aabb, t_max);
-        let Some(root_t) = root_t else {
-            return None;
-        };
-        stack.push(0, root_t);
 
         while !stack.is_empty() {
-            let (node_idx, node_t) = stack.pop();
+            let (encoded_idx, node_t) = stack.pop();
 
             if node_t >= t_max {
                 continue;
             }
 
-            let node = self.get_node(node_idx);
-
-            if node.is_leaf() {
-                let start_chunk = node.left_first as usize;
-                let chunk_count = node.tri_count as usize;
+            if (encoded_idx & 0x8000_0000) != 0 {
+                // Leaf node
+                let chunk_count = (encoded_idx >> 24) & 0x7F;
+                let start_chunk = encoded_idx & 0x00FF_FFFF;
 
                 for i in 0..chunk_count {
-                    let chunk_idx = start_chunk + i;
+                    let chunk_idx = start_chunk as usize + i as usize;
                     let chunk = &self.soa_chunks[chunk_idx];
 
                     if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
                         t_max = simd_hit.hit.t;
-                        // Calculate global triangle index from chunk index and SIMD lane
                         let tri_global_idx = chunk_idx * 8 + simd_hit.lane;
                         let tri = &self.triangles[tri_global_idx];
 
@@ -629,29 +716,47 @@ impl Bvh {
                     }
                 }
             } else {
-                if stack.len() + 1 < MAX_TRAVERSAL_DEPTH {
-                    let left_idx = node.left_first;
-                    let right_idx = left_idx + 1;
+                // Internal Bvh8Node
+                let node = self.get_node(encoded_idx);
+                let (mut bitmask, t_arr) = ray.intersect_bvh8_dist(node, t_max);
 
-                    let t_left_opt = ray.intersect_aabb(&self.get_node(left_idx).aabb, t_max);
-                    let t_right_opt = ray.intersect_aabb(&self.get_node(right_idx).aabb, t_max);
+                let mut hits = [(0u32, 0.0f32); 8];
+                let mut hit_count = 0;
 
-                    match (t_left_opt, t_right_opt) {
-                        (Some(t_left), Some(t_right)) => {
-                            // Both child boxes are hit by the ray.
-                            // FRONT-TO-BACK ORDER: Push the furthest node first.
-                            // This ensures the closest node is at the top of the stack and processed first.
-                            if t_left < t_right {
-                                stack.push(right_idx, t_right);
-                                stack.push(left_idx, t_left);
-                            } else {
-                                stack.push(left_idx, t_left);
-                                stack.push(right_idx, t_right);
-                            }
+                while bitmask != 0 {
+                    let lane = bitmask.trailing_zeros() as usize;
+                    bitmask &= bitmask - 1;
+
+                    let idx = node.child_indices[lane];
+                    if idx == u32::MAX {
+                        continue; // Empty lane
+                    }
+
+                    let t = t_arr[lane];
+                    if t < t_max {
+                        let count = node.chunk_counts[lane];
+                        let encoded = if count > 0 {
+                            idx | (count << 24) | 0x8000_0000
+                        } else {
+                            idx
+                        };
+                        hits[hit_count] = (encoded, t);
+                        hit_count += 1;
+                    }
+                }
+
+                if hit_count > 0 {
+                    // Insertion sort (descending) so the furthest is pushed first
+                    for i in 1..hit_count {
+                        let mut j = i;
+                        while j > 0 && hits[j - 1].1 < hits[j].1 {
+                            hits.swap(j - 1, j);
+                            j -= 1;
                         }
-                        (Some(t_left), None) => stack.push(left_idx, t_left),
-                        (None, Some(t_right)) => stack.push(right_idx, t_right),
-                        (None, None) => {}
+                    }
+
+                    for i in 0..hit_count {
+                        stack.push(hits[i].0, hits[i].1);
                     }
                 }
             }

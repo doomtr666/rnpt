@@ -245,12 +245,14 @@ impl Ray {
 
         let final_mask = det_mask & u_mask & uv_mask & tmin_mask & tmax_mask;
 
-        let mut bitmask = final_mask.to_bitmask();
+        let bitmask = final_mask.to_bitmask();
         if bitmask == 0 {
             return None;
         }
 
         let t_arr = t.to_array();
+        let mut bitmask = final_mask.to_bitmask();
+
         let mut best_t = current_t_max;
         let mut best_lane = None;
 
@@ -278,6 +280,45 @@ impl Ray {
                 lane,
             }
         })
+    }
+
+    #[inline(always)]
+    pub fn intersect_bvh8_dist(&self, node: &crate::bvh::Bvh8Node, t_max: f32) -> (u32, [f32; 8]) {
+        use wide::f32x8;
+
+        let p_min_x = f32x8::from(node.p_min_x);
+        let p_min_y = f32x8::from(node.p_min_y);
+        let p_min_z = f32x8::from(node.p_min_z);
+
+        let p_max_x = f32x8::from(node.p_max_x);
+        let p_max_y = f32x8::from(node.p_max_y);
+        let p_max_z = f32x8::from(node.p_max_z);
+
+        let origin_x = f32x8::splat(self.origin.x);
+        let origin_y = f32x8::splat(self.origin.y);
+        let origin_z = f32x8::splat(self.origin.z);
+
+        let inv_dir_x = f32x8::splat(self.inv_direction.x);
+        let inv_dir_y = f32x8::splat(self.inv_direction.y);
+        let inv_dir_z = f32x8::splat(self.inv_direction.z);
+
+        let t0_x = (p_min_x - origin_x) * inv_dir_x;
+        let t1_x = (p_max_x - origin_x) * inv_dir_x;
+        let tmin_x = t0_x.fast_min(t1_x);
+        let tmax_x = t0_x.fast_max(t1_x);
+
+        let t0_y = (p_min_y - origin_y) * inv_dir_y;
+        let t1_y = (p_max_y - origin_y) * inv_dir_y;
+        let tmin_y = tmin_x.fast_max(t0_y.fast_min(t1_y));
+        let tmax_y = tmax_x.fast_min(t0_y.fast_max(t1_y));
+
+        let t0_z = (p_min_z - origin_z) * inv_dir_z;
+        let t1_z = (p_max_z - origin_z) * inv_dir_z;
+        let tmin_z = tmin_y.fast_max(t0_z.fast_min(t1_z)).fast_max(f32x8::splat(self.tmin));
+        let tmax_z = tmax_y.fast_min(t0_z.fast_max(t1_z)).fast_min(f32x8::splat(t_max));
+
+        let mask = tmin_z.simd_le(tmax_z);
+        (mask.to_bitmask() as u32, tmin_z.to_array())
     }
 
     pub fn at(&self, t: f32) -> Point3<f32> {
