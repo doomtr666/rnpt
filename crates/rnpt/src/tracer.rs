@@ -1,6 +1,6 @@
-use std::sync::Arc;
-use crate::{Bvh, Camera, Color, ColorExt, Pcg32, Ray, Scene};
+use crate::{Bvh, Camera, Color, ColorExt, Light, Pcg32, Ray, Scene};
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(align(16))]
@@ -25,11 +25,15 @@ pub struct PathTracerConfig {
     pub camera: Camera,
     pub scene: Arc<Scene>,
     pub bvh: Arc<Bvh>,
+    /// Unified light list: scene punctual lights + one area light per emissive mesh.
+    pub lights: Arc<Vec<Light>>,
+    /// true  = NEE: sample emissive meshes as area lights, emission only on bounce 0.
+    /// false = "lucky": emission on every hit, no area-light sampling (BRDF only).
+    pub use_nee: bool,
 }
 
-const MAX_BOUNCES: u32 = 5;
+const MAX_BOUNCES: u32 = u32::MAX;
 const RAY_EPSILON: f32 = 0.001;
-const LIGHT_ATTENUATION_EPSILON: f32 = 1e-4;
 
 pub struct PathTracer {
     config: PathTracerConfig,
@@ -182,8 +186,9 @@ impl PathTracer {
         (world_dir, pdf)
     }
 
-    /// Computes the direct analytical lighting at a given surface intersection.
-    /// This function loops through all lights and checks for occlusion via shadow rays.
+    /// Direct lighting via NEE: one shadow ray per light, summed. Every light
+    /// type goes through the same `Light::sample_li` interface and the same
+    /// solid-angle estimator `f_r * Li * cos_s / pdf`.
     pub fn compute_direct_lighting(
         &self,
         hit_position: &Point3<f32>,
@@ -193,80 +198,42 @@ impl PathTracer {
         rng: &mut Pcg32,
     ) -> Color {
         let mut total_direct = Color::zeros();
-
-        // Evaluate the Lambertian BRDF (constant for the entire surface loop)
-        let brdf = albedo / std::f32::consts::PI;
-
-        // Iterate through all analytical light sources in the scene
-        for light in &self.config.scene.lights {
-            let hit_to_light = light.position - hit_position;
-            let distance_squared = hit_to_light.norm_squared();
-            let distance = distance_squared.sqrt();
-            let light_dir = UnitVector3::new_normalize(hit_to_light);
-
-            // Compute the geometric cosine term (N . L)
-            let cos_theta = normal.dot(&light_dir).max(0.0);
-
-            // Early out if the light source is behind the surface
-            if cos_theta <= 0.0 {
-                continue;
-            }
-
-            // Setup the Shadow Ray to query visibility
-            let shadow_ray = Ray::new_with_minmax(
-                hit_position + normal.into_inner() * RAY_EPSILON,
-                light_dir,
-                0.0,
-                distance - RAY_EPSILON,
-            );
-
-            // Ray visibility query (any-hit, no closest-hit work)
-            *shadow_rays += 1;
-            if !self.config.bvh.is_occluded(&shadow_ray) {
-                let attenuation = 1.0 / (4.0 * std::f32::consts::PI * distance_squared).max(LIGHT_ATTENUATION_EPSILON);
-                let incident_radiance = light.color * light.intensity * attenuation;
-                total_direct += brdf.component_mul(&incident_radiance) * cos_theta;
-            }
-        }
-
-        // Area lights: each emissive mesh is one light, sampled every call (NEE).
+        let brdf = albedo / std::f32::consts::PI; // Lambertian
         let textures = &self.config.scene.textures;
-        // Offset the shadow-ray origin off the surface, and measure distance FROM
-        // that origin, so `tmax = dist - RAY_EPSILON` is a full eps margin
-        // regardless of the surface/light angle. (Measuring from the un-offset
-        // hit made the margin collapse to eps*(1-cos_s) → the emitter
-        // self-occluded on surfaces facing it head-on, causing strange shadows.)
-        let origin = hit_position + normal.into_inner() * RAY_EPSILON;
-        for mesh in &self.config.bvh.emitters.meshes {
-            let s = mesh.sample(rng, textures);
 
-            let to_light = s.p - origin;
-            let d2 = to_light.norm_squared();
-            if d2 <= 0.0 {
-                continue;
-            }
-            let dist = d2.sqrt();
-            let wi = to_light / dist;
-
-            let cos_s = normal.dot(&wi).max(0.0); // at the shaded surface
-            let cos_l = s.normal.dot(&(-wi)).max(0.0); // at the emitter (front face)
-            if cos_s <= 0.0 || cos_l <= 0.0 {
+        for light in self.config.lights.iter() {
+            // In "lucky" mode, area-light contribution comes from BRDF rays
+            // hitting emitters instead, so skip NEE on them.
+            if !self.config.use_nee && light.is_area() {
                 continue;
             }
 
+            let Some(s) = light.sample_li(hit_position, rng, textures) else {
+                continue;
+            };
+
+            let cos_s = normal.dot(&s.wi).max(0.0);
+            if cos_s <= 0.0 {
+                continue;
+            }
+
+            // Shadow ray starts at t=0: single-sided culling rejects the
+            // originating triangle (det < 0), so no normal offset is needed.
+            let tmax = if s.distance.is_finite() {
+                s.distance - RAY_EPSILON
+            } else {
+                f32::INFINITY
+            };
             let shadow_ray = Ray::new_with_minmax(
-                origin,
-                UnitVector3::new_unchecked(wi),
+                *hit_position,
+                UnitVector3::new_unchecked(s.wi),
                 0.0,
-                dist - RAY_EPSILON,
+                tmax,
             );
 
             *shadow_rays += 1;
             if !self.config.bvh.is_occluded(&shadow_ray) {
-                // Area-measure estimator: cos_l / d2 is the solid-angle->area
-                // Jacobian; dividing by pdf_area (= 1/total_area) is unbiased.
-                let g = cos_s * cos_l / (d2 * s.pdf_area);
-                total_direct += brdf.component_mul(&s.le) * g;
+                total_direct += brdf.component_mul(&s.li) * (cos_s / s.pdf);
             }
         }
 
@@ -307,9 +274,9 @@ impl PathTracer {
 
             let has_textures = mat.albedo_texture.is_some() || mat.emissive_texture.is_some();
             let mut hit_uv = nalgebra::Vector2::zeros();
-            
+
             let w = 1.0 - hit.hit.u - hit.hit.v;
-            
+
             let c0 = self.config.bvh.colors[hit.v0 as usize];
             let c1 = self.config.bvh.colors[hit.v1 as usize];
             let c2 = self.config.bvh.colors[hit.v2 as usize];
@@ -333,11 +300,10 @@ impl PathTracer {
             // Direct Lighting Calculation
             let mut local_radiance = Color::black();
 
-            // Self-emission is only added when the emitter is seen directly (the
-            // camera/primary ray). On GI bounces it is omitted: that contribution
-            // is already covered by NEE (compute_direct_lighting) at the previous
-            // vertex, so adding it again would double-count and explode variance.
-            if bounce == 0 {
+            // NEE mode: emission only when the emitter is seen directly (bounce 0);
+            // GI bounces are covered by NEE at the previous vertex (avoids double
+            // counting). "Lucky" mode: emission on every hit (the old estimator).
+            if !self.config.use_nee || bounce == 0 {
                 let mut local_emissive = mat.emissive;
                 if let Some(tex_idx) = mat.emissive_texture {
                     if tex_idx < self.config.scene.textures.len() as u32 {
@@ -354,14 +320,15 @@ impl PathTracer {
             local_radiance += direct_radiance;
 
             // Add the local contribution of this vertex to the pixel, modulated by previous bounces
-            let mut sample_radiance = throughput.component_mul(&local_radiance);
-            
-            // Clamp extreme fireflies
-            let max_radiance = 10.0;
-            sample_radiance.x = sample_radiance.x.min(max_radiance);
-            sample_radiance.y = sample_radiance.y.min(max_radiance);
-            sample_radiance.z = sample_radiance.z.min(max_radiance);
+            let sample_radiance = throughput.component_mul(&local_radiance);
 
+            /*
+                        // Clamp extreme fireflies
+                        let max_radiance = 10.0;
+                        sample_radiance.x = sample_radiance.x.min(max_radiance);
+                        sample_radiance.y = sample_radiance.y.min(max_radiance);
+                        sample_radiance.z = sample_radiance.z.min(max_radiance);
+            */
             accumulated_radiance += sample_radiance;
 
             // Bounce Setup
@@ -388,10 +355,10 @@ impl PathTracer {
             let brdf_weight = brdf * cos_theta / pdf;
             throughput = throughput.component_mul(&brdf_weight);
 
-            // Setup the secondary ray for the next loop iteration
-            // Offset origin along the normal to prevent self-intersection
+            // Setup the secondary ray for the next loop iteration. Start at t=0:
+            // single-sided culling rejects the originating triangle (det < 0).
             ray = Ray::new(
-                hit_position + normal.into_inner() * RAY_EPSILON,
+                hit_position,
                 UnitVector3::new_unchecked(next_dir),
             );
 

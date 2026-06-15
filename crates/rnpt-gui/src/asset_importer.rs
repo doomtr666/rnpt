@@ -1,5 +1,5 @@
 use nalgebra::{Matrix4, Point3, Transform3, UnitVector3, Vector2, Vector3};
-use rnpt::{Camera, Color, Light, LightType, Material, Mesh, Node, Scene, Triangle};
+use rnpt::{Camera, Color, Light, Material, Mesh, Node, Scene, Triangle};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -241,25 +241,28 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
                 .transform_vector(&Vector3::new(0.0, 0.0, -1.0))
                 .normalize();
 
-            let light_type = match gltf_light.kind() {
-                gltf::khr_lights_punctual::Kind::Directional => LightType::Directional,
-                gltf::khr_lights_punctual::Kind::Point => LightType::Point,
-                gltf::khr_lights_punctual::Kind::Spot { .. } => LightType::Spot,
-            };
-
             // Convert glTF intensity (Candelas/Lux) back to Blender's intuitive Watts/Strength
-            let intensity = match light_type {
-                LightType::Directional => gltf_light.intensity() / 683.0,
-                _ => gltf_light.intensity() / (683.0 / (4.0 * std::f32::consts::PI)),
+            let color = Color::from(gltf_light.color());
+            let punctual_intensity = gltf_light.intensity() / (683.0 / (4.0 * std::f32::consts::PI));
+            let light = match gltf_light.kind() {
+                gltf::khr_lights_punctual::Kind::Directional => Light::Directional {
+                    direction: dir,
+                    color,
+                    intensity: gltf_light.intensity() / 683.0,
+                },
+                gltf::khr_lights_punctual::Kind::Point => Light::Point {
+                    position: pos,
+                    color,
+                    intensity: punctual_intensity,
+                },
+                gltf::khr_lights_punctual::Kind::Spot { .. } => Light::Spot {
+                    position: pos,
+                    direction: dir,
+                    color,
+                    intensity: punctual_intensity,
+                },
             };
-
-            lights.push(Light {
-                position: pos,
-                direction: dir,
-                color: Color::from(gltf_light.color()),
-                intensity,
-                light_type,
-            });
+            lights.push(light);
         }
 
         // Children traversal

@@ -37,9 +37,34 @@ struct RnptGuiApp {
     selected_asset_index: usize,
     current_scene: Option<std::sync::Arc<rnpt::Scene>>,
     current_bvh: Option<std::sync::Arc<rnpt::Bvh>>,
+    current_lights: Option<std::sync::Arc<Vec<rnpt::Light>>>,
 
     auto_fit: bool,
     resize_timeout: Option<Instant>,
+
+    use_nee: bool,
+}
+
+fn empty_scene() -> rnpt::Scene {
+    rnpt::Scene {
+        meshes: Vec::new(),
+        materials: Vec::new(),
+        textures: Vec::new(),
+        lights: Vec::new(),
+        nodes: Vec::new(),
+        roots: Vec::new(),
+        cameras: vec![rnpt::Camera::default()],
+    }
+}
+
+/// Build the BVH and the unified light list (scene punctual lights + emissive
+/// meshes collected during the BVH flatten) for a scene.
+fn build_bvh_and_lights(
+    scene: &rnpt::Scene,
+) -> (std::sync::Arc<rnpt::Bvh>, std::sync::Arc<Vec<rnpt::Light>>) {
+    let (bvh, emitters) = rnpt::BvhBuilder::new(scene).build();
+    let lights = rnpt::build_lights(&scene.lights, emitters);
+    (std::sync::Arc::new(bvh), std::sync::Arc::new(lights))
 }
 
 impl RnptGuiApp {
@@ -57,6 +82,7 @@ impl RnptGuiApp {
 
         let mut current_scene = None;
         let mut current_bvh = None;
+        let mut current_lights = None;
         if !asset_files.is_empty() {
             if let Ok(scene) = asset_importer::import_scene(&asset_files[selected_asset_index]) {
                 if !scene.cameras.is_empty() {
@@ -66,29 +92,30 @@ impl RnptGuiApp {
                     camera.fov = first_cam.fov;
                 }
                 let scene_arc = std::sync::Arc::new(scene);
-                let bvh_arc = std::sync::Arc::new(rnpt::BvhBuilder::new(&scene_arc).build());
+                let (bvh_arc, lights_arc) = build_bvh_and_lights(&scene_arc);
                 current_scene = Some(scene_arc);
                 current_bvh = Some(bvh_arc);
+                current_lights = Some(lights_arc);
             }
         }
 
-        let scene = current_scene.clone().unwrap_or_else(|| std::sync::Arc::new(rnpt::Scene {
-            meshes: Vec::new(),
-            materials: Vec::new(),
-            textures: Vec::new(),
-            lights: Vec::new(),
-            nodes: Vec::new(),
-            roots: Vec::new(),
-            cameras: vec![rnpt::Camera::default()],
-        }));
-        let bvh = current_bvh.clone().unwrap_or_else(|| std::sync::Arc::new(rnpt::BvhBuilder::new(&scene).build()));
+        let scene = current_scene
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(empty_scene()));
+        let (bvh, lights) = match (current_bvh.clone(), current_lights.clone()) {
+            (Some(b), Some(l)) => (b, l),
+            _ => build_bvh_and_lights(&scene),
+        };
 
+        let use_nee = true;
         let config = rnpt::PathTracerConfig {
             width,
             height,
             camera: camera.clone(),
             scene,
             bvh,
+            lights,
+            use_nee,
         };
 
         let tracer = Some(rnpt::ParallelTracer::new(config));
@@ -116,22 +143,22 @@ impl RnptGuiApp {
             selected_asset_index,
             current_scene,
             current_bvh,
+            current_lights,
             auto_fit: true,
             resize_timeout: None,
+            use_nee,
         }
     }
 
     fn trigger_reset(&mut self) {
-        let scene = self.current_scene.clone().unwrap_or_else(|| std::sync::Arc::new(rnpt::Scene {
-            meshes: Vec::new(),
-            materials: Vec::new(),
-            textures: Vec::new(),
-            lights: Vec::new(),
-            nodes: Vec::new(),
-            roots: Vec::new(),
-            cameras: vec![rnpt::Camera::default()],
-        }));
-        let bvh = self.current_bvh.clone().unwrap_or_else(|| std::sync::Arc::new(rnpt::BvhBuilder::new(&scene).build()));
+        let scene = self
+            .current_scene
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(empty_scene()));
+        let (bvh, lights) = match (self.current_bvh.clone(), self.current_lights.clone()) {
+            (Some(b), Some(l)) => (b, l),
+            _ => build_bvh_and_lights(&scene),
+        };
 
         let config = rnpt::PathTracerConfig {
             width: self.resolution[0],
@@ -139,6 +166,8 @@ impl RnptGuiApp {
             camera: self.camera.clone(),
             scene,
             bvh,
+            lights,
+            use_nee: self.use_nee,
         };
 
         // Always recreate tracer to ensure clean memory state and no race conditions
@@ -271,9 +300,10 @@ impl eframe::App for RnptGuiApp {
                                         self.camera.fov = first_cam.fov;
                                     }
                                     let scene_arc = std::sync::Arc::new(scene);
-                                    let bvh_arc = std::sync::Arc::new(rnpt::BvhBuilder::new(&scene_arc).build());
+                                    let (bvh_arc, lights_arc) = build_bvh_and_lights(&scene_arc);
                                     self.current_scene = Some(scene_arc);
                                     self.current_bvh = Some(bvh_arc);
+                                    self.current_lights = Some(lights_arc);
                                     self.trigger_reset();
                                 }
                                 Err(e) => {
@@ -392,6 +422,22 @@ impl eframe::App for RnptGuiApp {
                 ui.add_space(10.0);
 
                 // Post Processing section
+                // Lighting method (A/B comparison: resets accumulation on change)
+                ui.heading("Lighting");
+                ui.add_space(4.0);
+                let prev_use_nee = self.use_nee;
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.use_nee, true, "NEE (area lights)");
+                    ui.selectable_value(&mut self.use_nee, false, "Lucky (BRDF)");
+                });
+                if self.use_nee != prev_use_nee {
+                    self.trigger_reset();
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+
                 ui.heading("Post-Processing");
                 ui.add_space(4.0);
                 ui.add(egui::Slider::new(&mut self.exposure, 0.1..=10.0).text("Exposure"));

@@ -1,21 +1,6 @@
+use crate::Light;
 use crate::math::Color;
 use nalgebra::{Matrix4, Point3, Transform3, UnitVector3, Vector2, Vector3};
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum LightType {
-    Directional,
-    Point,
-    Spot,
-}
-
-#[derive(Clone, Debug)]
-pub struct Light {
-    pub position: Point3<f32>,
-    pub direction: Vector3<f32>,
-    pub color: Color,
-    pub intensity: f32,
-    pub light_type: LightType,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Camera {

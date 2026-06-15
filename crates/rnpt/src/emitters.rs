@@ -2,6 +2,7 @@ use crate::{Color, Pcg32, Texture};
 use nalgebra::{Point3, UnitVector3, Vector2};
 
 /// One emissive triangle in world space.
+#[derive(Clone, Debug)]
 pub struct EmitterTri {
     pub v0: Point3<f32>,
     pub v1: Point3<f32>,
@@ -15,6 +16,7 @@ pub struct EmitterTri {
 /// One emissive mesh instance = one area light. Triangles are sampled
 /// area-weighted within the mesh, so the area-measure pdf is constant
 /// (`1 / total_area`).
+#[derive(Clone, Debug)]
 pub struct MeshEmitter {
     tris: Vec<EmitterTri>,
     cdf: Vec<f32>, // normalized cumulative area, len == tris.len(), last == 1.0
@@ -102,8 +104,3 @@ impl MeshEmitter {
     }
 }
 
-/// All emissive mesh instances in the scene, each treated as one area light.
-#[derive(Default)]
-pub struct EmitterSet {
-    pub meshes: Vec<MeshEmitter>,
-}

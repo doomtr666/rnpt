@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::mem::MaybeUninit;
 
 use crate::Color;
-use crate::emitters::{EmitterSet, EmitterTri, MeshEmitter};
+use crate::emitters::{EmitterTri, MeshEmitter};
 use crate::{AABB, Ray, Scene, TriangleHit};
 use nalgebra::{Point3, Transform3, UnitVector3, Vector2};
 
@@ -260,7 +260,7 @@ impl BvhBuilder {
         }
     }
 
-    pub fn build(mut self) -> Bvh {
+    pub fn build(mut self) -> (Bvh, Vec<MeshEmitter>) {
         let num_triangles = self.flat_triangles.len();
 
         let remainder = num_triangles % 8;
@@ -351,7 +351,7 @@ impl BvhBuilder {
         let mut bvh8_nodes = Vec::new();
         Self::collapse_to_bvh8(0, &nodes, &mut bvh8_nodes);
 
-        Bvh {
+        let bvh = Bvh {
             nodes: bvh8_nodes,
             vertices: self.world_vertices,
             normals: self.world_normals,
@@ -359,10 +359,8 @@ impl BvhBuilder {
             colors: self.world_colors,
             triangles: ordered_triangles,
             soa_chunks: ordered_soa_chunks,
-            emitters: EmitterSet {
-                meshes: self.emitter_meshes,
-            },
-        }
+        };
+        (bvh, self.emitter_meshes)
     }
 
     fn update_node_bounds(
@@ -703,7 +701,6 @@ pub struct Bvh {
     pub colors: Vec<Color>,
     pub triangles: Vec<FlatTriangle>,
     pub soa_chunks: Vec<FlatTriangles>,
-    pub emitters: EmitterSet,
 }
 
 struct BvhStack {
