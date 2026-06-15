@@ -555,10 +555,9 @@ impl BvhBuilder {
             node8.p_max_z[i] = bvh2_node.aabb.max.z;
 
             if bvh2_node.is_leaf() {
-                let idx = bvh2_node.left_first;
-                let count = bvh2_node.chunk_count;
                 // count is always > 0 for a leaf, so the leaf flag is always set.
-                node8.children[i] = idx | (count << 24) | 0x8000_0000;
+                node8.children[i] =
+                    Bvh8Node::encode_leaf(bvh2_node.left_first, bvh2_node.chunk_count);
             } else {
                 node8.children[i] = Self::collapse_to_bvh8(c_idx, bvh2, bvh8);
             }
@@ -598,9 +597,35 @@ impl Default for Bvh8Node {
     }
 }
 
-// ... skipped down to Bvh::intersect ...
-// Wait, I need to replace from Bvh8Node::default to Bvh::intersect end.
-// Let's be precise.
+impl Bvh8Node {
+    // Child reference encoding: leaves set the top bit, store the chunk count
+    // in bits [24,30] and the chunk-range start in bits [0,23]. Internal nodes
+    // store a plain Bvh8 node index.
+    const LEAF_FLAG: u32 = 0x8000_0000;
+    const COUNT_SHIFT: u32 = 24;
+    const COUNT_MASK: u32 = 0x7F;
+    const START_MASK: u32 = 0x00FF_FFFF;
+
+    #[inline(always)]
+    fn encode_leaf(start_chunk: u32, chunk_count: u32) -> u32 {
+        start_chunk | (chunk_count << Self::COUNT_SHIFT) | Self::LEAF_FLAG
+    }
+
+    #[inline(always)]
+    fn is_leaf(encoded: u32) -> bool {
+        encoded & Self::LEAF_FLAG != 0
+    }
+
+    #[inline(always)]
+    fn leaf_start(encoded: u32) -> u32 {
+        encoded & Self::START_MASK
+    }
+
+    #[inline(always)]
+    fn leaf_count(encoded: u32) -> u32 {
+        (encoded >> Self::COUNT_SHIFT) & Self::COUNT_MASK
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct BvhNode {
@@ -665,7 +690,6 @@ impl BvhStack {
         unsafe { self.data.get_unchecked(self.ptr).assume_init() }
     }
 
-
     #[inline(always)]
     fn is_empty(&self) -> bool {
         self.ptr == 0
@@ -682,13 +706,13 @@ impl Bvh {
     }
 
     #[inline(always)]
-    fn get_chunk(&self, idx: usize) -> &FlatTriangles {
-        unsafe { self.soa_chunks.get_unchecked(idx) }
+    fn get_chunk(&self, idx: u32) -> &FlatTriangles {
+        unsafe { self.soa_chunks.get_unchecked(idx as usize) }
     }
 
     #[inline(always)]
-    fn get_triangle(&self, idx: usize) -> &FlatTriangle {
-        unsafe { self.triangles.get_unchecked(idx) }
+    fn get_triangle(&self, idx: u32) -> &FlatTriangle {
+        unsafe { self.triangles.get_unchecked(idx as usize) }
     }
 
     pub fn intersect(&self, ray: &Ray) -> Option<BvhHit> {
@@ -709,16 +733,16 @@ impl Bvh {
                 continue;
             }
 
-            if (encoded_idx & 0x8000_0000) != 0 {
+            if Bvh8Node::is_leaf(encoded_idx) {
                 // Leaf node
-                let chunk_count = (encoded_idx >> 24) & 0x7F;
-                let start_chunk = encoded_idx & 0x00FF_FFFF;
+                let start_chunk = Bvh8Node::leaf_start(encoded_idx);
+                let chunk_count = Bvh8Node::leaf_count(encoded_idx);
 
                 for i in 0..chunk_count {
-                    let chunk_idx = start_chunk as usize + i as usize;
+                    let chunk_idx = start_chunk + i;
                     let chunk = self.get_chunk(chunk_idx);
 
-                    if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
+                    if let Some(simd_hit) = ray.closest_triangle_simd8(chunk, t_max) {
                         t_max = simd_hit.hit.t;
                         let tri_global_idx = chunk_idx * 8 + simd_hit.lane;
                         let tri = self.get_triangle(tri_global_idx);
@@ -729,14 +753,14 @@ impl Bvh {
                             v0: tri.v0,
                             v1: tri.v1,
                             v2: tri.v2,
-                            chunk_idx: chunk_idx as u32,
+                            chunk_idx,
                         });
                     }
                 }
             } else {
                 // Internal Bvh8Node
                 let node = self.get_node(encoded_idx);
-                let (mut bitmask, t_arr) = ray.intersect_bvh8_dist(node, t_max);
+                let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
 
                 let mut hits = [(0u32, 0.0f32); 8];
                 let mut hit_count = 0;
@@ -791,14 +815,14 @@ impl Bvh {
         while !stack.is_empty() {
             let (encoded_idx, _) = stack.pop();
 
-            if (encoded_idx & 0x8000_0000) != 0 {
+            if Bvh8Node::is_leaf(encoded_idx) {
                 // Leaf node
-                let chunk_count = (encoded_idx >> 24) & 0x7F;
-                let start_chunk = encoded_idx & 0x00FF_FFFF;
+                let start_chunk = Bvh8Node::leaf_start(encoded_idx);
+                let chunk_count = Bvh8Node::leaf_count(encoded_idx);
 
                 for i in 0..chunk_count {
-                    let chunk_idx = start_chunk as usize + i as usize;
-                    if ray.occluded_simd_8(self.get_chunk(chunk_idx), t_max) {
+                    let chunk_idx = start_chunk + i;
+                    if ray.any_triangle_simd8(self.get_chunk(chunk_idx), t_max) {
                         return true; // early-out: occluder found
                     }
                 }
@@ -806,7 +830,7 @@ impl Bvh {
                 // Internal node: push hit children unsorted (order is irrelevant
                 // for any-hit, and t_max never tightens).
                 let node = self.get_node(encoded_idx);
-                let (mut bitmask, t_arr) = ray.intersect_bvh8_dist(node, t_max);
+                let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
 
                 while bitmask != 0 {
                     let lane = bitmask.trailing_zeros() as usize;

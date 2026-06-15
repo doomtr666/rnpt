@@ -1,3 +1,4 @@
+use crate::{Bvh8Node, FlatTriangles};
 use nalgebra::{Point3, UnitVector3};
 use wide::f32x8;
 
@@ -84,7 +85,7 @@ pub struct TriangleHit {
 
 pub struct TriangleHitSimd {
     pub hit: TriangleHit,
-    pub lane: usize,
+    pub lane: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -181,9 +182,9 @@ impl Ray {
     }
 
     /// SIMD intersection for 8 triangles at once.
-    pub fn intersect_simd_8(
+    pub fn closest_triangle_simd8(
         &self,
-        soa: &crate::bvh::FlatTriangles,
+        soa: &FlatTriangles,
         current_t_max: f32,
     ) -> Option<TriangleHitSimd> {
         let v0_x = f32x8::from(soa.v0_x);
@@ -275,7 +276,7 @@ impl Ray {
                     u: u_arr[lane],
                     v: v_arr[lane],
                 },
-                lane,
+                lane: lane as u32,
             }
         })
     }
@@ -285,7 +286,7 @@ impl Ray {
     /// (incl. front-face culling, to match the closest-hit render exactly), but
     /// no min/argmin/uv reduction — we only need "is anything there?".
     #[inline(always)]
-    pub fn occluded_simd_8(&self, soa: &crate::bvh::FlatTriangles, t_max: f32) -> bool {
+    pub fn any_triangle_simd8(&self, soa: &FlatTriangles, t_max: f32) -> bool {
         let v0_x = f32x8::from(soa.v0_x);
         let v0_y = f32x8::from(soa.v0_y);
         let v0_z = f32x8::from(soa.v0_z);
@@ -334,7 +335,7 @@ impl Ray {
     }
 
     #[inline(always)]
-    pub fn intersect_bvh8_dist(&self, node: &crate::bvh::Bvh8Node, t_max: f32) -> (u32, [f32; 8]) {
+    pub fn intersect_bvh8(&self, node: &Bvh8Node, t_max: f32) -> (u32, [f32; 8]) {
         use wide::f32x8;
 
         let p_min_x = f32x8::from(node.p_min_x);
@@ -365,8 +366,12 @@ impl Ray {
 
         let t0_z = (p_min_z - origin_z) * inv_dir_z;
         let t1_z = (p_max_z - origin_z) * inv_dir_z;
-        let tmin_z = tmin_y.fast_max(t0_z.fast_min(t1_z)).fast_max(f32x8::splat(self.tmin));
-        let tmax_z = tmax_y.fast_min(t0_z.fast_max(t1_z)).fast_min(f32x8::splat(t_max));
+        let tmin_z = tmin_y
+            .fast_max(t0_z.fast_min(t1_z))
+            .fast_max(f32x8::splat(self.tmin));
+        let tmax_z = tmax_y
+            .fast_min(t0_z.fast_max(t1_z))
+            .fast_min(f32x8::splat(t_max));
 
         let mask = tmin_z.simd_le(tmax_z);
         (mask.to_bitmask() as u32, tmin_z.to_array())
