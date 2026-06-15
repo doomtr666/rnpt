@@ -190,6 +190,7 @@ impl PathTracer {
         normal: &UnitVector3<f32>,
         albedo: Color,
         shadow_rays: &mut u64,
+        rng: &mut Pcg32,
     ) -> Color {
         let mut total_direct = Color::zeros();
 
@@ -225,6 +226,47 @@ impl PathTracer {
                 let attenuation = 1.0 / (4.0 * std::f32::consts::PI * distance_squared).max(LIGHT_ATTENUATION_EPSILON);
                 let incident_radiance = light.color * light.intensity * attenuation;
                 total_direct += brdf.component_mul(&incident_radiance) * cos_theta;
+            }
+        }
+
+        // Area lights: each emissive mesh is one light, sampled every call (NEE).
+        let textures = &self.config.scene.textures;
+        // Offset the shadow-ray origin off the surface, and measure distance FROM
+        // that origin, so `tmax = dist - RAY_EPSILON` is a full eps margin
+        // regardless of the surface/light angle. (Measuring from the un-offset
+        // hit made the margin collapse to eps*(1-cos_s) → the emitter
+        // self-occluded on surfaces facing it head-on, causing strange shadows.)
+        let origin = hit_position + normal.into_inner() * RAY_EPSILON;
+        for mesh in &self.config.bvh.emitters.meshes {
+            let s = mesh.sample(rng, textures);
+
+            let to_light = s.p - origin;
+            let d2 = to_light.norm_squared();
+            if d2 <= 0.0 {
+                continue;
+            }
+            let dist = d2.sqrt();
+            let wi = to_light / dist;
+
+            let cos_s = normal.dot(&wi).max(0.0); // at the shaded surface
+            let cos_l = s.normal.dot(&(-wi)).max(0.0); // at the emitter (front face)
+            if cos_s <= 0.0 || cos_l <= 0.0 {
+                continue;
+            }
+
+            let shadow_ray = Ray::new_with_minmax(
+                origin,
+                UnitVector3::new_unchecked(wi),
+                0.0,
+                dist - RAY_EPSILON,
+            );
+
+            *shadow_rays += 1;
+            if !self.config.bvh.is_occluded(&shadow_ray) {
+                // Area-measure estimator: cos_l / d2 is the solid-angle->area
+                // Jacobian; dividing by pdf_area (= 1/total_area) is unbiased.
+                let g = cos_s * cos_l / (d2 * s.pdf_area);
+                total_direct += brdf.component_mul(&s.le) * g;
             }
         }
 
@@ -291,20 +333,24 @@ impl PathTracer {
             // Direct Lighting Calculation
             let mut local_radiance = Color::black();
 
-            // Self-emission
-            let mut local_emissive = mat.emissive;
-            if let Some(tex_idx) = mat.emissive_texture {
-                if tex_idx < self.config.scene.textures.len() as u32 {
-                    let tex = &self.config.scene.textures[tex_idx as usize];
-                    local_emissive = local_emissive.component_mul(&tex.sample_bilinear(hit_uv));
+            // Self-emission is only added when the emitter is seen directly (the
+            // camera/primary ray). On GI bounces it is omitted: that contribution
+            // is already covered by NEE (compute_direct_lighting) at the previous
+            // vertex, so adding it again would double-count and explode variance.
+            if bounce == 0 {
+                let mut local_emissive = mat.emissive;
+                if let Some(tex_idx) = mat.emissive_texture {
+                    if tex_idx < self.config.scene.textures.len() as u32 {
+                        let tex = &self.config.scene.textures[tex_idx as usize];
+                        local_emissive = local_emissive.component_mul(&tex.sample_bilinear(hit_uv));
+                    }
                 }
+                local_radiance += local_emissive;
             }
-            local_radiance += local_emissive;
 
-            // Next Event Estimation (Analytic lights loop)
-            // This calculates the direct lighting at this specific vertex
+            // Next Event Estimation: analytic lights + emissive-mesh area lights.
             let direct_radiance =
-                self.compute_direct_lighting(&hit_position, &normal, albedo, shadow_rays);
+                self.compute_direct_lighting(&hit_position, &normal, albedo, shadow_rays, rng);
             local_radiance += direct_radiance;
 
             // Add the local contribution of this vertex to the pixel, modulated by previous bounces

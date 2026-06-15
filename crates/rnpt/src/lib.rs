@@ -10,6 +10,9 @@ pub use scene::*;
 mod bvh;
 pub use bvh::*;
 
+mod emitters;
+pub use emitters::*;
+
 mod tracer;
 pub use tracer::*;
 

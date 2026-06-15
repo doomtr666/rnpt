@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::mem::MaybeUninit;
 
 use crate::Color;
+use crate::emitters::{EmitterSet, EmitterTri, MeshEmitter};
 use crate::{AABB, Ray, Scene, TriangleHit};
 use nalgebra::{Point3, Transform3, UnitVector3, Vector2};
 
@@ -59,6 +60,7 @@ pub struct BvhBuilder {
     world_uvs: Vec<Vector2<f32>>,
     world_colors: Vec<Color>,
     flat_triangles: Vec<FlatTriangle>,
+    emitter_meshes: Vec<MeshEmitter>,
 }
 
 impl BvhBuilder {
@@ -68,6 +70,7 @@ impl BvhBuilder {
         let world_uvs = Vec::new();
         let world_colors = Vec::new();
         let flat_triangles = Vec::new();
+        let emitter_meshes = Vec::new();
 
         let mut builder = Self {
             world_vertices,
@@ -75,6 +78,7 @@ impl BvhBuilder {
             world_uvs,
             world_colors,
             flat_triangles,
+            emitter_meshes,
         };
 
         builder.flatten_scene(scene);
@@ -167,6 +171,11 @@ impl BvhBuilder {
 
             for &mesh_idx in &node.meshes {
                 let mesh = &scene.meshes[mesh_idx as usize];
+                let mat = &scene.materials[mesh.material as usize];
+                let is_emissive =
+                    mat.emissive.x > 0.0 || mat.emissive.y > 0.0 || mat.emissive.z > 0.0;
+                // One area light per emissive mesh instance.
+                let mut emitter_tris: Vec<EmitterTri> = Vec::new();
 
                 for &tri in &mesh.triangles {
                     let mut get_or_add_vertex = |local_idx: u32| -> usize {
@@ -208,6 +217,40 @@ impl BvhBuilder {
                         v2: v2 as u32,
                         material: mesh.material,
                     });
+
+                    if is_emissive {
+                        // World-space triangle for the area light (same transform
+                        // as the geometry above, so positions match exactly).
+                        let p0 = world_transform.transform_point(&mesh.vertices[tri.v0 as usize]);
+                        let p1 = world_transform.transform_point(&mesh.vertices[tri.v1 as usize]);
+                        let p2 = world_transform.transform_point(&mesh.vertices[tri.v2 as usize]);
+                        let n = (p1 - p0).cross(&(p2 - p0));
+                        let len = n.norm();
+                        if len > 0.0 {
+                            let uv = |li: u32| {
+                                if !mesh.uvs.is_empty() {
+                                    mesh.uvs[li as usize]
+                                } else {
+                                    Vector2::new(0.0, 0.0)
+                                }
+                            };
+                            emitter_tris.push(EmitterTri {
+                                v0: p0,
+                                v1: p1,
+                                v2: p2,
+                                uv0: uv(tri.v0),
+                                uv1: uv(tri.v1),
+                                uv2: uv(tri.v2),
+                                normal: UnitVector3::new_unchecked(n / len),
+                            });
+                        }
+                    }
+                }
+
+                if let Some(emitter) =
+                    MeshEmitter::new(emitter_tris, mat.emissive, mat.emissive_texture)
+                {
+                    self.emitter_meshes.push(emitter);
                 }
             }
 
@@ -316,6 +359,9 @@ impl BvhBuilder {
             colors: self.world_colors,
             triangles: ordered_triangles,
             soa_chunks: ordered_soa_chunks,
+            emitters: EmitterSet {
+                meshes: self.emitter_meshes,
+            },
         }
     }
 
@@ -657,6 +703,7 @@ pub struct Bvh {
     pub colors: Vec<Color>,
     pub triangles: Vec<FlatTriangle>,
     pub soa_chunks: Vec<FlatTriangles>,
+    pub emitters: EmitterSet,
 }
 
 struct BvhStack {
