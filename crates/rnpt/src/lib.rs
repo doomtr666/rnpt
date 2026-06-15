@@ -16,6 +16,9 @@ pub use emitters::*;
 mod light;
 pub use light::*;
 
+mod brdf;
+pub use brdf::*;
+
 mod tracer;
 pub use tracer::*;
 

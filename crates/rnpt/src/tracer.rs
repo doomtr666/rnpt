@@ -1,4 +1,4 @@
-use crate::{Bvh, Camera, Color, ColorExt, Light, Pcg32, Ray, Scene};
+use crate::{Brdf, Bvh, Camera, Color, ColorExt, Light, Pcg32, Ray, Scene};
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
 use std::sync::Arc;
 
@@ -149,42 +149,7 @@ impl PathTracer {
             (world_dir, pdf)
         }
     */
-    fn sample_cosine_hemisphere(
-        &self,
-        normal: &UnitVector3<f32>,
-        u1: f32, // Random number in [0, 1)
-        u2: f32, // Random number in [0, 1)
-    ) -> (Vector3<f32>, f32) {
-        // Local sampling on a disk, then project up to the hemisphere (Malley's method)
-        let r = u1.sqrt();
-        let phi = 2.0 * std::f32::consts::PI * u2;
-
-        // In local space, the normal is along the Z axis
-        let local_dir = Vector3::new(
-            r * phi.cos(),
-            r * phi.sin(),
-            (1.0 - u1).sqrt(), // local_z is exactly cos(theta)
-        );
-
-        // Build a stable orthonormal basis (TBN) from the world normal (Frisvad's method)
-        let n = normal.into_inner();
-        let sign = if n.z >= 0.0 { 1.0 } else { -1.0 };
-        let a = -1.0 / (sign + n.z);
-        let b = n.x * n.y * a;
-
-        let tangent = Vector3::new(1.0 + sign * n.x * n.x * a, sign * b, -sign * n.x);
-        let bitangent = Vector3::new(b, sign + n.y * n.y * a, -n.y);
-
-        // Transform the local sample direction into world space
-        let world_dir =
-            (tangent * local_dir.x + bitangent * local_dir.y + n * local_dir.z).normalize();
-
-        // The PDF for a cosine-weighted distribution is cos(theta) / PI
-        let cos_theta = local_dir.z;
-        let pdf = cos_theta / std::f32::consts::PI;
-
-        (world_dir, pdf)
-    }
+    // BRDF sampling lives in `brdf.rs` (Brdf::sample / Brdf::eval / Brdf::pdf).
 
     /// Direct lighting via NEE: one shadow ray per light, summed. Every light
     /// type goes through the same `Light::sample_li` interface and the same
@@ -193,12 +158,12 @@ impl PathTracer {
         &self,
         hit_position: &Point3<f32>,
         normal: &UnitVector3<f32>,
-        albedo: Color,
+        brdf: &Brdf,
+        wo: &Vector3<f32>,
         shadow_rays: &mut u64,
         rng: &mut Pcg32,
     ) -> Color {
         let mut total_direct = Color::zeros();
-        let brdf = albedo / std::f32::consts::PI; // Lambertian
         let textures = &self.config.scene.textures;
 
         for light in self.config.lights.iter() {
@@ -233,7 +198,8 @@ impl PathTracer {
 
             *shadow_rays += 1;
             if !self.config.bvh.is_occluded(&shadow_ray) {
-                total_direct += brdf.component_mul(&s.li) * (cos_s / s.pdf);
+                let f = brdf.eval(normal, wo, &s.wi);
+                total_direct += f.component_mul(&s.li) * (cos_s / s.pdf);
             }
         }
 
@@ -297,6 +263,9 @@ impl PathTracer {
                 }
             }
 
+            let brdf = Brdf::Lambertian { albedo };
+            let wo = -ray.direction.into_inner(); // toward the previous vertex
+
             // Direct Lighting Calculation
             let mut local_radiance = Color::black();
 
@@ -316,7 +285,7 @@ impl PathTracer {
 
             // Next Event Estimation: analytic lights + emissive-mesh area lights.
             let direct_radiance =
-                self.compute_direct_lighting(&hit_position, &normal, albedo, shadow_rays, rng);
+                self.compute_direct_lighting(&hit_position, &normal, &brdf, &wo, shadow_rays, rng);
             local_radiance += direct_radiance;
 
             // Add the local contribution of this vertex to the pixel, modulated by previous bounces
@@ -331,36 +300,21 @@ impl PathTracer {
             */
             accumulated_radiance += sample_radiance;
 
-            // Bounce Setup
-
-            // If no cache query, we sample the BRDF to continue the path
-            let (next_dir, pdf) =
-                self.sample_cosine_hemisphere(&normal, rng.next_f32(), rng.next_f32());
-
-            if pdf <= 0.0 {
+            // Bounce Setup: importance-sample the BRDF to continue the path.
+            let Some(bs) = brdf.sample(&normal, &wo, rng) else {
+                break;
+            };
+            let cos_theta = normal.dot(&bs.wi).max(0.0);
+            if bs.pdf <= 0.0 || cos_theta <= 0.0 {
                 break;
             }
 
-            // Calculate the geometric cosine term for the scattering direction
-            let cos_theta = normal.dot(&next_dir).max(0.0);
-            if cos_theta <= 0.0 {
-                break;
-            }
-
-            // Evaluate the Lambertian BRDF
-            let brdf = albedo / std::f32::consts::PI;
-
-            // Update the path throughput for the next bounce
-            // New Throughput = Old Throughput * (BRDF * cos_theta / PDF)
-            let brdf_weight = brdf * cos_theta / pdf;
-            throughput = throughput.component_mul(&brdf_weight);
+            // Update path throughput: f_r * cos_theta / pdf.
+            throughput = throughput.component_mul(&(bs.f * (cos_theta / bs.pdf)));
 
             // Setup the secondary ray for the next loop iteration. Start at t=0:
             // single-sided culling rejects the originating triangle (det < 0).
-            ray = Ray::new(
-                hit_position,
-                UnitVector3::new_unchecked(next_dir),
-            );
+            ray = Ray::new(hit_position, UnitVector3::new_unchecked(bs.wi));
 
             // Russian Roulette to terminate paths that carry no energy
             if bounce > 3 {
