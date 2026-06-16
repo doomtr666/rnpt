@@ -10,6 +10,9 @@ pub use scene::*;
 mod bvh;
 pub use bvh::*;
 
+mod bvh_builder;
+pub use bvh_builder::*;
+
 mod emitters;
 pub use emitters::*;
 
@@ -18,6 +21,9 @@ pub use light::*;
 
 mod brdf;
 pub use brdf::*;
+
+mod material;
+pub use material::*;
 
 mod tracer;
 pub use tracer::*;

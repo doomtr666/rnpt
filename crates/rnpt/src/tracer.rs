@@ -1,4 +1,4 @@
-use crate::{Brdf, Bvh, Camera, Color, ColorExt, Light, Pcg32, Ray, Scene};
+use crate::{Brdf, Bvh, Camera, Color, ColorExt, Light, Pcg32, Ray, Scene, evaluate_surface};
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
 use std::sync::Arc;
 
@@ -32,8 +32,31 @@ pub struct PathTracerConfig {
     pub use_nee: bool,
 }
 
+/// No hard path-length cap: paths terminate via Russian roulette only (PBRT
+/// style, unbiased). `u32::MAX` is just a loop guard.
 const MAX_BOUNCES: u32 = u32::MAX;
+/// Rays start exactly on the surface (single-sided culling rejects
+/// self-intersection); this only backs a shadow ray's `tmax` off the light.
 const RAY_EPSILON: f32 = 0.001;
+/// Russian roulette only kicks in after this many bounces.
+const RR_START_BOUNCE: u32 = 3;
+/// Floor on the RR termination probability.
+const RR_MIN_Q: f32 = 0.05;
+
+/// Russian roulette: unbiasedly terminate low-energy paths. Returns `true` if
+/// the path should stop; otherwise rescales `throughput` to stay unbiased.
+fn russian_roulette(throughput: &mut Color, bounce: u32, rng: &mut Pcg32) -> bool {
+    if bounce <= RR_START_BOUNCE {
+        return false;
+    }
+    let max_channel = throughput.x.max(throughput.y).max(throughput.z);
+    let q = (1.0 - max_channel).max(RR_MIN_Q); // termination probability
+    if rng.next_f32() < q {
+        return true;
+    }
+    *throughput /= 1.0 - q;
+    false
+}
 
 pub struct PathTracer {
     config: PathTracerConfig,
@@ -44,23 +67,6 @@ impl PathTracer {
     pub fn new(config: PathTracerConfig) -> Self {
         let cam2world = config.camera.compute_camera_to_world();
         Self { config, cam2world }
-    }
-
-    fn trace_ray(&self, ray: &Ray) -> Option<crate::bvh::BvhHit> {
-        self.config.bvh.intersect(ray)
-    }
-
-    fn interpolate_normal(
-        &self,
-        n0: &UnitVector3<f32>,
-        n1: &UnitVector3<f32>,
-        n2: &UnitVector3<f32>,
-        u: f32,
-        v: f32,
-    ) -> UnitVector3<f32> {
-        let w = 1.0 - u - v;
-        let n = n0.scale(w) + n1.scale(u) + n2.scale(v);
-        UnitVector3::new_normalize(n)
     }
 
     fn init_pixel_rng(&self, x: u32, y: u32, frame_index: u32) -> Pcg32 {
@@ -81,7 +87,7 @@ impl PathTracer {
         Pcg32::from_seed_128(packed_seed)
     }
 
-    // English code comments as per instructions
+    /// Generate the primary camera ray for pixel (x, y), jittered within the pixel.
     pub fn generate_ray(&self, rng: &mut Pcg32, x: f32, y: f32) -> Ray {
         let width = self.config.width as f32;
         let height = self.config.height as f32;
@@ -97,60 +103,20 @@ impl PathTracer {
         let fov_rad = (self.config.camera.fov * std::f32::consts::PI) / 180.0;
         let tan_half_fov = (fov_rad * 0.5).tan();
 
-        // Ray direction in camera local space
-        // La caméra regarde le long de son axe -Z local
+        // Ray direction in camera space (the camera looks down its local -Z axis).
         let local_dir = Vector3::new(
             ndc_x * aspect_ratio * tan_half_fov,
             ndc_y * tan_half_fov,
             -1.0,
         );
 
-        // Transform by CameraToWorld matrix
-        // transform_vector n'applique pas la translation (ce qu'on veut pour une direction)
+        // transform_vector skips the translation (correct for a direction).
         let ray_dir = self.cam2world.transform_vector(&local_dir).normalize();
-
-        // L'origine du rayon est la position de la caméra (la partie translation de la matrice)
+        // Ray origin = camera position (the translation part of the matrix).
         let ray_origin = self.cam2world.transform_point(&Point3::origin());
 
         Ray::new(ray_origin, UnitVector3::new_normalize(ray_dir))
     }
-    /*
-        /// Samples the hemisphere uniformly.
-        /// Returns the world-space direction and the associated probability density function (PDF).
-        fn sample_uniform_hemisphere(
-            &self,
-            normal: &UnitVector3<f32>,
-            u1: f32, // Random number in [0, 1)
-            u2: f32, // Random number in [0, 1)
-        ) -> (Vector3<f32>, f32) {
-            // Generate local coordinates on the hemisphere (Z-up axis)
-            let phi = 2.0 * std::f32::consts::PI * u2;
-            let local_z = u1; // cos(theta) = u1
-            let sin_theta = (1.0 - local_z * local_z).max(0.0).sqrt();
-
-            let local_x = sin_theta * phi.cos();
-            let local_y = sin_theta * phi.sin();
-
-            // Build a stable orthonormal basis (TBN) from the world normal (Frisvad's method)
-            let n = normal.into_inner();
-            let sign = if n.z >= 0.0 { 1.0 } else { -1.0 };
-            let a = -1.0 / (sign + n.z);
-            let b = n.x * n.y * a;
-
-            let tangent = Vector3::new(1.0 + sign * n.x * n.x * a, sign * b, -sign * n.x);
-            let bitangent = Vector3::new(b, sign + n.y * n.y * a, -n.y);
-
-            // Transform the local sample direction into world space
-            let world_dir = (tangent * local_x + bitangent * local_y + n * local_z).normalize();
-
-            // The PDF for a uniform hemisphere distribution is a constant: 1 / (2 * PI)
-            let pdf = 1.0 / (2.0 * std::f32::consts::PI);
-
-            (world_dir, pdf)
-        }
-    */
-    // BRDF sampling lives in `brdf.rs` (Brdf::sample / Brdf::eval / Brdf::pdf).
-
     /// Direct lighting via NEE: one shadow ray per light, summed. Every light
     /// type goes through the same `Light::sample_li` interface and the same
     /// solid-angle estimator `f_r * Li * cos_s / pdf`.
@@ -206,6 +172,11 @@ impl PathTracer {
         total_direct
     }
 
+    /// Trace one path from the camera and return its radiance estimate. Each
+    /// bounce: intersect → evaluate the surface → add emission (in NEE mode only
+    /// when the emitter is seen directly) → NEE direct lighting → BRDF-sample the
+    /// next direction → Russian roulette. No hard depth cap; RR terminates paths.
+    /// `rays`/`shadow_rays` accumulate ray counts for stats.
     fn trace_path(
         &self,
         mut ray: Ray,
@@ -217,94 +188,48 @@ impl PathTracer {
         let mut throughput = Color::white(); // Current path attenuation factor
 
         for bounce in 0..MAX_BOUNCES {
-            // Ray intersection
+            // Closest-hit intersection with the scene.
             *rays += 1;
-            let hit_opt = self.trace_ray(&ray);
-
-            let Some(hit) = hit_opt else {
+            let Some(hit) = self.config.bvh.intersect(&ray) else {
                 let sky_radiance = Color::black(); //scene.sample_sky(&ray);
                 accumulated_radiance += throughput.component_mul(&sky_radiance);
                 break;
             };
 
-            // Fetch surface data
-            let mat = &self.config.scene.materials[hit.material as usize];
-
-            let n0 = self.config.bvh.normals[hit.v0 as usize];
-            let n1 = self.config.bvh.normals[hit.v1 as usize];
-            let n2 = self.config.bvh.normals[hit.v2 as usize];
-
-            let normal = self.interpolate_normal(&n0, &n1, &n2, hit.hit.u, hit.hit.v);
-
-            let hit_position = ray.at(hit.hit.t);
-
-            let has_textures = mat.albedo_texture.is_some() || mat.emissive_texture.is_some();
-            let mut hit_uv = nalgebra::Vector2::zeros();
-
-            let w = 1.0 - hit.hit.u - hit.hit.v;
-
-            let c0 = self.config.bvh.colors[hit.v0 as usize];
-            let c1 = self.config.bvh.colors[hit.v1 as usize];
-            let c2 = self.config.bvh.colors[hit.v2 as usize];
-            let vertex_color = c0 * w + c1 * hit.hit.u + c2 * hit.hit.v;
-
-            if has_textures {
-                let uv0 = self.config.bvh.uvs[hit.v0 as usize];
-                let uv1 = self.config.bvh.uvs[hit.v1 as usize];
-                let uv2 = self.config.bvh.uvs[hit.v2 as usize];
-                hit_uv = uv0 * w + uv1 * hit.hit.u + uv2 * hit.hit.v;
-            }
-
-            let mut albedo = mat.albedo.component_mul(&vertex_color);
-            if let Some(tex_idx) = mat.albedo_texture {
-                if tex_idx < self.config.scene.textures.len() as u32 {
-                    let tex = &self.config.scene.textures[tex_idx as usize];
-                    albedo = albedo.component_mul(&tex.sample_bilinear(hit_uv));
-                }
-            }
-
-            let brdf = Brdf::Lambertian { albedo };
+            // Evaluate geometry + material at the hit (normal, albedo, emissive).
+            let surf = evaluate_surface(&hit, &ray, &self.config.bvh, &self.config.scene);
+            let brdf = surf.brdf();
             let wo = -ray.direction.into_inner(); // toward the previous vertex
 
-            // Direct Lighting Calculation
             let mut local_radiance = Color::black();
 
-            // NEE mode: emission only when the emitter is seen directly (bounce 0);
-            // GI bounces are covered by NEE at the previous vertex (avoids double
-            // counting). "Lucky" mode: emission on every hit (the old estimator).
+            // Emission only when the emitter is seen directly (bounce 0) in NEE
+            // mode; on GI bounces it is covered by NEE at the previous vertex
+            // (avoids double counting). "Lucky" mode adds it on every hit.
             if !self.config.use_nee || bounce == 0 {
-                let mut local_emissive = mat.emissive;
-                if let Some(tex_idx) = mat.emissive_texture {
-                    if tex_idx < self.config.scene.textures.len() as u32 {
-                        let tex = &self.config.scene.textures[tex_idx as usize];
-                        local_emissive = local_emissive.component_mul(&tex.sample_bilinear(hit_uv));
-                    }
-                }
-                local_radiance += local_emissive;
+                local_radiance += surf.emissive;
             }
 
             // Next Event Estimation: analytic lights + emissive-mesh area lights.
-            let direct_radiance =
-                self.compute_direct_lighting(&hit_position, &normal, &brdf, &wo, shadow_rays, rng);
-            local_radiance += direct_radiance;
+            local_radiance += self.compute_direct_lighting(
+                &surf.position,
+                &surf.normal,
+                &brdf,
+                &wo,
+                shadow_rays,
+                rng,
+            );
 
-            // Add the local contribution of this vertex to the pixel, modulated by previous bounces
-            let sample_radiance = throughput.component_mul(&local_radiance);
-
-            /*
-                        // Clamp extreme fireflies
-                        let max_radiance = 10.0;
-                        sample_radiance.x = sample_radiance.x.min(max_radiance);
-                        sample_radiance.y = sample_radiance.y.min(max_radiance);
-                        sample_radiance.z = sample_radiance.z.min(max_radiance);
-            */
-            accumulated_radiance += sample_radiance;
+            // Weight this vertex's radiance by the path throughput so far.
+            // (No firefly clamp on purpose: clamping biases by clipping energy
+            // near lights — the unbiased fix is MIS on the NEE/BRDF samples.)
+            accumulated_radiance += throughput.component_mul(&local_radiance);
 
             // Bounce Setup: importance-sample the BRDF to continue the path.
-            let Some(bs) = brdf.sample(&normal, &wo, rng) else {
+            let Some(bs) = brdf.sample(&surf.normal, &wo, rng) else {
                 break;
             };
-            let cos_theta = normal.dot(&bs.wi).max(0.0);
+            let cos_theta = surf.normal.dot(&bs.wi).max(0.0);
             if bs.pdf <= 0.0 || cos_theta <= 0.0 {
                 break;
             }
@@ -314,31 +239,20 @@ impl PathTracer {
 
             // Setup the secondary ray for the next loop iteration. Start at t=0:
             // single-sided culling rejects the originating triangle (det < 0).
-            ray = Ray::new(hit_position, UnitVector3::new_unchecked(bs.wi));
+            ray = Ray::new(surf.position, UnitVector3::new_unchecked(bs.wi));
 
-            // Russian Roulette to terminate paths that carry no energy
-            if bounce > 3 {
-                // Correctly extract the maximum component using f32::max
-                let max_throughput = throughput.x.max(throughput.y).max(throughput.z);
-
-                let q = (1.0 - max_throughput).max(0.05);
-                if rng.next_f32() < q {
-                    break;
-                }
-                throughput /= 1.0 - q;
+            // Russian roulette: drop low-energy paths without bias.
+            if russian_roulette(&mut throughput, bounce, rng) {
+                break;
             }
         }
 
         accumulated_radiance
     }
 
-    /// A stateless function that computes a sample for a pixel (x, y)
-    /// and accumulates the result into the given mutable pixel reference.
-    ///
-    /// This function is thread-safe as long as distinct threads operate
-    /// on distinct pixel references.
-    /// Traces one sample and returns `(rays, shadow_rays)`: closest-hit rays
-    /// (primary + bounces) and any-hit shadow rays respectively.
+    /// Trace one sample for pixel (x, y), accumulating into `pixel`. Returns
+    /// `(rays, shadow_rays)`: closest-hit rays (primary + bounces) and any-hit
+    /// shadow rays. Thread-safe as long as threads own disjoint pixels.
     pub fn sample_pixel(&self, x: usize, y: usize, pixel: &mut Pixel) -> (u64, u64) {
         let mut rng = self.init_pixel_rng(x as u32, y as u32, pixel.samples);
         let ray = self.generate_ray(&mut rng, x as f32, y as f32);
