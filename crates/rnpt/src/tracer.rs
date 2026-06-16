@@ -224,15 +224,13 @@ impl PathTracer {
             let brdf = surf.brdf();
             let wo = -ray.direction.into_inner(); // toward the previous vertex
 
-            let mut local_radiance = Color::black();
-
             // Emission, weighted per strategy (see SamplingStrategy):
             //  - BrdfOnly: every hit, full weight.
             //  - NeeOnly:  only the camera ray (bounce 0); GI emission is covered
             //              by NEE at the previous vertex (no double counting).
             //  - Mis:      bounce 0 full; otherwise balance-heuristic weight vs the
             //              NEE that could have sampled this emitter point.
-            if surf.emissive != Color::zeros() {
+            let emission = if surf.emissive != Color::zeros() {
                 let emit_w = match self.config.strategy {
                     SamplingStrategy::BrdfOnly => 1.0,
                     SamplingStrategy::NeeOnly => {
@@ -261,11 +259,13 @@ impl PathTracer {
                         }
                     }
                 };
-                local_radiance += surf.emissive * emit_w;
-            }
+                surf.emissive * emit_w
+            } else {
+                Color::black()
+            };
 
             // Next Event Estimation: analytic lights + emissive-mesh area lights.
-            local_radiance += self.compute_direct_lighting(
+            let direct = self.compute_direct_lighting(
                 &surf.position,
                 &surf.normal,
                 &brdf,
@@ -275,9 +275,8 @@ impl PathTracer {
             );
 
             // Weight this vertex's radiance by the path throughput so far.
-            // (No firefly clamp on purpose: clamping biases by clipping energy
-            // near lights — the unbiased fix is MIS on the NEE/BRDF samples.)
-            accumulated_radiance += throughput.component_mul(&local_radiance);
+            // (No firefly clamp on purpose — the unbiased fix is MIS.)
+            accumulated_radiance += throughput.component_mul(&(emission + direct));
 
             // Bounce Setup: importance-sample the BRDF to continue the path.
             let Some(bs) = brdf.sample(&surf.normal, &wo, rng) else {

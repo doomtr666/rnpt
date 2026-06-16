@@ -224,10 +224,7 @@ impl eframe::App for RnptGuiApp {
         // If pixels updated, or exposure changed, regenerate the texture
         let exposure_changed = self.exposure != self.last_exposure;
         let tonemapper_changed = self.tonemapper != self.last_tonemapper;
-        if pixels_updated
-            || exposure_changed
-            || tonemapper_changed
-            || self.texture_handle.is_none()
+        if pixels_updated || exposure_changed || tonemapper_changed || self.texture_handle.is_none()
         {
             let mut raw_rgba = vec![0u8; self.local_width * self.local_height * 4];
 
@@ -427,16 +424,8 @@ impl eframe::App for RnptGuiApp {
                 ui.add_space(4.0);
                 let prev_strategy = self.strategy;
                 ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.strategy,
-                        rnpt::SamplingStrategy::Mis,
-                        "MIS",
-                    );
-                    ui.selectable_value(
-                        &mut self.strategy,
-                        rnpt::SamplingStrategy::NeeOnly,
-                        "NEE",
-                    );
+                    ui.selectable_value(&mut self.strategy, rnpt::SamplingStrategy::Mis, "MIS");
+                    ui.selectable_value(&mut self.strategy, rnpt::SamplingStrategy::NeeOnly, "NEE");
                     ui.selectable_value(
                         &mut self.strategy,
                         rnpt::SamplingStrategy::BrdfOnly,

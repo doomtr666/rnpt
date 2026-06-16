@@ -3,6 +3,11 @@ use nalgebra::{Point3, Vector3};
 
 use std::f32::consts::PI;
 
+/// Minimum squared distance used for point/spot falloff: gives the idealized
+/// point light a finite radius (`sqrt` ≈ 0.5) so the `1/d²` near-field can't
+/// diverge into fireflies. Tunable. The shadow ray still uses the true distance.
+const POINT_LIGHT_MIN_DIST2: f32 = 0.25;
+
 /// One sample of incident light at a shading point, in a common (solid-angle)
 /// measure so every light type plugs into the same estimator.
 pub struct LightSample {
@@ -87,10 +92,13 @@ impl Light {
                     return None;
                 }
                 let dist = d2.sqrt();
+                // Regularize the unphysical 1/d² near-field (finite light radius);
+                // the shadow ray below still travels the true distance.
+                let d2_falloff = d2.max(POINT_LIGHT_MIN_DIST2);
                 Some(LightSample {
                     wi: to / dist,
                     distance: dist,
-                    li: color * (intensity / (4.0 * PI * d2)),
+                    li: color * (intensity / (4.0 * PI * d2_falloff)),
                     pdf: 1.0,
                 })
             }
