@@ -11,6 +11,9 @@ pub struct FlatTriangle {
     pub v1: u32,
     pub v2: u32,
     pub material: u32,
+    /// Index into the unified light list if this triangle is an area-light
+    /// emitter, else `u32::MAX`. Used for the MIS weight on BRDF hits.
+    pub light: u32,
 }
 
 #[repr(C, align(32))]
@@ -109,6 +112,8 @@ pub struct BvhHit {
     pub v1: u32,
     pub v2: u32,
     pub chunk_idx: u32,
+    /// Unified light index if the hit triangle is an emitter, else `u32::MAX`.
+    pub light: u32,
 }
 
 pub struct Bvh {
@@ -216,6 +221,7 @@ impl Bvh {
                             v1: tri.v1,
                             v2: tri.v2,
                             chunk_idx,
+                            light: tri.light,
                         });
                     }
                 }

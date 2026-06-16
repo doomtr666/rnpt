@@ -6,7 +6,8 @@ use nalgebra::{Point3, UnitVector3, Vector2};
 /// will plug in here, and it builds the BRDF for the integrator.
 pub struct SurfaceInteraction {
     pub position: Point3<f32>,
-    pub normal: UnitVector3<f32>, // shading normal
+    pub normal: UnitVector3<f32>,     // shading normal (interpolated vertex normals)
+    pub geo_normal: UnitVector3<f32>, // geometric normal (triangle winding)
     pub albedo: Color,
     pub emissive: Color,
 }
@@ -31,6 +32,13 @@ pub fn evaluate_surface(hit: &BvhHit, ray: &Ray, bvh: &Bvh, scene: &Scene) -> Su
     let n1 = bvh.normals[hit.v1 as usize];
     let n2 = bvh.normals[hit.v2 as usize];
     let normal = UnitVector3::new_normalize(n0.scale(w) + n1.scale(u) + n2.scale(v));
+
+    // Geometric normal from the triangle winding (raw, to match the emitter
+    // normal used by NEE — needed for the MIS cos_l on BRDF hits).
+    let p0 = bvh.vertices[hit.v0 as usize];
+    let p1 = bvh.vertices[hit.v1 as usize];
+    let p2 = bvh.vertices[hit.v2 as usize];
+    let geo_normal = UnitVector3::new_normalize((p1 - p0).cross(&(p2 - p0)));
 
     let position = ray.at(hit.hit.t);
 
@@ -64,6 +72,7 @@ pub fn evaluate_surface(hit: &BvhHit, ray: &Ray, bvh: &Bvh, scene: &Scene) -> Su
     SurfaceInteraction {
         position,
         normal,
+        geo_normal,
         albedo: modulate(mat.albedo_texture, mat.albedo.component_mul(&vertex_color)),
         emissive: modulate(mat.emissive_texture, mat.emissive),
     }

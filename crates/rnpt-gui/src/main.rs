@@ -42,7 +42,7 @@ struct RnptGuiApp {
     auto_fit: bool,
     resize_timeout: Option<Instant>,
 
-    use_nee: bool,
+    strategy: rnpt::SamplingStrategy,
 }
 
 fn empty_scene() -> rnpt::Scene {
@@ -107,7 +107,7 @@ impl RnptGuiApp {
             _ => build_bvh_and_lights(&scene),
         };
 
-        let use_nee = true;
+        let strategy = rnpt::SamplingStrategy::Mis;
         let config = rnpt::PathTracerConfig {
             width,
             height,
@@ -115,7 +115,7 @@ impl RnptGuiApp {
             scene,
             bvh,
             lights,
-            use_nee,
+            strategy,
         };
 
         let tracer = Some(rnpt::ParallelTracer::new(config));
@@ -146,7 +146,7 @@ impl RnptGuiApp {
             current_lights,
             auto_fit: true,
             resize_timeout: None,
-            use_nee,
+            strategy,
         }
     }
 
@@ -167,7 +167,7 @@ impl RnptGuiApp {
             scene,
             bvh,
             lights,
-            use_nee: self.use_nee,
+            strategy: self.strategy,
         };
 
         // Always recreate tracer to ensure clean memory state and no race conditions
@@ -425,12 +425,25 @@ impl eframe::App for RnptGuiApp {
                 // Lighting method (A/B comparison: resets accumulation on change)
                 ui.heading("Lighting");
                 ui.add_space(4.0);
-                let prev_use_nee = self.use_nee;
+                let prev_strategy = self.strategy;
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.use_nee, true, "NEE (area lights)");
-                    ui.selectable_value(&mut self.use_nee, false, "Lucky (BRDF)");
+                    ui.selectable_value(
+                        &mut self.strategy,
+                        rnpt::SamplingStrategy::Mis,
+                        "MIS",
+                    );
+                    ui.selectable_value(
+                        &mut self.strategy,
+                        rnpt::SamplingStrategy::NeeOnly,
+                        "NEE",
+                    );
+                    ui.selectable_value(
+                        &mut self.strategy,
+                        rnpt::SamplingStrategy::BrdfOnly,
+                        "BRDF",
+                    );
                 });
-                if self.use_nee != prev_use_nee {
+                if self.strategy != prev_strategy {
                     self.trigger_reset();
                 }
 

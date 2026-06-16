@@ -18,6 +18,19 @@ impl Default for Pixel {
     }
 }
 
+/// Direct-lighting estimator. All three are unbiased and converge to the same
+/// image; `Mis` has the lowest variance (and is the default).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SamplingStrategy {
+    /// BRDF sampling only: emission on every hit; NEE for delta lights only
+    /// (a BRDF ray can never hit a point/directional light).
+    BrdfOnly,
+    /// Light sampling only (NEE), emission counted on the camera ray only.
+    NeeOnly,
+    /// Multiple importance sampling (balance heuristic) of NEE and BRDF.
+    Mis,
+}
+
 #[derive(Clone)]
 pub struct PathTracerConfig {
     pub width: usize,
@@ -27,9 +40,7 @@ pub struct PathTracerConfig {
     pub bvh: Arc<Bvh>,
     /// Unified light list: scene punctual lights + one area light per emissive mesh.
     pub lights: Arc<Vec<Light>>,
-    /// true  = NEE: sample emissive meshes as area lights, emission only on bounce 0.
-    /// false = "lucky": emission on every hit, no area-light sampling (BRDF only).
-    pub use_nee: bool,
+    pub strategy: SamplingStrategy,
 }
 
 /// No hard path-length cap: paths terminate via Russian roulette only (PBRT
@@ -133,9 +144,10 @@ impl PathTracer {
         let textures = &self.config.scene.textures;
 
         for light in self.config.lights.iter() {
-            // In "lucky" mode, area-light contribution comes from BRDF rays
-            // hitting emitters instead, so skip NEE on them.
-            if !self.config.use_nee && light.is_area() {
+            // BrdfOnly draws no light samples for area lights (their contribution
+            // comes from BRDF rays hitting emitters); delta lights always need NEE
+            // since a BRDF ray can never hit them.
+            if self.config.strategy == SamplingStrategy::BrdfOnly && light.is_area() {
                 continue;
             }
 
@@ -165,7 +177,15 @@ impl PathTracer {
             *shadow_rays += 1;
             if !self.config.bvh.is_occluded(&shadow_ray) {
                 let f = brdf.eval(normal, wo, &s.wi);
-                total_direct += f.component_mul(&s.li) * (cos_s / s.pdf);
+                // MIS balance-heuristic weight against BRDF sampling, for area
+                // lights only (delta lights can't be BRDF-sampled → weight 1).
+                let w = if self.config.strategy == SamplingStrategy::Mis && light.is_area() {
+                    let p_b = brdf.pdf(normal, wo, &s.wi);
+                    s.pdf / (s.pdf + p_b)
+                } else {
+                    1.0
+                };
+                total_direct += f.component_mul(&s.li) * (cos_s / s.pdf * w);
             }
         }
 
@@ -186,6 +206,9 @@ impl PathTracer {
     ) -> Color {
         let mut accumulated_radiance = Color::black();
         let mut throughput = Color::white(); // Current path attenuation factor
+        // Solid-angle pdf of the BRDF bounce that reached the current vertex
+        // (0 for the camera ray) — needed for the MIS weight on emitter hits.
+        let mut bsdf_pdf = 0.0f32;
 
         for bounce in 0..MAX_BOUNCES {
             // Closest-hit intersection with the scene.
@@ -203,11 +226,42 @@ impl PathTracer {
 
             let mut local_radiance = Color::black();
 
-            // Emission only when the emitter is seen directly (bounce 0) in NEE
-            // mode; on GI bounces it is covered by NEE at the previous vertex
-            // (avoids double counting). "Lucky" mode adds it on every hit.
-            if !self.config.use_nee || bounce == 0 {
-                local_radiance += surf.emissive;
+            // Emission, weighted per strategy (see SamplingStrategy):
+            //  - BrdfOnly: every hit, full weight.
+            //  - NeeOnly:  only the camera ray (bounce 0); GI emission is covered
+            //              by NEE at the previous vertex (no double counting).
+            //  - Mis:      bounce 0 full; otherwise balance-heuristic weight vs the
+            //              NEE that could have sampled this emitter point.
+            if surf.emissive != Color::zeros() {
+                let emit_w = match self.config.strategy {
+                    SamplingStrategy::BrdfOnly => 1.0,
+                    SamplingStrategy::NeeOnly => {
+                        if bounce == 0 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    SamplingStrategy::Mis => {
+                        if bounce == 0 {
+                            1.0
+                        } else {
+                            let cos_l = surf.geo_normal.dot(&wo).max(0.0);
+                            let p_l = self
+                                .config
+                                .lights
+                                .get(hit.light as usize)
+                                .map_or(0.0, |l| l.area_pdf(hit.hit.t * hit.hit.t, cos_l));
+                            let denom = bsdf_pdf + p_l;
+                            if denom > 0.0 {
+                                bsdf_pdf / denom
+                            } else {
+                                1.0
+                            }
+                        }
+                    }
+                };
+                local_radiance += surf.emissive * emit_w;
             }
 
             // Next Event Estimation: analytic lights + emissive-mesh area lights.
@@ -233,6 +287,7 @@ impl PathTracer {
             if bs.pdf <= 0.0 || cos_theta <= 0.0 {
                 break;
             }
+            bsdf_pdf = bs.pdf; // carried to the next vertex for its MIS weight
 
             // Update path throughput: f_r * cos_theta / pdf.
             throughput = throughput.component_mul(&(bs.f * (cos_theta / bs.pdf)));

@@ -64,6 +64,11 @@ impl MeshEmitter {
         })
     }
 
+    #[inline]
+    pub fn total_area(&self) -> f32 {
+        self.total_area
+    }
+
     /// Area-weighted sample of a point on the mesh. `pdf_area = 1 / total_area`
     /// regardless of the chosen triangle (pick ∝ area cancels the per-triangle
     /// uniform density) — this keeps the NEE estimator unbiased.

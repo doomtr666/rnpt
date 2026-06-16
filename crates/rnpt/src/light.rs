@@ -48,6 +48,17 @@ impl Light {
         !self.is_area()
     }
 
+    /// Solid-angle pdf that NEE would assign to a point on this light, given the
+    /// squared distance and emitter-side cosine. `0` for non-area or back-facing
+    /// — used for the MIS weight when a BRDF ray lands on an emitter.
+    #[inline]
+    pub fn area_pdf(&self, dist2: f32, cos_l: f32) -> f32 {
+        match self {
+            Light::Area(mesh) if cos_l > 0.0 => dist2 / (mesh.total_area() * cos_l),
+            _ => 0.0,
+        }
+    }
+
     /// Sample incident radiance at `x`. Returns `None` if the light cannot
     /// contribute (degenerate distance, back-facing emitter, ...).
     pub fn sample_li(

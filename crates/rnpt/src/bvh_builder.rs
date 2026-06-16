@@ -133,7 +133,14 @@ impl BvhBuilder {
                 let mat = &scene.materials[mesh.material as usize];
                 let is_emissive =
                     mat.emissive.x > 0.0 || mat.emissive.y > 0.0 || mat.emissive.z > 0.0;
-                // One area light per emissive mesh instance.
+                // One area light per emissive mesh instance. Its unified-light
+                // index = (punctual lights) + (this emitter's position), matching
+                // `build_lights` (punctual ++ emitters). `u32::MAX` for non-emitters.
+                let light_idx = if is_emissive {
+                    scene.lights.len() as u32 + self.emitter_meshes.len() as u32
+                } else {
+                    u32::MAX
+                };
                 let mut emitter_tris: Vec<EmitterTri> = Vec::new();
 
                 for &tri in &mesh.triangles {
@@ -175,6 +182,7 @@ impl BvhBuilder {
                         v1: v1 as u32,
                         v2: v2 as u32,
                         material: mesh.material,
+                        light: light_idx,
                     });
 
                     if is_emissive {
@@ -230,6 +238,7 @@ impl BvhBuilder {
                     v1: 0,
                     v2: 0,
                     material: 0,
+                    light: u32::MAX,
                 });
             }
         }
