@@ -38,8 +38,11 @@ pub struct PathTracerConfig {
     pub camera: Camera,
     pub scene: Arc<Scene>,
     pub bvh: Arc<Bvh>,
-    /// Unified light list: scene punctual lights + one area light per emissive mesh.
+    /// Unified light list: scene punctual lights + area lights + optional environment.
     pub lights: Arc<Vec<Light>>,
+    /// Index of the `Light::Environment` in `lights`, if any (for the ray-escape
+    /// background / BRDF-side MIS). `None` → black background.
+    pub env: Option<usize>,
     pub strategy: SamplingStrategy,
 }
 
@@ -144,10 +147,10 @@ impl PathTracer {
         let textures = &self.config.scene.textures;
 
         for light in self.config.lights.iter() {
-            // BrdfOnly draws no light samples for area lights (their contribution
-            // comes from BRDF rays hitting emitters); delta lights always need NEE
-            // since a BRDF ray can never hit them.
-            if self.config.strategy == SamplingStrategy::BrdfOnly && light.is_area() {
+            // BrdfOnly draws no light samples for non-delta lights (area + env;
+            // their contribution comes from BRDF rays hitting emitters / escaping
+            // into the environment); delta lights always need NEE.
+            if self.config.strategy == SamplingStrategy::BrdfOnly && !light.is_delta() {
                 continue;
             }
 
@@ -177,9 +180,9 @@ impl PathTracer {
             *shadow_rays += 1;
             if !self.config.bvh.is_occluded(&shadow_ray) {
                 let f = brdf.eval(normal, wo, &s.wi);
-                // MIS balance-heuristic weight against BRDF sampling, for area
-                // lights only (delta lights can't be BRDF-sampled → weight 1).
-                let w = if self.config.strategy == SamplingStrategy::Mis && light.is_area() {
+                // MIS balance-heuristic weight against BRDF sampling, for non-delta
+                // lights (area + env); delta lights can't be BRDF-sampled → weight 1.
+                let w = if self.config.strategy == SamplingStrategy::Mis && !light.is_delta() {
                     let p_b = brdf.pdf(normal, wo, &s.wi);
                     s.pdf / (s.pdf + p_b)
                 } else {
@@ -214,8 +217,38 @@ impl PathTracer {
             // Closest-hit intersection with the scene.
             *rays += 1;
             let Some(hit) = self.config.bvh.intersect(&ray) else {
-                let sky_radiance = Color::black(); //scene.sample_sky(&ray);
-                accumulated_radiance += throughput.component_mul(&sky_radiance);
+                // Ray escaped: the environment light (background + BRDF-side MIS).
+                // Weight mirrors emitter emission: bounce 0 sees the background
+                // directly (NEE can't sample it → w=1); deeper bounces are MIS-
+                // weighted vs the env NEE that could have sampled this direction.
+                if let Some(env_idx) = self.config.env {
+                    let env = &self.config.lights[env_idx];
+                    let dir = ray.direction.into_inner();
+                    let w = match self.config.strategy {
+                        SamplingStrategy::BrdfOnly => 1.0,
+                        SamplingStrategy::NeeOnly => {
+                            if bounce == 0 {
+                                1.0
+                            } else {
+                                0.0
+                            }
+                        }
+                        SamplingStrategy::Mis => {
+                            if bounce == 0 {
+                                1.0
+                            } else {
+                                let p_l = env.env_pdf(&dir);
+                                let denom = bsdf_pdf + p_l;
+                                if denom > 0.0 {
+                                    bsdf_pdf / denom
+                                } else {
+                                    1.0
+                                }
+                            }
+                        }
+                    };
+                    accumulated_radiance += throughput.component_mul(&env.radiance(&dir)) * w;
+                }
                 break;
             };
 

@@ -5,13 +5,22 @@ use std::path::{Path, PathBuf};
 
 /// Scans the directory for any .glb or .gltf files and returns their paths.
 pub fn list_assets<P: AsRef<Path>>(dir: P) -> Vec<PathBuf> {
+    list_by_ext(dir, &["glb", "gltf"])
+}
+
+/// Scans the directory for equirectangular HDRIs (.hdr).
+pub fn list_hdris<P: AsRef<Path>>(dir: P) -> Vec<PathBuf> {
+    list_by_ext(dir, &["hdr"])
+}
+
+fn list_by_ext<P: AsRef<Path>>(dir: P, exts: &[&str]) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
-                if let Some(ext) = path.extension() {
-                    if ext == "glb" || ext == "gltf" {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if exts.iter().any(|&e| ext.eq_ignore_ascii_case(e)) {
                         files.push(path);
                     }
                 }
@@ -20,6 +29,15 @@ pub fn list_assets<P: AsRef<Path>>(dir: P) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+/// Load an equirectangular `.hdr` as linear RGB pixels (row-major) + dimensions.
+pub fn load_hdr(path: &Path) -> Option<(Vec<Color>, usize, usize)> {
+    let img = image::ImageReader::open(path).ok()?.decode().ok()?;
+    let rgb = img.to_rgb32f();
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    let pixels = rgb.pixels().map(|p| Color::new(p[0], p[1], p[2])).collect();
+    Some((pixels, w, h))
 }
 
 fn gltf_matrix_to_nalgebra(matrix: [[f32; 4]; 4]) -> Matrix4<f32> {

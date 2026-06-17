@@ -25,6 +25,9 @@ pub use brdf::*;
 mod material;
 pub use material::*;
 
+mod distribution;
+pub use distribution::*;
+
 mod tracer;
 pub use tracer::*;
 

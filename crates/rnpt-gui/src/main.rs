@@ -43,6 +43,31 @@ struct RnptGuiApp {
     resize_timeout: Option<Instant>,
 
     strategy: rnpt::SamplingStrategy,
+
+    // Environment (HDRI) lighting.
+    hdr_files: Vec<std::path::PathBuf>,
+    selected_env: usize, // 0 = none, else hdr_files[selected_env - 1]
+    env: Option<std::sync::Arc<rnpt::EnvLight>>,
+    env_raw: Option<(Vec<rnpt::Color>, usize, usize)>, // cached pixels for intensity rebuild
+    env_intensity: f32,
+    env_rotation: f32, // degrees, [0, 360)
+}
+
+/// Append the environment light (if any) to the unified light list and report
+/// its index for the ray-escape hook.
+fn with_env(
+    lights: &std::sync::Arc<Vec<rnpt::Light>>,
+    env: &Option<std::sync::Arc<rnpt::EnvLight>>,
+) -> (std::sync::Arc<Vec<rnpt::Light>>, Option<usize>) {
+    match env {
+        Some(e) => {
+            let mut v = (**lights).clone();
+            v.push(rnpt::Light::Environment(e.clone()));
+            let idx = v.len() - 1;
+            (std::sync::Arc::new(v), Some(idx))
+        }
+        None => (lights.clone(), None),
+    }
 }
 
 fn empty_scene() -> rnpt::Scene {
@@ -115,6 +140,7 @@ impl RnptGuiApp {
             scene,
             bvh,
             lights,
+            env: None,
             strategy,
         };
 
@@ -147,7 +173,34 @@ impl RnptGuiApp {
             auto_fit: true,
             resize_timeout: None,
             strategy,
+            hdr_files: asset_importer::list_hdris("assets"),
+            selected_env: 0,
+            env: None,
+            env_raw: None,
+            env_intensity: 1.0,
+            env_rotation: 0.0,
         }
+    }
+
+    /// (Re)load the selected HDRI into `env` (clearing it if "None").
+    fn load_env(&mut self) {
+        if self.selected_env == 0 {
+            self.env = None;
+            self.env_raw = None;
+            return;
+        }
+        let path = self.hdr_files[self.selected_env - 1].clone();
+        self.env_raw = asset_importer::load_hdr(&path);
+        self.rebuild_env();
+    }
+
+    /// Rebuild the `EnvLight` from the cached pixels at the current intensity
+    /// (the importance-sampling distribution is intensity-independent).
+    fn rebuild_env(&mut self) {
+        let rot_rad = self.env_rotation.to_radians();
+        self.env = self.env_raw.as_ref().map(|(pixels, w, h)| {
+            std::sync::Arc::new(rnpt::EnvLight::new(pixels.clone(), *w, *h, self.env_intensity, rot_rad))
+        });
     }
 
     fn trigger_reset(&mut self) {
@@ -159,6 +212,7 @@ impl RnptGuiApp {
             (Some(b), Some(l)) => (b, l),
             _ => build_bvh_and_lights(&scene),
         };
+        let (lights, env) = with_env(&lights, &self.env);
 
         let config = rnpt::PathTracerConfig {
             width: self.resolution[0],
@@ -167,6 +221,7 @@ impl RnptGuiApp {
             scene,
             bvh,
             lights,
+            env,
             strategy: self.strategy,
         };
 
@@ -433,6 +488,54 @@ impl eframe::App for RnptGuiApp {
                     );
                 });
                 if self.strategy != prev_strategy {
+                    self.trigger_reset();
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                // Environment (HDRI)
+                ui.heading("Environment");
+                ui.add_space(4.0);
+                let prev_env = self.selected_env;
+                let env_label = if self.selected_env == 0 {
+                    "None".to_string()
+                } else {
+                    self.hdr_files[self.selected_env - 1]
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("?")
+                        .to_string()
+                };
+                egui::ComboBox::from_id_source("env_selector")
+                    .selected_text(env_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.selected_env, 0, "None");
+                        for (i, p) in self.hdr_files.iter().enumerate() {
+                            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                            ui.selectable_value(&mut self.selected_env, i + 1, name);
+                        }
+                    });
+                if self.selected_env != prev_env {
+                    self.load_env();
+                    self.trigger_reset();
+                }
+                let mut env_changed = false;
+                ui.add_enabled_ui(self.env.is_some(), |ui| {
+                    let prev_i = self.env_intensity;
+                    ui.add(egui::Slider::new(&mut self.env_intensity, 0.0..=10.0).text("Intensity"));
+                    if (self.env_intensity - prev_i).abs() > f32::EPSILON {
+                        env_changed = true;
+                    }
+                    let prev_r = self.env_rotation;
+                    ui.add(egui::Slider::new(&mut self.env_rotation, 0.0..=360.0).text("Rotation°"));
+                    if (self.env_rotation - prev_r).abs() > f32::EPSILON {
+                        env_changed = true;
+                    }
+                });
+                if env_changed {
+                    self.rebuild_env();
                     self.trigger_reset();
                 }
 
