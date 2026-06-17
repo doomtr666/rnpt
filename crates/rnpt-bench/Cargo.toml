@@ -1,0 +1,22 @@
+[package]
+name = "rnpt-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+[[bench]]
+name = "bvh"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+nalgebra = "0.33"
+rand = { version = "0.8", features = ["small_rng"] }
+rnpt = { path = "../rnpt" }
+
+# cargo bench -p rnpt-bench --features embree
+# (first run downloads Embree automatically)
+[features]
+default = []
+embree = []
