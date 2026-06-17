@@ -49,29 +49,21 @@ impl Camera {
     }
 }
 
+/// All textures are stored as linear-light RGB f32, converted from sRGB at load
+/// time (see `asset_importer`). `sample_bilinear` is pure interpolation — no
+/// color-space work at sample time. Linear maps (normals, roughness, …) are
+/// loaded without sRGB conversion and plug into the same sampler unchanged.
 #[derive(Clone, Debug)]
 pub struct Texture {
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<[u8; 4]>,
-}
-
-static DEGAMMA_LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
-
-fn get_degamma_lut() -> &'static [f32; 256] {
-    DEGAMMA_LUT.get_or_init(|| {
-        let mut lut = [0.0; 256];
-        for i in 0..256 {
-            lut[i] = (i as f32 / 255.0).powf(2.2);
-        }
-        lut
-    })
+    pub pixels: Vec<Color>, // linear f32, converted once at load time
 }
 
 impl Texture {
     pub fn sample_bilinear(&self, uv: Vector2<f32>) -> Color {
         if self.width == 0 || self.height == 0 {
-            return Color::new(1.0, 0.0, 1.0); // Magenta error color
+            return Color::new(1.0, 0.0, 1.0);
         }
 
         let u = uv.x - uv.x.floor();
@@ -88,27 +80,15 @@ impl Texture {
         let tx = x - x0 as f32;
         let ty = y - y0 as f32;
 
-        let lut = get_degamma_lut();
+        let get = |x: u32, y: u32| self.pixels[(y * self.width + x) as usize];
 
-        let get_color = |x: u32, y: u32| -> Color {
-            let idx = (y * self.width + x) as usize;
-            let pixel = self.pixels[idx];
-            Color::new(
-                lut[pixel[0] as usize],
-                lut[pixel[1] as usize],
-                lut[pixel[2] as usize],
-            )
-        };
+        let c00 = get(x0, y0);
+        let c10 = get(x1, y0);
+        let c01 = get(x0, y1);
+        let c11 = get(x1, y1);
 
-        let c00 = get_color(x0, y0);
-        let c10 = get_color(x1, y0);
-        let c01 = get_color(x0, y1);
-        let c11 = get_color(x1, y1);
-
-        let top = c00 * (1.0 - tx) + c10 * tx;
-        let bottom = c01 * (1.0 - tx) + c11 * tx;
-
-        top * (1.0 - ty) + bottom * ty
+        (c00 * (1.0 - tx) + c10 * tx) * (1.0 - ty)
+            + (c01 * (1.0 - tx) + c11 * tx) * ty
     }
 }
 

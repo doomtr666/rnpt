@@ -3,6 +3,17 @@ use rnpt::{Camera, Color, Light, Material, Mesh, Node, Scene, Triangle};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// IEC 61966-2-1 sRGB → linear (exact, matches Blender/OpenGL).
+#[inline]
+fn srgb_u8_to_linear(v: u8) -> f32 {
+    let c = v as f32 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 /// Scans the directory for any .glb or .gltf files and returns their paths.
 pub fn list_assets<P: AsRef<Path>>(dir: P) -> Vec<PathBuf> {
     list_by_ext(dir, &["glb", "gltf"])
@@ -65,39 +76,44 @@ fn gltf_matrix_to_nalgebra(matrix: [[f32; 4]; 4]) -> Matrix4<f32> {
 pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error::Error>> {
     let (document, buffers, images) = gltf::import(path)?;
 
-    // Load Textures
+    // Load Textures — convert sRGB u8 → linear f32 once here so sample_bilinear
+    // is pure interpolation with no per-sample color-space work.
+    // Linear maps (normal, roughness, …) will be loaded without this conversion
+    // when they are added; the sampler is identical for both.
     let mut textures = Vec::new();
     for img in images {
-        let mut pixels = vec![[255u8; 4]; (img.width * img.height) as usize];
-        
+        let n = (img.width * img.height) as usize;
         let bytes = &img.pixels;
-        match img.format {
-            gltf::image::Format::R8G8B8 => {
-                for i in 0..(img.width * img.height) as usize {
-                    pixels[i] = [bytes[i * 3], bytes[i * 3 + 1], bytes[i * 3 + 2], 255];
-                }
-            }
-            gltf::image::Format::R8G8B8A8 => {
-                for i in 0..(img.width * img.height) as usize {
-                    pixels[i] = [bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]];
-                }
-            }
-            gltf::image::Format::R8 => {
-                for i in 0..(img.width * img.height) as usize {
-                    pixels[i] = [bytes[i], bytes[i], bytes[i], 255];
-                }
-            }
-            gltf::image::Format::R8G8 => {
-                for i in 0..(img.width * img.height) as usize {
-                    pixels[i] = [bytes[i * 2], bytes[i * 2 + 1], 0, 255];
-                }
-            }
+        let pixels: Vec<rnpt::Color> = match img.format {
+            gltf::image::Format::R8G8B8 => (0..n)
+                .map(|i| rnpt::Color::new(
+                    srgb_u8_to_linear(bytes[i * 3]),
+                    srgb_u8_to_linear(bytes[i * 3 + 1]),
+                    srgb_u8_to_linear(bytes[i * 3 + 2]),
+                ))
+                .collect(),
+            gltf::image::Format::R8G8B8A8 => (0..n)
+                .map(|i| rnpt::Color::new(
+                    srgb_u8_to_linear(bytes[i * 4]),
+                    srgb_u8_to_linear(bytes[i * 4 + 1]),
+                    srgb_u8_to_linear(bytes[i * 4 + 2]),
+                ))
+                .collect(),
+            gltf::image::Format::R8 => (0..n)
+                .map(|i| { let l = srgb_u8_to_linear(bytes[i]); rnpt::Color::new(l, l, l) })
+                .collect(),
+            gltf::image::Format::R8G8 => (0..n)
+                .map(|i| rnpt::Color::new(
+                    srgb_u8_to_linear(bytes[i * 2]),
+                    srgb_u8_to_linear(bytes[i * 2 + 1]),
+                    0.0,
+                ))
+                .collect(),
             _ => {
                 eprintln!("Unsupported texture format: {:?}", img.format);
-                // Unsupported or less common formats, keep it white for now
+                vec![rnpt::Color::new(1.0, 0.0, 1.0); n]
             }
-        }
-
+        };
         textures.push(rnpt::Texture {
             width: img.width,
             height: img.height,

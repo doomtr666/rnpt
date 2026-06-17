@@ -43,6 +43,7 @@ struct RnptGuiApp {
     resize_timeout: Option<Instant>,
 
     strategy: rnpt::SamplingStrategy,
+    selected_camera_index: usize,
 
     // Environment (HDRI) lighting.
     hdr_files: Vec<std::path::PathBuf>,
@@ -173,6 +174,7 @@ impl RnptGuiApp {
             auto_fit: true,
             resize_timeout: None,
             strategy,
+            selected_camera_index: 0,
             hdr_files: asset_importer::list_hdris("assets"),
             selected_env: 0,
             env: None,
@@ -345,6 +347,7 @@ impl eframe::App for RnptGuiApp {
                                 &self.asset_files[self.selected_asset_index],
                             ) {
                                 Ok(scene) => {
+                                    self.selected_camera_index = 0;
                                     if !scene.cameras.is_empty() {
                                         let first_cam = &scene.cameras[0];
                                         self.camera.position = first_cam.position;
@@ -371,6 +374,33 @@ impl eframe::App for RnptGuiApp {
 
                 // Camera section
                 ui.collapsing("Camera Parameters", |ui| {
+                    // Camera selector (only when the scene has more than one camera)
+                    let n_cams = self.current_scene.as_ref().map_or(0, |s| s.cameras.len());
+                    if n_cams > 1 {
+                        let prev = self.selected_camera_index;
+                        egui::ComboBox::from_id_source("camera_selector")
+                            .selected_text(format!("Camera {}", self.selected_camera_index))
+                            .show_ui(ui, |ui| {
+                                for i in 0..n_cams {
+                                    ui.selectable_value(
+                                        &mut self.selected_camera_index,
+                                        i,
+                                        format!("Camera {}", i),
+                                    );
+                                }
+                            });
+                        if self.selected_camera_index != prev {
+                            let cam = self.current_scene.as_ref()
+                                .and_then(|s| s.cameras.get(self.selected_camera_index))
+                                .cloned();
+                            if let Some(cam) = cam {
+                                self.camera = cam;
+                                changed = true;
+                            }
+                        }
+                        ui.add_space(4.0);
+                    }
+
                     ui.label("Position:");
                     ui.horizontal(|ui| {
                         changed |= ui
@@ -635,6 +665,10 @@ impl eframe::App for RnptGuiApp {
             });
 
         let mut viewport_size = None;
+        let mut nav_orbit = [0.0f32; 2];
+        let mut nav_pan = [0.0f32; 2];
+        let mut nav_scroll = 0.0f32;
+        let mut nav_changed = false;
         egui::CentralPanel::default().show(ctx, |ui| {
             let available = ui.available_size();
             viewport_size = Some([available.x, available.y]);
@@ -656,6 +690,32 @@ impl eframe::App for RnptGuiApp {
                 );
 
                 ui.put(rect, egui::Image::new(texture));
+
+                // Camera navigation
+                let response = ui.interact(rect, ui.id().with("nav"), egui::Sense::drag());
+                if response.dragged_by(egui::PointerButton::Primary) {
+                    let d = response.drag_delta();
+                    if d.x != 0.0 || d.y != 0.0 {
+                        nav_orbit = [d.x, d.y];
+                        nav_changed = true;
+                    }
+                }
+                if response.dragged_by(egui::PointerButton::Middle)
+                    || response.dragged_by(egui::PointerButton::Secondary)
+                {
+                    let d = response.drag_delta();
+                    if d.x != 0.0 || d.y != 0.0 {
+                        nav_pan = [d.x, d.y];
+                        nav_changed = true;
+                    }
+                }
+                if response.hovered() {
+                    let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                    if scroll.abs() > 0.5 {
+                        nav_scroll = scroll;
+                        nav_changed = true;
+                    }
+                }
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.spinner();
@@ -673,6 +733,13 @@ impl eframe::App for RnptGuiApp {
                     self.resize_timeout = Some(Instant::now() + Duration::from_millis(150));
                 }
             }
+        }
+
+        if nav_changed {
+            orbit_camera(&mut self.camera, nav_orbit[0], nav_orbit[1]);
+            pan_camera(&mut self.camera, nav_pan[0], nav_pan[1]);
+            dolly_camera(&mut self.camera, nav_scroll);
+            self.trigger_reset();
         }
     }
 }
@@ -759,7 +826,62 @@ fn format_rays_per_sec(rays_per_sec: f64) -> String {
     }
 }
 
-// The background thread logic has been entirely encapsulated within rnpt::ParallelTracer!
+/// Orbit the camera around its target in spherical coordinates.
+/// Left-drag: dx rotates azimuth, dy rotates elevation.
+fn orbit_camera(camera: &mut rnpt::Camera, dx: f32, dy: f32) {
+    use std::f32::consts::PI;
+    let to_cam = camera.position - camera.target;
+    let r = to_cam.norm();
+    if r < 1e-6 {
+        return;
+    }
+    let theta = (to_cam.y / r).clamp(-1.0, 1.0).acos(); // polar [0, PI]
+    let phi = to_cam.z.atan2(to_cam.x);                  // azimuth [-PI, PI]
+    let s = 0.005f32;
+    let new_phi = phi - dx * s;
+    let new_theta = (theta + dy * s).clamp(0.005, PI - 0.005);
+    camera.position = camera.target
+        + nalgebra::Vector3::new(
+            r * new_theta.sin() * new_phi.cos(),
+            r * new_theta.cos(),
+            r * new_theta.sin() * new_phi.sin(),
+        );
+}
+
+/// Pan (translate) the camera and its target together in the view plane.
+/// Middle/right-drag: move sideways and up/down without changing the look direction.
+fn pan_camera(camera: &mut rnpt::Camera, dx: f32, dy: f32) {
+    let v = camera.target - camera.position;
+    let r = v.norm();
+    if r < 1e-6 {
+        return;
+    }
+    let forward = v / r;
+    let world_up = nalgebra::Vector3::new(0.0f32, 1.0, 0.0);
+    let right = forward.cross(&world_up);
+    let right_norm = right.norm();
+    if right_norm < 1e-6 {
+        return;
+    }
+    let right = right / right_norm;
+    let up = right.cross(&forward);
+    let s = r * 0.001;
+    let offset = right * (-dx * s) + up * (dy * s);
+    camera.position += offset;
+    camera.target += offset;
+}
+
+/// Dolly (zoom) the camera toward or away from the target.
+/// Scroll up → closer, scroll down → farther.
+fn dolly_camera(camera: &mut rnpt::Camera, scroll: f32) {
+    let to_cam = camera.position - camera.target;
+    let r = to_cam.norm();
+    if r < 1e-6 {
+        return;
+    }
+    let new_r = (r * (-scroll * 0.005f32).exp()).max(0.01);
+    camera.position = camera.target + to_cam / r * new_r;
+}
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
