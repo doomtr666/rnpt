@@ -5,4 +5,7 @@ edition = "2024"
 
 [dependencies]
 nalgebra = "0.33"
-wide = "1.5.0"
+rnpt-bvh = { path = "../rnpt-bvh" }
+
+[dev-dependencies]
+nalgebra = "0.33"

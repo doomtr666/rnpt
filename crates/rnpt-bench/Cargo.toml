@@ -3,7 +3,6 @@ name = "rnpt-bench"
 version = "0.1.0"
 edition = "2024"
 publish = false
-build = "build.rs"
 
 [[bench]]
 name = "bvh"
@@ -14,9 +13,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 nalgebra = "0.33"
 rand = { version = "0.8", features = ["small_rng"] }
 rnpt = { path = "../rnpt" }
+rnpt-bvh-embree = { path = "../rnpt-bvh-embree" }
 
 # cargo bench -p rnpt-bench --features embree
 # (first run downloads Embree automatically)
 [features]
 default = []
-embree = []
+embree = ["rnpt-bvh-embree/embree"]

@@ -8,6 +8,9 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rnpt::{Bvh, BvhBuilder, Material, Mesh, Node, Ray, Scene, Transform3, Triangle};
 
+#[cfg(feature = "embree")]
+use rnpt_bvh_embree::{Geometry as EGeometry, RayAccelerator, Scene as EScene};
+
 // ── Scene generators ──────────────────────────────────────────────────────────
 
 fn hnoise(x: f32, y: f32) -> f32 {
@@ -16,7 +19,6 @@ fn hnoise(x: f32, y: f32) -> f32 {
   + (x * 11.1 + y * 7.3).sin() * 0.10
 }
 
-/// Connected grid with height variation — good BVH, representative of organic surfaces.
 fn make_heightfield(target_tris: usize) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
     let r = ((target_tris / 2) as f64).sqrt() as usize + 2;
     let c = r;
@@ -42,8 +44,6 @@ fn make_heightfield(target_tris: usize) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
     (verts, tris)
 }
 
-/// N icospheres (level-4, 5120 tris each) at random positions/radii.
-/// Simulates "many objects in a scene" — AABBs overlap between spheres.
 fn make_sphere_cluster(target_tris: usize) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
     const SUBDIVS: u32 = 4;
     const TRIS_PER_SPHERE: usize = 20 * (1 << (2 * SUBDIVS)); // 5120
@@ -64,7 +64,6 @@ fn make_sphere_cluster(target_tris: usize) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
     (verts, tris)
 }
 
-/// Random disconnected triangles in [-1,1]³ — maximum AABB overlap, worst-case BVH.
 fn make_random_soup(target_tris: usize) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
     let mut rng = SmallRng::seed_from_u64(0xc0ffee_dead_beef);
     let mut verts = Vec::with_capacity(target_tris * 3);
@@ -152,14 +151,20 @@ fn build_bvh(verts: &[[f32;3]], tris: &[[u32;3]]) -> Bvh {
     BvhBuilder::new(&scene).build().0
 }
 
+#[cfg(feature = "embree")]
+fn build_embree(verts: &[[f32;3]], tris: &[[u32;3]]) -> EScene {
+    let mut s = EScene::new();
+    s.attach_geometry(EGeometry::triangle_mesh(verts, tris));
+    s.commit();
+    s
+}
+
 // ── Ray generation ────────────────────────────────────────────────────────────
 
-const NUM_RAYS: usize = 1024; // must be divisible by 8 for intersect8 packets
+const NUM_RAYS: usize = 1024;
 const SEED: u64 = 0xdead_beef_cafe_babe;
 
 fn coherent_rays() -> Vec<Ray> {
-    // Orthographic rays: identical direction, origins on a uniform grid over [-1,1]².
-    // All rays share the same traversal path down to leaf level — maximum BVH coherence.
     let dir = UnitVector3::new_normalize(Vector3::new(0.0f32, 0.0, -1.0));
     let side = (NUM_RAYS as f32).sqrt() as usize;
     (0..NUM_RAYS).map(|i| {
@@ -201,176 +206,15 @@ fn shadow_rays() -> Vec<Ray> {
     }).collect()
 }
 
-// ── Embree FFI ────────────────────────────────────────────────────────────────
-
+// Convert rnpt::Ray to rnpt_bvh::Ray for Embree queries
 #[cfg(feature = "embree")]
-mod embree {
-    use std::ptr;
-
-    pub type RTCDevice   = *mut std::ffi::c_void;
-    pub type RTCScene    = *mut std::ffi::c_void;
-    pub type RTCGeometry = *mut std::ffi::c_void;
-
-    pub const RTC_GEOMETRY_TYPE_TRIANGLE: u32 = 0;
-    pub const RTC_BUFFER_TYPE_INDEX:      u32 = 0;
-    pub const RTC_BUFFER_TYPE_VERTEX:     u32 = 1;
-    pub const RTC_FORMAT_FLOAT3:          u32 = 0x9003;
-    pub const RTC_FORMAT_UINT3:           u32 = 0x5003;
-
-    #[repr(C, align(16))]
-    #[derive(Clone, Copy, Default)]
-    pub struct RTCRay {
-        pub org_x:f32, pub org_y:f32, pub org_z:f32, pub tnear:f32,
-        pub dir_x:f32, pub dir_y:f32, pub dir_z:f32, pub time:f32,
-        pub tfar:f32,  pub mask:u32,  pub id:u32,    pub flags:u32,
-    }
-
-    // RTC_GEOMETRY_INSTANCE_ARRAY is defined → instPrimID[1] present
-    // 9 × 4 = 36 bytes → padded to 48 by align(16)
-    #[repr(C, align(16))]
-    #[derive(Clone, Copy)]
-    pub struct RTCHit {
-        pub ng_x:f32, pub ng_y:f32, pub ng_z:f32,
-        pub u:f32, pub v:f32,
-        pub prim_id:u32, pub geom_id:u32,
-        pub inst_id:[u32;1], pub inst_prim_id:[u32;1],
-    }
-    impl Default for RTCHit {
-        fn default() -> Self {
-            Self { ng_x:0.,ng_y:0.,ng_z:0., u:0.,v:0.,
-                prim_id:u32::MAX, geom_id:u32::MAX,
-                inst_id:[u32::MAX], inst_prim_id:[u32::MAX] }
-        }
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub struct RTCRayHit { pub ray: RTCRay, pub hit: RTCHit }
-
-    // RTCRay8 / RTCHit8 — RTC_ALIGN(32), SoA layout (8 lanes)
-    #[repr(C, align(32))]
-    pub struct RTCRay8 {
-        pub org_x:[f32;8], pub org_y:[f32;8], pub org_z:[f32;8], pub tnear:[f32;8],
-        pub dir_x:[f32;8], pub dir_y:[f32;8], pub dir_z:[f32;8], pub time:[f32;8],
-        pub tfar:[f32;8], pub mask:[u32;8], pub id:[u32;8], pub flags:[u32;8],
-    }
-    // RTC_GEOMETRY_INSTANCE_ARRAY defined + RTC_MAX_INSTANCE_LEVEL_COUNT=1
-    // layout: ng[8]×3, u/v[8], prim/geomID[8], instID[1][8], instPrimID[1][8]
-    // = 224 bytes → already multiple of 32, no padding
-    #[repr(C, align(32))]
-    pub struct RTCHit8 {
-        pub ng_x:[f32;8], pub ng_y:[f32;8], pub ng_z:[f32;8],
-        pub u:[f32;8], pub v:[f32;8],
-        pub prim_id:[u32;8], pub geom_id:[u32;8],
-        pub inst_id:[[u32;8];1], pub inst_prim_id:[[u32;8];1],
-    }
-    #[repr(C)]
-    pub struct RTCRayHit8 { pub ray: RTCRay8, pub hit: RTCHit8 }
-
-    unsafe extern "C" {
-        pub fn rtcNewDevice(cfg: *const std::ffi::c_char) -> RTCDevice;
-        pub fn rtcReleaseDevice(d: RTCDevice);
-        pub fn rtcNewScene(d: RTCDevice) -> RTCScene;
-        pub fn rtcReleaseScene(s: RTCScene);
-        pub fn rtcNewGeometry(d: RTCDevice, ty: u32) -> RTCGeometry;
-        pub fn rtcReleaseGeometry(g: RTCGeometry);
-        pub fn rtcSetNewGeometryBuffer(g:RTCGeometry, ty:u32, slot:u32, fmt:u32,
-            stride:usize, count:usize) -> *mut std::ffi::c_void;
-        pub fn rtcCommitGeometry(g: RTCGeometry);
-        pub fn rtcAttachGeometry(s: RTCScene, g: RTCGeometry) -> u32;
-        pub fn rtcCommitScene(s: RTCScene);
-        pub fn rtcIntersect1(s:RTCScene, rh:*mut RTCRayHit, args:*const std::ffi::c_void);
-        pub fn rtcOccluded1(s:RTCScene, r:*mut RTCRay, args:*const std::ffi::c_void);
-        pub fn rtcIntersect8(valid:*const i32, s:RTCScene, rh:*mut RTCRayHit8, args:*const std::ffi::c_void);
-    }
-
-    pub struct Device(RTCDevice);
-    pub struct EmbreeScene(RTCScene);
-
-    impl Device {
-        pub fn new() -> Self {
-            let d = unsafe { rtcNewDevice(ptr::null()) };
-            assert!(!d.is_null());
-            Self(d)
-        }
-    }
-    impl Drop for Device { fn drop(&mut self) { unsafe { rtcReleaseDevice(self.0); } } }
-
-    impl EmbreeScene {
-        pub fn build(dev: &Device, verts: &[[f32;3]], tris: &[[u32;3]]) -> Self {
-            unsafe {
-                let s = rtcNewScene(dev.0);
-                let g = rtcNewGeometry(dev.0, RTC_GEOMETRY_TYPE_TRIANGLE);
-                let vb = rtcSetNewGeometryBuffer(g, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
-                    12, verts.len()) as *mut f32;
-                std::ptr::copy_nonoverlapping(verts.as_ptr() as *const f32, vb, verts.len()*3);
-                let ib = rtcSetNewGeometryBuffer(g, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3,
-                    12, tris.len()) as *mut u32;
-                std::ptr::copy_nonoverlapping(tris.as_ptr() as *const u32, ib, tris.len()*3);
-                rtcCommitGeometry(g); rtcAttachGeometry(s, g); rtcReleaseGeometry(g);
-                rtcCommitScene(s);
-                Self(s)
-            }
-        }
-        pub fn intersect1(&self, ray: &rnpt::Ray) -> bool {
-            let mut rh = RTCRayHit {
-                ray: RTCRay {
-                    org_x:ray.origin.x, org_y:ray.origin.y, org_z:ray.origin.z, tnear:ray.tmin,
-                    dir_x:ray.direction.x, dir_y:ray.direction.y, dir_z:ray.direction.z,
-                    time:0., tfar:ray.tmax, mask:u32::MAX, id:0, flags:0,
-                },
-                hit: RTCHit::default(),
-            };
-            unsafe { rtcIntersect1(self.0, &mut rh, ptr::null()); }
-            rh.hit.geom_id != u32::MAX
-        }
-        pub fn occluded1(&self, ray: &rnpt::Ray) -> bool {
-            let mut r = RTCRay {
-                org_x:ray.origin.x, org_y:ray.origin.y, org_z:ray.origin.z, tnear:ray.tmin,
-                dir_x:ray.direction.x, dir_y:ray.direction.y, dir_z:ray.direction.z,
-                time:0., tfar:ray.tmax, mask:u32::MAX, id:0, flags:0,
-            };
-            unsafe { rtcOccluded1(self.0, &mut r, ptr::null()); }
-            r.tfar < 0.0
-        }
-
-        // Packet intersection: NUM_RAYS must be divisible by 8.
-        // Rays are already ordered for coherence (same-direction grid), so each packet
-        // of 8 adjacent rays shares the same top-level BVH traversal path.
-        pub fn intersect8_batch(&self, rays: &[rnpt::Ray]) -> u32 {
-            const FULL: i32 = -1i32; // all bits set = valid lane
-            let valid = [FULL; 8];
-            let mut hits = 0u32;
-            for chunk in rays.chunks_exact(8) {
-                let mut rh = RTCRayHit8 {
-                    ray: RTCRay8 {
-                        org_x: std::array::from_fn(|i| chunk[i].origin.x),
-                        org_y: std::array::from_fn(|i| chunk[i].origin.y),
-                        org_z: std::array::from_fn(|i| chunk[i].origin.z),
-                        tnear: std::array::from_fn(|i| chunk[i].tmin),
-                        dir_x: std::array::from_fn(|i| chunk[i].direction.x),
-                        dir_y: std::array::from_fn(|i| chunk[i].direction.y),
-                        dir_z: std::array::from_fn(|i| chunk[i].direction.z),
-                        time:  [0.0; 8],
-                        tfar:  std::array::from_fn(|i| chunk[i].tmax),
-                        mask:  [u32::MAX; 8],
-                        id:    [0; 8],
-                        flags: [0; 8],
-                    },
-                    hit: RTCHit8 {
-                        ng_x:[0.;8], ng_y:[0.;8], ng_z:[0.;8],
-                        u:[0.;8], v:[0.;8],
-                        prim_id:[u32::MAX;8], geom_id:[u32::MAX;8],
-                        inst_id:[[u32::MAX;8];1], inst_prim_id:[[u32::MAX;8];1],
-                    },
-                };
-                unsafe { rtcIntersect8(valid.as_ptr(), self.0, &mut rh, ptr::null()); }
-                for i in 0..8 { if rh.hit.geom_id[i] != u32::MAX { hits += 1; } }
-            }
-            hits
-        }
-    }
-    impl Drop for EmbreeScene { fn drop(&mut self) { unsafe { rtcReleaseScene(self.0); } } }
+fn to_bvh_ray(r: &Ray) -> rnpt_bvh::Ray {
+    rnpt_bvh::Ray::new_with_minmax(
+        [r.origin.x, r.origin.y, r.origin.z],
+        [r.direction.x, r.direction.y, r.direction.z],
+        r.tmin,
+        r.tmax,
+    )
 }
 
 // ── Bench runner ──────────────────────────────────────────────────────────────
@@ -379,9 +223,10 @@ const SIZES: &[(&str, usize)] = &[
     ("10k",  10_000),
     ("100k", 100_000),
     ("1M",   1_000_000),
+    ("10M",  10_000_000),
 ];
 
-// Random soup BVH is degenerate (O(N) traversal) — beyond 10k it runs for hours.
+// Random soup BVH is degenerate — beyond 10k traversal blows up.
 const SOUP_SIZES: &[(&str, usize)] = &[("10k", 10_000)];
 
 fn bench_scene(
@@ -407,19 +252,15 @@ fn bench_scene(
                 b.iter(|| { for r in &coherent { black_box(bvh.intersect(r)); } })
             });
             #[cfg(feature = "embree")] {
-                let dev = embree::Device::new();
-                let sc  = embree::EmbreeScene::build(&dev, &verts, &tris);
+                let sc = build_embree(&verts, &tris);
                 g.bench_function(BenchmarkId::new("embree1", size_label), |b| {
-                    b.iter(|| { for r in &coherent { black_box(sc.intersect1(r)); } })
-                });
-                g.bench_function(BenchmarkId::new("embree8", size_label), |b| {
-                    b.iter(|| black_box(sc.intersect8_batch(&coherent)))
+                    b.iter(|| { for r in &coherent { black_box(sc.closest_hit(&to_bvh_ray(r))); } })
                 });
             }
             g.finish();
         }
 
-        // incoherent — scalar only (packet API brings no benefit for random rays)
+        // incoherent
         {
             let mut g = c.benchmark_group(format!("incoherent/{tag}"));
             g.throughput(Throughput::Elements(n));
@@ -428,16 +269,15 @@ fn bench_scene(
                 b.iter(|| { for r in &incoherent { black_box(bvh.intersect(r)); } })
             });
             #[cfg(feature = "embree")] {
-                let dev = embree::Device::new();
-                let sc  = embree::EmbreeScene::build(&dev, &verts, &tris);
+                let sc = build_embree(&verts, &tris);
                 g.bench_function(BenchmarkId::new("embree", size_label), |b| {
-                    b.iter(|| { for r in &incoherent { black_box(sc.intersect1(r)); } })
+                    b.iter(|| { for r in &incoherent { black_box(sc.closest_hit(&to_bvh_ray(r))); } })
                 });
             }
             g.finish();
         }
 
-        // shadow — any-hit, scalar
+        // shadow
         {
             let mut g = c.benchmark_group(format!("shadow/{tag}"));
             g.throughput(Throughput::Elements(n));
@@ -446,10 +286,9 @@ fn bench_scene(
                 b.iter(|| { for r in &shadow { black_box(bvh.is_occluded(r)); } })
             });
             #[cfg(feature = "embree")] {
-                let dev = embree::Device::new();
-                let sc  = embree::EmbreeScene::build(&dev, &verts, &tris);
+                let sc = build_embree(&verts, &tris);
                 g.bench_function(BenchmarkId::new("embree", size_label), |b| {
-                    b.iter(|| { for r in &shadow { black_box(sc.occluded1(r)); } })
+                    b.iter(|| { for r in &shadow { black_box(sc.any_hit(&to_bvh_ray(r))); } })
                 });
             }
             g.finish();

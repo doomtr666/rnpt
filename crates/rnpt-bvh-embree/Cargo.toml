@@ -1,0 +1,13 @@
+[package]
+name    = "rnpt-bvh-embree"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+embree = []
+
+[dependencies]
+rnpt-bvh = { path = "../rnpt-bvh" }
+
+[dev-dependencies]
+rnpt-bvh = { path = "../rnpt-bvh" }

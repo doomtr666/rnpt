@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rnpt", "crates/rnpt-gui", "crates/rnpt-bench"]
+members = ["crates/rnpt", "crates/rnpt-gui", "crates/rnpt-bench", "crates/bench-report", "crates/rnpt-bvh", "crates/rnpt-bvh-embree"]
 
 [profile.release]
 debug = true
