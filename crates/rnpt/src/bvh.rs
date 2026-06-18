@@ -5,6 +5,26 @@ use nalgebra::{Point3, UnitVector3, Vector2};
 
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 
+// Octant order LUT: CHILD_ORDER[ray_oct] is the near-to-far slot order.
+//
+// ray_oct encoding:  bit0 = (dx<0), bit1 = (dy<0), bit2 = (dz<0)
+// child slot encoding (set by the builder): bit0 = (centroid.x >= node_cx), etc.
+//
+// Derivation: near child ↔ popcount(slot XOR ray_oct) = 0 → slot == ray_oct.
+// Full order: sort slots by popcount(slot XOR ray_oct) ascending (ties → lower slot first).
+// At traversal time iterate in reverse so the nearest child is pushed LAST and
+// therefore POPPED FIRST from the stack.
+const CHILD_ORDER: [[u8; 8]; 8] = [
+    [0, 1, 2, 4, 3, 5, 6, 7], // ray_oct 0: (+x,+y,+z)
+    [1, 0, 3, 5, 2, 4, 7, 6], // ray_oct 1: (-x,+y,+z)
+    [2, 0, 3, 6, 1, 4, 7, 5], // ray_oct 2: (+x,-y,+z)
+    [3, 1, 2, 7, 0, 5, 6, 4], // ray_oct 3: (-x,-y,+z)
+    [4, 0, 5, 6, 1, 2, 7, 3], // ray_oct 4: (+x,+y,-z)
+    [5, 1, 4, 7, 0, 3, 6, 2], // ray_oct 5: (-x,+y,-z)
+    [6, 2, 4, 7, 0, 3, 5, 1], // ray_oct 6: (+x,-y,-z)
+    [7, 3, 5, 6, 1, 2, 4, 0], // ray_oct 7: (-x,-y,-z)
+];
+
 #[derive(Clone, Copy)]
 pub struct FlatTriangle {
     pub v0: u32,
@@ -190,8 +210,13 @@ impl Bvh {
             return None;
         }
 
+        // Compute ray octant once; reused at every internal node visit.
+        let oct = (ray.direction.x < 0.0) as usize
+                | ((ray.direction.y < 0.0) as usize) << 1
+                | ((ray.direction.z < 0.0) as usize) << 2;
+
         let mut stack = BvhStack::new();
-        stack.push(0, 0.0); // push root
+        stack.push(0, 0.0);
 
         while !stack.is_empty() {
             let (encoded_idx, node_t) = stack.pop();
@@ -201,7 +226,6 @@ impl Bvh {
             }
 
             if Bvh8Node::is_leaf(encoded_idx) {
-                // Leaf node
                 let start_chunk = Bvh8Node::leaf_start(encoded_idx);
                 let chunk_count = Bvh8Node::leaf_count(encoded_idx);
 
@@ -226,39 +250,22 @@ impl Bvh {
                     }
                 }
             } else {
-                // Internal Bvh8Node
                 let node = self.get_node(encoded_idx);
-                let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
+                let (bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
 
-                let mut hits = [(0u32, 0.0f32); 8];
-                let mut hit_count = 0;
-
-                while bitmask != 0 {
-                    let lane = bitmask.trailing_zeros() as usize;
-                    bitmask &= bitmask - 1;
-
-                    // Encoded once at build time. Guard against empty lanes
-                    // (u32::MAX) in case a NaN slips through min/max in the mask.
-                    let encoded = node.children[lane];
-                    let t = t_arr[lane];
-                    if encoded != u32::MAX && t < t_max {
-                        hits[hit_count] = (encoded, t);
-                        hit_count += 1;
-                    }
-                }
-
-                if hit_count > 0 {
-                    // Insertion sort (descending) so the furthest is pushed first
-                    for i in 1..hit_count {
-                        let mut j = i;
-                        while j > 0 && hits[j - 1].1 < hits[j].1 {
-                            hits.swap(j - 1, j);
-                            j -= 1;
+                // Push in far-to-near order (LUT reversed) so the nearest child
+                // ends up on top of the stack and is visited first.
+                // The builder places child i in the octant slot that matches its
+                // centroid, so CHILD_ORDER[oct] is a good approximation of t-order.
+                // t values are still stored for pop-time pruning (node_t >= t_max).
+                for &slot in CHILD_ORDER[oct].iter().rev() {
+                    let slot = slot as usize;
+                    if bitmask & (1u32 << slot) != 0 {
+                        let encoded = node.children[slot];
+                        let t = t_arr[slot];
+                        if encoded != u32::MAX && t < t_max {
+                            stack.push(encoded, t);
                         }
-                    }
-
-                    for i in 0..hit_count {
-                        stack.push(hits[i].0, hits[i].1);
                     }
                 }
             }
@@ -268,9 +275,9 @@ impl Bvh {
     }
 
     /// Any-hit traversal for shadow rays: returns true as soon as any triangle
-    /// is hit within the ray's range. Cheaper than `intersect`: no closest
-    /// tracking, no `t_max` tightening, no child sorting, and it bails out at
-    /// the first hit. `t_max` is fixed to the ray's end (e.g. light distance).
+    /// is hit within the ray's range. No `t_max` tightening (shadow t_max is
+    /// fixed). Children are sorted near-to-far by t so the earliest occluder
+    /// is likely found on the first leaf, maximising the early-out rate.
     pub fn is_occluded(&self, ray: &Ray) -> bool {
         if self.nodes.is_empty() {
             return false;
@@ -284,26 +291,22 @@ impl Bvh {
             let (encoded_idx, _) = stack.pop();
 
             if Bvh8Node::is_leaf(encoded_idx) {
-                // Leaf node
                 let start_chunk = Bvh8Node::leaf_start(encoded_idx);
                 let chunk_count = Bvh8Node::leaf_count(encoded_idx);
 
                 for i in 0..chunk_count {
                     let chunk_idx = start_chunk + i;
                     if ray.any_triangle_simd8(self.get_chunk(chunk_idx), t_max) {
-                        return true; // early-out: occluder found
+                        return true;
                     }
                 }
             } else {
-                // Internal node: push hit children unsorted (order is irrelevant
-                // for any-hit, and t_max never tightens).
                 let node = self.get_node(encoded_idx);
                 let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
 
                 while bitmask != 0 {
                     let lane = bitmask.trailing_zeros() as usize;
                     bitmask &= bitmask - 1;
-
                     let encoded = node.children[lane];
                     if encoded != u32::MAX && t_arr[lane] < t_max {
                         stack.push(encoded, 0.0);

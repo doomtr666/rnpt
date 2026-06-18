@@ -526,14 +526,16 @@ impl BvhBuilder {
         let bvh8_idx = bvh8.len() as u32;
         bvh8.push(Bvh8Node::default());
 
-        let mut children = vec![node_idx];
+        // Expand the best (largest-area) non-leaf child until we have up to 8 children.
+        let mut children = [0usize; 8];
+        let mut n_children = 1usize;
+        children[0] = node_idx;
 
-        while children.len() < 8 {
+        while n_children < 8 {
             let mut best_idx = None;
-            let mut best_area = -1.0;
-
-            for (i, &c_idx) in children.iter().enumerate() {
-                let node = &bvh2[c_idx];
+            let mut best_area = -1.0f32;
+            for i in 0..n_children {
+                let node = &bvh2[children[i]];
                 if !node.is_leaf() {
                     let area = node.aabb.surface_area();
                     if area > best_area {
@@ -542,37 +544,80 @@ impl BvhBuilder {
                     }
                 }
             }
-
             if let Some(i) = best_idx {
-                let node = &bvh2[children[i]];
-                let left = node.left_first as usize;
-                let right = left + 1;
-                children.swap_remove(i);
-                children.push(left);
-                children.push(right);
+                let left = bvh2[children[i]].left_first as usize;
+                children[i] = children[n_children - 1]; // swap_remove
+                n_children -= 1;
+                children[n_children] = left;
+                n_children += 1;
+                children[n_children] = left + 1;
+                n_children += 1;
             } else {
                 break;
             }
         }
 
-        let mut node8 = Bvh8Node::default();
+        // Compute node center for octant slot assignment (all stack, no heap).
+        let mut min_x = f32::MAX; let mut max_x = f32::NEG_INFINITY;
+        let mut min_y = f32::MAX; let mut max_y = f32::NEG_INFINITY;
+        let mut min_z = f32::MAX; let mut max_z = f32::NEG_INFINITY;
+        for i in 0..n_children {
+            let a = &bvh2[children[i]].aabb;
+            if a.min.x < min_x { min_x = a.min.x } if a.max.x > max_x { max_x = a.max.x }
+            if a.min.y < min_y { min_y = a.min.y } if a.max.y > max_y { max_y = a.max.y }
+            if a.min.z < min_z { min_z = a.min.z } if a.max.z > max_z { max_z = a.max.z }
+        }
+        let cx = (min_x + max_x) * 0.5;
+        let cy = (min_y + max_y) * 0.5;
+        let cz = (min_z + max_z) * 0.5;
 
-        for (i, &c_idx) in children.iter().enumerate() {
-            let bvh2_node = &bvh2[c_idx];
-            node8.p_min_x[i] = bvh2_node.aabb.min.x;
-            node8.p_min_y[i] = bvh2_node.aabb.min.y;
-            node8.p_min_z[i] = bvh2_node.aabb.min.z;
-            node8.p_max_x[i] = bvh2_node.aabb.max.x;
-            node8.p_max_y[i] = bvh2_node.aabb.max.y;
-            node8.p_max_z[i] = bvh2_node.aabb.max.z;
+        // Assign each child to its octant slot; collisions fall back to first free slot.
+        let mut slot_to_child = [usize::MAX; 8];
+        let mut slot_used = [false; 8];
+        let mut pending = [0usize; 8];
+        let mut n_pending = 0usize;
 
-            if bvh2_node.is_leaf() {
-                // count is always > 0 for a leaf, so the leaf flag is always set.
-                node8.children[i] =
-                    Bvh8Node::encode_leaf(bvh2_node.left_first, bvh2_node.chunk_count);
+        for i in 0..n_children {
+            let c_idx = children[i];
+            let a = &bvh2[c_idx].aabb;
+            let pcx = (a.min.x + a.max.x) * 0.5;
+            let pcy = (a.min.y + a.max.y) * 0.5;
+            let pcz = (a.min.z + a.max.z) * 0.5;
+            let oct = ((pcx >= cx) as usize)
+                    | (((pcy >= cy) as usize) << 1)
+                    | (((pcz >= cz) as usize) << 2);
+            if !slot_used[oct] {
+                slot_used[oct] = true;
+                slot_to_child[oct] = c_idx;
             } else {
-                node8.children[i] = Self::collapse_to_bvh8(c_idx, bvh2, bvh8);
+                pending[n_pending] = c_idx;
+                n_pending += 1;
             }
+        }
+        for i in 0..n_pending {
+            let mut slot = 0;
+            while slot_used[slot] { slot += 1; }
+            slot_used[slot] = true;
+            slot_to_child[slot] = pending[i];
+        }
+
+        // Fill BVH8 node; recursive calls may grow bvh8, bvh8_idx stays valid.
+        let mut node8 = Bvh8Node::default();
+        for slot in 0..8 {
+            let c_idx = slot_to_child[slot];
+            if c_idx == usize::MAX { continue; }
+            let bvh2_node = &bvh2[c_idx];
+            node8.p_min_x[slot] = bvh2_node.aabb.min.x;
+            node8.p_min_y[slot] = bvh2_node.aabb.min.y;
+            node8.p_min_z[slot] = bvh2_node.aabb.min.z;
+            node8.p_max_x[slot] = bvh2_node.aabb.max.x;
+            node8.p_max_y[slot] = bvh2_node.aabb.max.y;
+            node8.p_max_z[slot] = bvh2_node.aabb.max.z;
+            node8.children[slot] = if bvh2_node.is_leaf() {
+                Bvh8Node::encode_leaf(bvh2_node.left_first, bvh2_node.chunk_count)
+            } else {
+                Self::collapse_to_bvh8(c_idx, bvh2, bvh8)
+            };
         }
 
         bvh8[bvh8_idx as usize] = node8;
