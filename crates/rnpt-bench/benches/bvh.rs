@@ -9,7 +9,7 @@ use rand::rngs::SmallRng;
 use rnpt::{Bvh, BvhBuilder, Material, Mesh, Node, Ray, Scene, Transform3, Triangle};
 
 #[cfg(feature = "embree")]
-use rnpt_bvh_embree::{Geometry as EGeometry, RayAccelerator, Scene as EScene};
+use rnpt_bvh_embree::{Geometry as EGeometry, Ray as BvhRay, RayAccelerator, Scene as EScene};
 
 // ── Scene generators ──────────────────────────────────────────────────────────
 
@@ -60,24 +60,6 @@ fn make_sphere_cluster(target_tris: usize) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
         let base = verts.len() as u32;
         for v in &unit_v { verts.push([cx + v[0]*r, cy + v[1]*r, cz + v[2]*r]); }
         for t in &unit_t { tris.push([base + t[0], base + t[1], base + t[2]]); }
-    }
-    (verts, tris)
-}
-
-fn make_random_soup(target_tris: usize) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
-    let mut rng = SmallRng::seed_from_u64(0xc0ffee_dead_beef);
-    let mut verts = Vec::with_capacity(target_tris * 3);
-    let mut tris  = Vec::with_capacity(target_tris);
-    for i in 0..target_tris {
-        for _ in 0..3 {
-            verts.push([
-                rng.gen_range(-1.0f32..1.0),
-                rng.gen_range(-1.0f32..1.0),
-                rng.gen_range(-1.0f32..1.0),
-            ]);
-        }
-        let b = (i * 3) as u32;
-        tris.push([b, b + 1, b + 2]);
     }
     (verts, tris)
 }
@@ -206,10 +188,9 @@ fn shadow_rays() -> Vec<Ray> {
     }).collect()
 }
 
-// Convert rnpt::Ray to rnpt_bvh::Ray for Embree queries
 #[cfg(feature = "embree")]
-fn to_bvh_ray(r: &Ray) -> rnpt_bvh::Ray {
-    rnpt_bvh::Ray::new_with_minmax(
+fn to_bvh_ray(r: &Ray) -> BvhRay {
+    BvhRay::new_with_minmax(
         [r.origin.x, r.origin.y, r.origin.z],
         [r.direction.x, r.direction.y, r.direction.z],
         r.tmin,
@@ -220,85 +201,89 @@ fn to_bvh_ray(r: &Ray) -> rnpt_bvh::Ray {
 // ── Bench runner ──────────────────────────────────────────────────────────────
 
 const SIZES: &[(&str, usize)] = &[
-    ("10k",  10_000),
     ("100k", 100_000),
     ("1M",   1_000_000),
     ("10M",  10_000_000),
 ];
 
-// Random soup BVH is degenerate — beyond 10k traversal blows up.
-const SOUP_SIZES: &[(&str, usize)] = &[("10k", 10_000)];
-
 fn bench_scene(
     c:     &mut Criterion,
     tag:   &str,
-    sizes: &[(&str, usize)],
+    sizes: &[(&'static str, usize)],
     make:  fn(usize) -> (Vec<[f32;3]>, Vec<[u32;3]>),
 ) {
     let coherent   = coherent_rays();
     let incoherent = incoherent_rays();
     let shadow     = shadow_rays();
+    let n = NUM_RAYS as u64;
 
-    for &(size_label, target) in sizes {
+    // Build all scene sizes upfront. Each size is built once and shared
+    // across all three ray-type groups — Criterion groups must not be
+    // recreated with the same name or previous size results are orphaned.
+    struct Built {
+        label: &'static str,
+        bvh:   Bvh,
+        #[cfg(feature = "embree")]
+        sc:    EScene,
+    }
+    let scenes: Vec<Built> = sizes.iter().map(|&(label, target)| {
         let (verts, tris) = make(target);
-        let n = NUM_RAYS as u64;
-
-        // coherent — rnpt scalar + embree scalar + embree8 packet
-        {
-            let mut g = c.benchmark_group(format!("coherent/{tag}"));
-            g.throughput(Throughput::Elements(n));
-            let bvh = build_bvh(&verts, &tris);
-            g.bench_function(BenchmarkId::new("rnpt", size_label), |b| {
-                b.iter(|| { for r in &coherent { black_box(bvh.intersect(r)); } })
-            });
-            #[cfg(feature = "embree")] {
-                let sc = build_embree(&verts, &tris);
-                g.bench_function(BenchmarkId::new("embree1", size_label), |b| {
-                    b.iter(|| { for r in &coherent { black_box(sc.closest_hit(&to_bvh_ray(r))); } })
-                });
-            }
-            g.finish();
+        Built {
+            label,
+            bvh: build_bvh(&verts, &tris),
+            #[cfg(feature = "embree")]
+            sc:  build_embree(&verts, &tris),
         }
+    }).collect();
 
-        // incoherent
-        {
-            let mut g = c.benchmark_group(format!("incoherent/{tag}"));
-            g.throughput(Throughput::Elements(n));
-            let bvh = build_bvh(&verts, &tris);
-            g.bench_function(BenchmarkId::new("rnpt", size_label), |b| {
-                b.iter(|| { for r in &incoherent { black_box(bvh.intersect(r)); } })
+    {
+        let mut g = c.benchmark_group(format!("coherent_{tag}"));
+        g.throughput(Throughput::Elements(n));
+        for s in &scenes {
+            g.bench_function(BenchmarkId::new("rnpt", s.label), |b| {
+                b.iter(|| { for r in &coherent { black_box(s.bvh.intersect(r)); } })
             });
-            #[cfg(feature = "embree")] {
-                let sc = build_embree(&verts, &tris);
-                g.bench_function(BenchmarkId::new("embree", size_label), |b| {
-                    b.iter(|| { for r in &incoherent { black_box(sc.closest_hit(&to_bvh_ray(r))); } })
-                });
-            }
-            g.finish();
+            #[cfg(feature = "embree")]
+            g.bench_function(BenchmarkId::new("embree1", s.label), |b| {
+                b.iter(|| { for r in &coherent { black_box(s.sc.closest_hit(&to_bvh_ray(r))); } })
+            });
         }
+        g.finish();
+    }
 
-        // shadow
-        {
-            let mut g = c.benchmark_group(format!("shadow/{tag}"));
-            g.throughput(Throughput::Elements(n));
-            let bvh = build_bvh(&verts, &tris);
-            g.bench_function(BenchmarkId::new("rnpt", size_label), |b| {
-                b.iter(|| { for r in &shadow { black_box(bvh.is_occluded(r)); } })
+    {
+        let mut g = c.benchmark_group(format!("incoherent_{tag}"));
+        g.throughput(Throughput::Elements(n));
+        for s in &scenes {
+            g.bench_function(BenchmarkId::new("rnpt", s.label), |b| {
+                b.iter(|| { for r in &incoherent { black_box(s.bvh.intersect(r)); } })
             });
-            #[cfg(feature = "embree")] {
-                let sc = build_embree(&verts, &tris);
-                g.bench_function(BenchmarkId::new("embree", size_label), |b| {
-                    b.iter(|| { for r in &shadow { black_box(sc.any_hit(&to_bvh_ray(r))); } })
-                });
-            }
-            g.finish();
+            #[cfg(feature = "embree")]
+            g.bench_function(BenchmarkId::new("embree", s.label), |b| {
+                b.iter(|| { for r in &incoherent { black_box(s.sc.closest_hit(&to_bvh_ray(r))); } })
+            });
         }
+        g.finish();
+    }
+
+    {
+        let mut g = c.benchmark_group(format!("shadow_{tag}"));
+        g.throughput(Throughput::Elements(n));
+        for s in &scenes {
+            g.bench_function(BenchmarkId::new("rnpt", s.label), |b| {
+                b.iter(|| { for r in &shadow { black_box(s.bvh.is_occluded(r)); } })
+            });
+            #[cfg(feature = "embree")]
+            g.bench_function(BenchmarkId::new("embree", s.label), |b| {
+                b.iter(|| { for r in &shadow { black_box(s.sc.any_hit(&to_bvh_ray(r))); } })
+            });
+        }
+        g.finish();
     }
 }
 
-fn bench_hf     (c: &mut Criterion) { bench_scene(c, "hf",      SIZES,      make_heightfield);    }
-fn bench_cluster(c: &mut Criterion) { bench_scene(c, "cluster", SIZES,      make_sphere_cluster); }
-fn bench_soup   (c: &mut Criterion) { bench_scene(c, "soup",    SOUP_SIZES, make_random_soup);    }
+fn bench_hf     (c: &mut Criterion) { bench_scene(c, "hf",      SIZES, make_heightfield);    }
+fn bench_cluster(c: &mut Criterion) { bench_scene(c, "cluster", SIZES, make_sphere_cluster); }
 
-criterion_group!(benches, bench_hf, bench_cluster, bench_soup);
+criterion_group!(benches, bench_hf, bench_cluster);
 criterion_main!(benches);

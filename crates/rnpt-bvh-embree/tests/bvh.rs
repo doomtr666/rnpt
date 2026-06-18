@@ -31,11 +31,13 @@ fn cross(a: [f32;3], b: [f32;3]) -> [f32;3] {
 fn dot(a: [f32;3], b: [f32;3]) -> f32 { a[0]*b[0]+a[1]*b[1]+a[2]*b[2] }
 fn sub(a: [f32;3], b: [f32;3]) -> [f32;3] { [a[0]-b[0],a[1]-b[1],a[2]-b[2]] }
 
+/// Two-sided MT — Embree hits both faces by default, so the brute-force
+/// reference must also be two-sided for a fair comparison.
 fn mt_hit(v0:[f32;3], v1:[f32;3], v2:[f32;3], r:&Ray) -> Option<f32> {
     const EPS:f32 = 1e-7;
     let e1 = sub(v1,v0); let e2 = sub(v2,v0);
     let h = cross(r.dir,e2); let det = dot(e1,h);
-    if det < EPS { return None; }
+    if det.abs() < EPS { return None; } // parallel — not a back-face cull
     let inv = 1.0/det; let s = sub(r.org,v0);
     let u = inv*dot(s,h); if u<0.0||u>1.0 { return None; }
     let q = cross(s,e1); let v = inv*dot(r.dir,q);
@@ -95,10 +97,11 @@ fn miss_behind() {
 
 #[test]
 fn backface_cull() {
-    // Embree culls back faces when using RTC_GEOMETRY_FLAG_NONE (default)
-    // and the ray hits the back face → no hit.
+    // Embree is two-sided by default — it hits both faces.
+    // Contrast: rnpt-bvh culls back faces (det < EPS check).
     let r = ray([0.25,0.25,-1.0],[0.0,0.0,1.0]);
-    assert!(one_tri().closest_hit(&r).is_none(), "back face must be culled");
+    let hit = one_tri().closest_hit(&r).expect("Embree is two-sided: back face must be hit");
+    assert!(approx(hit.t, 1.0), "t={}", hit.t);
 }
 
 // ── E ─────────────────────────────────────────────────────────────────────────
@@ -253,7 +256,7 @@ fn large_scene_vs_brute_force() {
 
 #[test]
 fn empty_scene() {
-    let scene = build_scene(&[],[]);
+    let scene = build_scene(&[], &[]);
     let r = ray([0.25,0.25,1.0],[0.0,0.0,-1.0]);
     assert!(scene.closest_hit(&r).is_none(), "empty scene must return None");
     assert!(!scene.any_hit(&r), "empty scene must not occlude");

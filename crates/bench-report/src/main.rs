@@ -91,8 +91,9 @@ fn ratio_color(rnpt: Option<f64>, reference: Option<f64>) -> &'static str {
 // ── Table ─────────────────────────────────────────────────────────────────────
 
 const RAY_ORDER:   &[&str] = &["coherent", "incoherent", "shadow"];
-const SCENE_ORDER: &[&str] = &["hf", "cluster", "soup"];
-const SIZE_ORDER:  &[&str] = &["10k", "100k", "1m"];
+const SCENE_ORDER: &[&str] = &["hf", "cluster"];
+// (lookup key as written by Criterion on disk, display label)
+const SIZE_ORDER:  &[(&str, &str)] = &[("100k", "100k"), ("1m", "1M"), ("10m", "10M")];
 const SEP: &str  = "────────────────────────────────────────────────────────────────────";
 const SEP2: &str = "════════════════════════════════════════════════════════════════════";
 
@@ -102,8 +103,8 @@ fn get(data: &Data, group: &str, impl_: &str, size: &str) -> Option<f64> {
 
 fn print_table(data: &Data) {
     let header = format!(
-        "{bold}{:<20}  {:>5}  {:>8}  {:>8}  {:>8}  {:>7}  {:>7}{reset}",
-        "ray/scene", "size", "embree1", "embree8", "rnpt", "vs e1", "vs e8",
+        "{bold}{:<20}  {:>5}  {:>8}  {:>8}  {:>7}{reset}",
+        "ray/scene", "size", "embree1", "rnpt", "vs e1",
         bold = ansi(BOLD), reset = ansi(RESET),
     );
     println!("{header}");
@@ -111,7 +112,6 @@ fn print_table(data: &Data) {
     let mut prev_ray = "";
 
     for &ray in RAY_ORDER {
-        // separator between ray types
         if !prev_ray.is_empty() {
             println!("{}", ansi(DIM).to_owned() + SEP2 + ansi(RESET));
         }
@@ -120,37 +120,34 @@ fn print_table(data: &Data) {
         for &scene in SCENE_ORDER {
             let group = format!("{}_{}", ray, scene);
 
-            // Skip groups with no data at all
-            let has_any = SIZE_ORDER.iter().any(|s| {
-                get(data, &group, "rnpt", s).is_some()
-                    || get(data, &group, "embree", s).is_some()
-                    || get(data, &group, "embree1", s).is_some()
+            let has_any = SIZE_ORDER.iter().any(|(key, _)| {
+                get(data, &group, "rnpt", key).is_some()
+                    || get(data, &group, "embree", key).is_some()
+                    || get(data, &group, "embree1", key).is_some()
             });
             if !has_any { continue; }
 
             println!("{}", ansi(DIM).to_owned() + SEP + ansi(RESET));
 
-            for (i, &size) in SIZE_ORDER.iter().enumerate() {
-                // coherent uses "embree1", others use "embree"
+            for (i, &(key, disp)) in SIZE_ORDER.iter().enumerate() {
                 let e1 = if ray == "coherent" {
-                    get(data, &group, "embree1", size)
+                    get(data, &group, "embree1", key)
                 } else {
-                    get(data, &group, "embree", size)
+                    get(data, &group, "embree", key)
                 };
-                let e8   = get(data, &group, "embree8", size);
-                let rnpt = get(data, &group, "rnpt", size);
+                let rnpt = get(data, &group, "rnpt", key);
 
-                if e1.is_none() && e8.is_none() && rnpt.is_none() { continue; }
+                if e1.is_none() && rnpt.is_none() { continue; }
 
                 let label = if i == 0 { format!("{}/{}", ray, scene) } else { String::new() };
                 let color = ratio_color(rnpt, e1);
                 let reset = if color.is_empty() { "" } else { ansi(RESET) };
 
                 println!(
-                    "{color}{:<20}  {:>5}  {}  {}  {}  {}  {}{reset}",
-                    label, size,
-                    fmt_mrays(e1), fmt_mrays(e8), fmt_mrays(rnpt),
-                    fmt_ratio(rnpt, e1), fmt_ratio(rnpt, e8),
+                    "{color}{:<20}  {:>5}  {}  {}  {}{reset}",
+                    label, disp,
+                    fmt_mrays(e1), fmt_mrays(rnpt),
+                    fmt_ratio(rnpt, e1),
                     color = color, reset = reset,
                 );
             }
@@ -158,7 +155,7 @@ fn print_table(data: &Data) {
     }
     println!("{}", ansi(DIM).to_owned() + SEP + ansi(RESET));
     println!();
-    println!("  {}Mray/s — higher is better.  vs e1/e8 = rnpt ÷ embree (100% = parity).{}", ansi(DIM), ansi(RESET));
+    println!("  {}Mray/s — higher is better.  vs e1 = rnpt ÷ embree (100% = parity).{}", ansi(DIM), ansi(RESET));
     println!("  {}green ≥ 85%   yellow ≥ 65%   red < 65%{}", ansi(DIM), ansi(RESET));
 }
 
