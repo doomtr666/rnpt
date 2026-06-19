@@ -1,5 +1,6 @@
-use nalgebra::{Matrix4, Point3, Transform3, UnitVector3, Vector2, Vector3};
+use nalgebra::{Matrix4, Point3, Transform3, UnitVector3, Vector2, Vector3, Vector4};
 use rnpt::{Camera, Color, Light, Material, Mesh, Node, Scene, Triangle};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -76,36 +77,56 @@ fn gltf_matrix_to_nalgebra(matrix: [[f32; 4]; 4]) -> Matrix4<f32> {
 pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error::Error>> {
     let (document, buffers, images) = gltf::import(path)?;
 
-    // Load Textures — convert sRGB u8 → linear f32 once here so sample_bilinear
-    // is pure interpolation with no per-sample color-space work.
-    // Linear maps (normal, roughness, …) will be loaded without this conversion
-    // when they are added; the sampler is identical for both.
+    // Scan materials first to determine which image indices are linear data
+    // (normal maps, metallic/roughness, occlusion) vs sRGB color data (albedo,
+    // emissive). This drives the per-image decode below.
+    let mut linear_images: HashSet<usize> = HashSet::new();
+    for mat in document.materials() {
+        let pbr = mat.pbr_metallic_roughness();
+        if let Some(info) = pbr.metallic_roughness_texture() {
+            linear_images.insert(info.texture().source().index());
+        }
+        if let Some(info) = mat.normal_texture() {
+            linear_images.insert(info.texture().source().index());
+        }
+        if let Some(info) = mat.occlusion_texture() {
+            linear_images.insert(info.texture().source().index());
+        }
+    }
+
+    // Load textures — sRGB → linear for color maps, raw /255 for linear maps.
+    // sample_bilinear is pure interpolation with no per-sample color-space work.
     let mut textures = Vec::new();
-    for img in images {
+    for (idx, img) in images.iter().enumerate() {
         let n = (img.width * img.height) as usize;
         let bytes = &img.pixels;
+        let is_linear = linear_images.contains(&idx);
+        let decode = |b: u8| -> f32 {
+            if is_linear { b as f32 / 255.0 } else { srgb_u8_to_linear(b) }
+        };
+
         let pixels: Vec<rnpt::Color> = match img.format {
             gltf::image::Format::R8G8B8 => (0..n)
                 .map(|i| rnpt::Color::new(
-                    srgb_u8_to_linear(bytes[i * 3]),
-                    srgb_u8_to_linear(bytes[i * 3 + 1]),
-                    srgb_u8_to_linear(bytes[i * 3 + 2]),
+                    decode(bytes[i * 3]),
+                    decode(bytes[i * 3 + 1]),
+                    decode(bytes[i * 3 + 2]),
                 ))
                 .collect(),
             gltf::image::Format::R8G8B8A8 => (0..n)
                 .map(|i| rnpt::Color::new(
-                    srgb_u8_to_linear(bytes[i * 4]),
-                    srgb_u8_to_linear(bytes[i * 4 + 1]),
-                    srgb_u8_to_linear(bytes[i * 4 + 2]),
+                    decode(bytes[i * 4]),
+                    decode(bytes[i * 4 + 1]),
+                    decode(bytes[i * 4 + 2]),
                 ))
                 .collect(),
             gltf::image::Format::R8 => (0..n)
-                .map(|i| { let l = srgb_u8_to_linear(bytes[i]); rnpt::Color::new(l, l, l) })
+                .map(|i| { let l = decode(bytes[i]); rnpt::Color::new(l, l, l) })
                 .collect(),
             gltf::image::Format::R8G8 => (0..n)
                 .map(|i| rnpt::Color::new(
-                    srgb_u8_to_linear(bytes[i * 2]),
-                    srgb_u8_to_linear(bytes[i * 2 + 1]),
+                    decode(bytes[i * 2]),
+                    decode(bytes[i * 2 + 1]),
                     0.0,
                 ))
                 .collect(),
@@ -123,25 +144,33 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
 
     // Load Materials
     let mut materials = Vec::new();
-    for (_idx, mat) in document.materials().enumerate() {
+    for mat in document.materials() {
         let pbr = mat.pbr_metallic_roughness();
-        let base_color = pbr.base_color_factor(); // [f32; 4]
-        let emissive_color = mat.emissive_factor(); // [f32; 3]
-        // Extract strength from KHR_materials_emissive_strength if available
+        let base_color = pbr.base_color_factor();
+        let emissive_color = mat.emissive_factor();
         let emissive_strength = mat.emissive_strength().unwrap_or(1.0);
-
         let mut emissive = Color::from(emissive_color);
         emissive *= emissive_strength;
+
+        // gltf crate returns Some(cutoff) for Mask mode, None for Opaque/Blend.
+        let alpha_cutoff = mat.alpha_cutoff();
 
         materials.push(Material {
             albedo: Color::from([base_color[0], base_color[1], base_color[2]]),
             emissive,
-            albedo_texture: pbr
-                .base_color_texture()
+            albedo_texture: pbr.base_color_texture()
                 .map(|info| info.texture().source().index() as u32),
-            emissive_texture: mat
-                .emissive_texture()
+            emissive_texture: mat.emissive_texture()
                 .map(|info| info.texture().source().index() as u32),
+            metallic: pbr.metallic_factor(),
+            roughness: pbr.roughness_factor(),
+            metallic_roughness_texture: pbr.metallic_roughness_texture()
+                .map(|info| info.texture().source().index() as u32),
+            normal_texture: mat.normal_texture()
+                .map(|info| info.texture().source().index() as u32),
+            normal_scale: mat.normal_texture().map(|info| info.scale()).unwrap_or(1.0),
+            alpha_cutoff,
+            double_sided: mat.double_sided(),
         });
     }
 
@@ -193,6 +222,14 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
                 }
             }
 
+            // Tangents (vec4: xyz = tangent, w = bitangent sign ±1, Mikktspace convention)
+            let mut mesh_tangents = Vec::new();
+            if let Some(tangents_iter) = reader.read_tangents() {
+                for t in tangents_iter {
+                    mesh_tangents.push(Vector4::new(t[0], t[1], t[2], t[3]));
+                }
+            }
+
             // Read indices
             if let Some(indices_iter) = reader.read_indices() {
                 let indices: Vec<u32> = indices_iter.into_u32().collect();
@@ -210,6 +247,7 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
                 normals,
                 uvs,
                 colors: mesh_colors,
+                tangents: mesh_tangents,
                 triangles,
                 material: primitive.material().index().unwrap_or(0) as u32,
             });

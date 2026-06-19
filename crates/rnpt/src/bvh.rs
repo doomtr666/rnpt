@@ -1,5 +1,5 @@
 use crate::{Color, TriangleHit};
-use nalgebra::{Point3, UnitVector3, Vector2};
+use nalgebra::{Point3, UnitVector3, Vector2, Vector4};
 use rnpt_bvh::RayAccelerator;
 
 /// Per-triangle metadata — material, light, and vertex indices into `Bvh.vertices`.
@@ -30,6 +30,9 @@ pub struct Bvh {
     pub normals:       Vec<UnitVector3<f32>>,
     pub uvs:           Vec<Vector2<f32>>,
     pub colors:        Vec<Color>,
+    /// Per-vertex Mikktspace tangents (xyz = world-space direction, w = bitangent sign ±1).
+    /// Zero-initialized (w == 0) when the mesh had no TANGENT attribute.
+    pub tangents:      Vec<Vector4<f32>>,
     pub triangle_meta: Vec<TriangleMeta>,
 }
 

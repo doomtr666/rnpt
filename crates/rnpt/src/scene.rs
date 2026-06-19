@@ -1,6 +1,6 @@
 use crate::Light;
 use crate::math::Color;
-use nalgebra::{Matrix4, Point3, Transform3, UnitVector3, Vector2, Vector3};
+use nalgebra::{Matrix4, Point3, Transform3, UnitVector3, Vector2, Vector3, Vector4};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Camera {
@@ -98,6 +98,31 @@ pub struct Material {
     pub emissive: Color,
     pub albedo_texture: Option<u32>,
     pub emissive_texture: Option<u32>,
+    pub metallic: f32,
+    pub roughness: f32,
+    pub metallic_roughness_texture: Option<u32>, // G = roughness, B = metallic (glTF spec)
+    pub normal_texture: Option<u32>,
+    pub normal_scale: f32,
+    pub alpha_cutoff: Option<f32>, // None = OPAQUE/BLEND, Some(t) = MASK
+    pub double_sided: bool,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            albedo: Color::new(1.0, 1.0, 1.0),
+            emissive: Color::zeros(),
+            albedo_texture: None,
+            emissive_texture: None,
+            metallic: 0.0,
+            roughness: 1.0,
+            metallic_roughness_texture: None,
+            normal_texture: None,
+            normal_scale: 1.0,
+            alpha_cutoff: None,
+            double_sided: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -113,6 +138,9 @@ pub struct Mesh {
     pub normals: Vec<UnitVector3<f32>>,
     pub uvs: Vec<Vector2<f32>>,
     pub colors: Vec<Color>,
+    /// Optional Mikktspace tangents (vec4: xyz = tangent direction, w = bitangent sign ±1).
+    /// Empty when the mesh has no TANGENT attribute; TBN falls back to UV-delta computation.
+    pub tangents: Vec<Vector4<f32>>,
     pub triangles: Vec<Triangle>,
     pub material: u32,
 }

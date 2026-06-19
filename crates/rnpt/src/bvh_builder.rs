@@ -2,27 +2,29 @@ use std::collections::HashMap;
 
 use crate::emitters::{EmitterTri, MeshEmitter};
 use crate::{Bvh, Color, Scene, TriangleMeta};
-use nalgebra::{Point3, Transform3, UnitVector3, Vector2};
+use nalgebra::{Point3, Transform3, UnitVector3, Vector2, Vector3, Vector4};
 
 pub struct BvhBuilder {
-    world_vertices: Vec<Point3<f32>>,
-    world_normals:  Vec<UnitVector3<f32>>,
-    world_uvs:      Vec<Vector2<f32>>,
-    world_colors:   Vec<Color>,
+    world_vertices:  Vec<Point3<f32>>,
+    world_normals:   Vec<UnitVector3<f32>>,
+    world_uvs:       Vec<Vector2<f32>>,
+    world_colors:    Vec<Color>,
+    world_tangents:  Vec<Vector4<f32>>,
     /// Flat triangles: (v0, v1, v2, material, light) — one per input triangle.
-    flat_meta:      Vec<TriangleMeta>,
-    emitter_meshes: Vec<MeshEmitter>,
+    flat_meta:       Vec<TriangleMeta>,
+    emitter_meshes:  Vec<MeshEmitter>,
 }
 
 impl BvhBuilder {
     pub fn new(scene: &Scene) -> Self {
         let mut builder = Self {
-            world_vertices: Vec::new(),
-            world_normals:  Vec::new(),
-            world_uvs:      Vec::new(),
-            world_colors:   Vec::new(),
-            flat_meta:      Vec::new(),
-            emitter_meshes: Vec::new(),
+            world_vertices:  Vec::new(),
+            world_normals:   Vec::new(),
+            world_uvs:       Vec::new(),
+            world_colors:    Vec::new(),
+            world_tangents:  Vec::new(),
+            flat_meta:       Vec::new(),
+            emitter_meshes:  Vec::new(),
         };
         builder.flatten_scene(scene);
         builder
@@ -60,6 +62,10 @@ impl BvhBuilder {
                 let mut emitter_tris: Vec<EmitterTri> = Vec::new();
 
                 for &tri in &mesh.triangles {
+                    // Rotation-scale 3×3 for transforming tangent direction vectors.
+                    let m3 = world_transform.matrix().fixed_view::<3, 3>(0, 0);
+                    let m3_det = m3.determinant();
+
                     let mut get_or_add_vertex = |local_idx: u32| -> usize {
                         let key = (node_idx, mesh_idx, local_idx);
                         *vertex_map.entry(key).or_insert_with(|| {
@@ -82,6 +88,18 @@ impl BvhBuilder {
                                 Color::new(1.0, 1.0, 1.0)
                             };
                             self.world_colors.push(color);
+
+                            // Tangent: transform xyz as a direction, keep W but flip when
+                            // the world transform has a negative determinant (mirror).
+                            let tangent = if !mesh.tangents.is_empty() {
+                                let t = mesh.tangents[local_idx as usize];
+                                let t3 = (m3 * Vector3::new(t.x, t.y, t.z)).normalize();
+                                let w = t.w * if m3_det < 0.0 { -1.0 } else { 1.0 };
+                                Vector4::new(t3.x, t3.y, t3.z, w)
+                            } else {
+                                Vector4::zeros()
+                            };
+                            self.world_tangents.push(tangent);
 
                             let idx = self.world_vertices.len();
                             self.world_vertices.push(p);
@@ -158,6 +176,7 @@ impl BvhBuilder {
             normals:       self.world_normals,
             uvs:           self.world_uvs,
             colors:        self.world_colors,
+            tangents:      self.world_tangents,
             triangle_meta: self.flat_meta,
         };
 
