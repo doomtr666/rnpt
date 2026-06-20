@@ -1,8 +1,28 @@
 use nalgebra::{Matrix4, Point3, Transform3, UnitVector3, Vector2, Vector3, Vector4};
+use rayon::prelude::*;
 use rnpt::{Camera, Color, Light, Material, Mesh, Node, Scene, Triangle};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+/// Timing and count breakdown from `import_scene`.
+#[derive(Default, Debug, Clone)]
+pub struct SceneLoadStats {
+    /// Wall time for `gltf::import` (file I/O + JSON/binary parse).
+    pub gltf_parse_ms: u64,
+    /// Wall time spent decoding and sRGB-converting all textures.
+    pub texture_decode_ms: u64,
+    /// Wall time for material + mesh + node processing.
+    pub mesh_process_ms: u64,
+    /// Total wall time for the full `import_scene` call.
+    pub total_ms: u64,
+    pub texture_count: usize,
+    pub total_texture_pixels: usize,
+    pub triangle_count: usize,
+    pub material_count: usize,
+    pub mesh_count: usize,
+}
 
 /// IEC 61966-2-1 sRGB → linear (exact, matches Blender/OpenGL).
 #[inline]
@@ -74,8 +94,16 @@ fn gltf_matrix_to_nalgebra(matrix: [[f32; 4]; 4]) -> Matrix4<f32> {
 }
 
 /// Imports a GLB or glTF file and parses it into an rnpt::Scene.
-pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error::Error>> {
+/// Returns the scene alongside a timing/count breakdown.
+pub fn import_scene<P: AsRef<Path>>(
+    path: P,
+) -> Result<(Scene, SceneLoadStats), Box<dyn std::error::Error>> {
+    let mut stats = SceneLoadStats::default();
+    let t_total = Instant::now();
+
+    let t0 = Instant::now();
     let (document, buffers, images) = gltf::import(path)?;
+    stats.gltf_parse_ms = t0.elapsed().as_millis() as u64;
 
     // Scan materials first to determine which image indices are linear data
     // (normal maps, metallic/roughness, occlusion) vs sRGB color data (albedo,
@@ -94,55 +122,50 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
         }
     }
 
-    // Load textures — sRGB → linear for color maps, raw /255 for linear maps.
-    // sample_bilinear is pure interpolation with no per-sample color-space work.
-    let mut textures = Vec::new();
-    for (idx, img) in images.iter().enumerate() {
-        let n = (img.width * img.height) as usize;
-        let bytes = &img.pixels;
-        let is_linear = linear_images.contains(&idx);
-        let decode = |b: u8| -> f32 {
-            if is_linear { b as f32 / 255.0 } else { srgb_u8_to_linear(b) }
-        };
+    // Precompute 256-entry LUTs: sRGB→linear (pow 2.4) and raw /255.
+    // This eliminates ~300M pow() calls on a typical Bistro load.
+    let srgb_lut: [f32; 256] = std::array::from_fn(|i| srgb_u8_to_linear(i as u8));
+    let linear_lut: [f32; 256] = std::array::from_fn(|i| i as f32 / 255.0);
 
-        let pixels: Vec<rnpt::Color> = match img.format {
-            gltf::image::Format::R8G8B8 => (0..n)
-                .map(|i| rnpt::Color::new(
-                    decode(bytes[i * 3]),
-                    decode(bytes[i * 3 + 1]),
-                    decode(bytes[i * 3 + 2]),
-                ))
-                .collect(),
-            gltf::image::Format::R8G8B8A8 => (0..n)
-                .map(|i| rnpt::Color::new(
-                    decode(bytes[i * 4]),
-                    decode(bytes[i * 4 + 1]),
-                    decode(bytes[i * 4 + 2]),
-                ))
-                .collect(),
-            gltf::image::Format::R8 => (0..n)
-                .map(|i| { let l = decode(bytes[i]); rnpt::Color::new(l, l, l) })
-                .collect(),
-            gltf::image::Format::R8G8 => (0..n)
-                .map(|i| rnpt::Color::new(
-                    decode(bytes[i * 2]),
-                    decode(bytes[i * 2 + 1]),
-                    0.0,
-                ))
-                .collect(),
-            _ => {
-                eprintln!("Unsupported texture format: {:?}", img.format);
-                vec![rnpt::Color::new(1.0, 0.0, 1.0); n]
-            }
-        };
-        textures.push(rnpt::Texture {
-            width: img.width,
-            height: img.height,
-            pixels,
-        });
-    }
+    // Decode all textures in parallel (Rayon), one task per image.
+    let t_tex = Instant::now();
+    let textures: Vec<rnpt::Texture> = images
+        .par_iter()
+        .enumerate()
+        .map(|(idx, img)| {
+            let lut = if linear_images.contains(&idx) { &linear_lut } else { &srgb_lut };
+            let bytes = &img.pixels;
+            let pixels: Vec<rnpt::Color> = match img.format {
+                gltf::image::Format::R8G8B8 => bytes
+                    .chunks_exact(3)
+                    .map(|p| rnpt::Color::new(lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]))
+                    .collect(),
+                gltf::image::Format::R8G8B8A8 => bytes
+                    .chunks_exact(4)
+                    .map(|p| rnpt::Color::new(lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]))
+                    .collect(),
+                gltf::image::Format::R8 => bytes
+                    .iter()
+                    .map(|&b| { let l = lut[b as usize]; rnpt::Color::new(l, l, l) })
+                    .collect(),
+                gltf::image::Format::R8G8 => bytes
+                    .chunks_exact(2)
+                    .map(|p| rnpt::Color::new(lut[p[0] as usize], lut[p[1] as usize], 0.0))
+                    .collect(),
+                _ => {
+                    eprintln!("Unsupported texture format: {:?}", img.format);
+                    vec![rnpt::Color::new(1.0, 0.0, 1.0); (img.width * img.height) as usize]
+                }
+            };
+            rnpt::Texture { width: img.width, height: img.height, pixels }
+        })
+        .collect();
+    stats.texture_decode_ms = t_tex.elapsed().as_millis() as u64;
+    stats.texture_count = textures.len();
+    stats.total_texture_pixels = textures.iter().map(|t| (t.width * t.height) as usize).sum();
 
     // Load Materials
+    let t_mesh = Instant::now();
     let mut materials = Vec::new();
     for mat in document.materials() {
         let pbr = mat.pbr_metallic_roughness();
@@ -414,13 +437,22 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
     // Extract roots
     let roots = scene.nodes().map(|n| n.index() as u32).collect();
 
-    Ok(Scene {
-        meshes,
-        materials,
-        textures,
-        lights,
-        nodes: nodes_list,
-        roots,
-        cameras,
-    })
+    stats.mesh_process_ms = t_mesh.elapsed().as_millis() as u64;
+    stats.material_count = materials.len();
+    stats.mesh_count = meshes.len();
+    stats.triangle_count = meshes.iter().map(|m: &Mesh| m.triangles.len()).sum();
+    stats.total_ms = t_total.elapsed().as_millis() as u64;
+
+    Ok((
+        Scene {
+            meshes,
+            materials,
+            textures,
+            lights,
+            nodes: nodes_list,
+            roots,
+            cameras,
+        },
+        stats,
+    ))
 }

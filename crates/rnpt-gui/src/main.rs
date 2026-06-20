@@ -52,6 +52,14 @@ struct RnptGuiApp {
     env_raw: Option<(Vec<rnpt::Color>, usize, usize)>, // cached pixels for intensity rebuild
     env_intensity: f32,
     env_rotation: f32, // degrees, [0, 360)
+
+    // Load timings
+    scene_load_stats: Option<asset_importer::SceneLoadStats>,
+    bvh_build_ms: u64,
+    bvh_triangle_count: usize,
+
+    // Debug mode
+    show_debug: bool,
 }
 
 /// Append the environment light (if any) to the unified light list and report
@@ -85,12 +93,16 @@ fn empty_scene() -> rnpt::Scene {
 
 /// Build the BVH and the unified light list (scene punctual lights + emissive
 /// meshes collected during the BVH flatten) for a scene.
+/// Returns (bvh, lights, build_ms, triangle_count).
 fn build_bvh_and_lights(
     scene: &rnpt::Scene,
-) -> (std::sync::Arc<rnpt::Bvh>, std::sync::Arc<Vec<rnpt::Light>>) {
+) -> (std::sync::Arc<rnpt::Bvh>, std::sync::Arc<Vec<rnpt::Light>>, u64, usize) {
+    let t0 = Instant::now();
     let (bvh, emitters) = rnpt::BvhBuilder::new(scene).build();
+    let build_ms = t0.elapsed().as_millis() as u64;
+    let tri_count = bvh.triangle_meta.len();
     let lights = rnpt::build_lights(&scene.lights, emitters);
-    (std::sync::Arc::new(bvh), std::sync::Arc::new(lights))
+    (std::sync::Arc::new(bvh), std::sync::Arc::new(lights), build_ms, tri_count)
 }
 
 impl RnptGuiApp {
@@ -109,8 +121,13 @@ impl RnptGuiApp {
         let mut current_scene = None;
         let mut current_bvh = None;
         let mut current_lights = None;
+        let mut scene_load_stats: Option<asset_importer::SceneLoadStats> = None;
+        let mut bvh_build_ms = 0u64;
+        let mut bvh_triangle_count = 0usize;
         if !asset_files.is_empty() {
-            if let Ok(scene) = asset_importer::import_scene(&asset_files[selected_asset_index]) {
+            if let Ok((scene, stats)) =
+                asset_importer::import_scene(&asset_files[selected_asset_index])
+            {
                 if !scene.cameras.is_empty() {
                     let first_cam = &scene.cameras[0];
                     camera.position = first_cam.position;
@@ -118,7 +135,10 @@ impl RnptGuiApp {
                     camera.fov = first_cam.fov;
                 }
                 let scene_arc = std::sync::Arc::new(scene);
-                let (bvh_arc, lights_arc) = build_bvh_and_lights(&scene_arc);
+                let (bvh_arc, lights_arc, bms, tris) = build_bvh_and_lights(&scene_arc);
+                scene_load_stats = Some(stats);
+                bvh_build_ms = bms;
+                bvh_triangle_count = tris;
                 current_scene = Some(scene_arc);
                 current_bvh = Some(bvh_arc);
                 current_lights = Some(lights_arc);
@@ -130,7 +150,12 @@ impl RnptGuiApp {
             .unwrap_or_else(|| std::sync::Arc::new(empty_scene()));
         let (bvh, lights) = match (current_bvh.clone(), current_lights.clone()) {
             (Some(b), Some(l)) => (b, l),
-            _ => build_bvh_and_lights(&scene),
+            _ => {
+                let (b, l, bms, tris) = build_bvh_and_lights(&scene);
+                bvh_build_ms = bms;
+                bvh_triangle_count = tris;
+                (b, l)
+            }
         };
 
         let strategy = rnpt::SamplingStrategy::Mis;
@@ -181,6 +206,10 @@ impl RnptGuiApp {
             env_raw: None,
             env_intensity: 1.0,
             env_rotation: 0.0,
+            scene_load_stats,
+            bvh_build_ms,
+            bvh_triangle_count,
+            show_debug: false,
         }
     }
 
@@ -212,7 +241,12 @@ impl RnptGuiApp {
             .unwrap_or_else(|| std::sync::Arc::new(empty_scene()));
         let (bvh, lights) = match (self.current_bvh.clone(), self.current_lights.clone()) {
             (Some(b), Some(l)) => (b, l),
-            _ => build_bvh_and_lights(&scene),
+            _ => {
+                let (b, l, bms, tris) = build_bvh_and_lights(&scene);
+                self.bvh_build_ms = bms;
+                self.bvh_triangle_count = tris;
+                (b, l)
+            }
         };
         let (lights, env) = with_env(&lights, &self.env);
 
@@ -346,7 +380,7 @@ impl eframe::App for RnptGuiApp {
                             match asset_importer::import_scene(
                                 &self.asset_files[self.selected_asset_index],
                             ) {
-                                Ok(scene) => {
+                                Ok((scene, stats)) => {
                                     self.selected_camera_index = 0;
                                     if !scene.cameras.is_empty() {
                                         let first_cam = &scene.cameras[0];
@@ -355,7 +389,11 @@ impl eframe::App for RnptGuiApp {
                                         self.camera.fov = first_cam.fov;
                                     }
                                     let scene_arc = std::sync::Arc::new(scene);
-                                    let (bvh_arc, lights_arc) = build_bvh_and_lights(&scene_arc);
+                                    let (bvh_arc, lights_arc, bms, tris) =
+                                        build_bvh_and_lights(&scene_arc);
+                                    self.scene_load_stats = Some(stats);
+                                    self.bvh_build_ms = bms;
+                                    self.bvh_triangle_count = tris;
                                     self.current_scene = Some(scene_arc);
                                     self.current_bvh = Some(bvh_arc);
                                     self.current_lights = Some(lights_arc);
@@ -656,10 +694,60 @@ impl eframe::App for RnptGuiApp {
                     if let Some(ref scene) = self.current_scene {
                         ui.label(format!("Meshes: {}", scene.meshes.len()));
                         ui.label(format!("Materials: {}", scene.materials.len()));
+                        ui.label(format!("Triangles: {}", self.bvh_triangle_count));
                         ui.label(format!("Lights: {}", scene.lights.len()));
                         ui.label(format!("Cameras: {}", scene.cameras.len()));
                     } else {
                         ui.label("No scene loaded");
+                    }
+                });
+
+                ui.collapsing("Load Times", |ui| {
+                    if let Some(ref s) = self.scene_load_stats {
+                        ui.label(format!("Total import:    {:>6} ms", s.total_ms));
+                        ui.label(format!("  gltf parse:   {:>6} ms", s.gltf_parse_ms));
+                        ui.label(format!("  tex decode:   {:>6} ms  ({} tex, {}M px)",
+                            s.texture_decode_ms,
+                            s.texture_count,
+                            s.total_texture_pixels / 1_000_000,
+                        ));
+                        ui.label(format!("  mesh/mat:     {:>6} ms", s.mesh_process_ms));
+                        ui.label(format!("BVH build:       {:>6} ms", self.bvh_build_ms));
+                    } else {
+                        ui.label("No scene loaded");
+                    }
+                });
+
+                ui.collapsing("Debug", |ui| {
+                    ui.checkbox(&mut self.show_debug, "Show materials");
+                    if self.show_debug {
+                        if let Some(ref scene) = self.current_scene {
+                            egui::ScrollArea::vertical()
+                                .max_height(300.0)
+                                .show(ui, |ui| {
+                                    for (i, mat) in scene.materials.iter().enumerate() {
+                                        ui.collapsing(format!("Mat {i}"), |ui| {
+                                            ui.label(format!("albedo: [{:.2}, {:.2}, {:.2}]",
+                                                mat.albedo.x, mat.albedo.y, mat.albedo.z));
+                                            ui.label(format!("roughness: {:.3}  metallic: {:.3}",
+                                                mat.roughness, mat.metallic));
+                                            ui.label(format!("transmission: {:.3}  ior: {:.3}",
+                                                mat.transmission, mat.ior));
+                                            ui.label(format!("thickness: {:.3}  att_dist: {:.3}",
+                                                mat.thickness_factor, mat.attenuation_distance));
+                                            ui.label(format!("att_color: [{:.2}, {:.2}, {:.2}]",
+                                                mat.attenuation_color.x,
+                                                mat.attenuation_color.y,
+                                                mat.attenuation_color.z));
+                                            ui.label(format!("emissive: [{:.2}, {:.2}, {:.2}]",
+                                                mat.emissive.x, mat.emissive.y, mat.emissive.z));
+                                            ui.label(format!(
+                                                "double_sided: {}  alpha_cut: {:?}",
+                                                mat.double_sided, mat.alpha_cutoff));
+                                        });
+                                    }
+                                });
+                        }
                     }
                 });
             });
