@@ -10,6 +10,9 @@ pub struct TriangleMeta {
     pub v0: u32,
     pub v1: u32,
     pub v2: u32,
+    /// True when this triangle accepts backface hits in the BVH (glass with transmission > 0).
+    /// Exit-face detection at shading time uses `geo_normal · wo < 0` instead.
+    pub double_sided: bool,
 }
 
 pub struct BvhHit {

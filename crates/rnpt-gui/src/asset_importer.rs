@@ -155,6 +155,23 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
         // gltf crate returns Some(cutoff) for Mask mode, None for Opaque/Blend.
         let alpha_cutoff = mat.alpha_cutoff();
 
+        let transmission = mat.transmission()
+            .map(|t| t.transmission_factor())
+            .unwrap_or(0.0);
+        let ior = mat.ior().unwrap_or(1.5);
+
+        let (thickness_factor, attenuation_distance, attenuation_color) =
+            if let Some(vol) = mat.volume() {
+                let ac = vol.attenuation_color();
+                (
+                    vol.thickness_factor(),
+                    vol.attenuation_distance(),
+                    Color::new(ac[0], ac[1], ac[2]),
+                )
+            } else {
+                (0.0, f32::INFINITY, Color::new(1.0, 1.0, 1.0))
+            };
+
         materials.push(Material {
             albedo: Color::from([base_color[0], base_color[1], base_color[2]]),
             emissive,
@@ -171,6 +188,11 @@ pub fn import_scene<P: AsRef<Path>>(path: P) -> Result<Scene, Box<dyn std::error
             normal_scale: mat.normal_texture().map(|info| info.scale()).unwrap_or(1.0),
             alpha_cutoff,
             double_sided: mat.double_sided(),
+            transmission,
+            ior,
+            thickness_factor,
+            attenuation_distance,
+            attenuation_color,
         });
     }
 

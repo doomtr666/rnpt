@@ -18,6 +18,7 @@ struct BuildTri {
     v2: u32,
     orig_idx: u32,
     geom_id: u32,
+    double_sided: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -43,12 +44,14 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
             world_vertices.push(Point3::new(v[0], v[1], v[2]));
         }
         for (orig_idx, &t) in geom.tris.iter().enumerate() {
+            let double_sided = geom.double_sided.get(orig_idx).copied().unwrap_or(false);
             build_tris.push(BuildTri {
                 v0: t[0] + vert_offset,
                 v1: t[1] + vert_offset,
                 v2: t[2] + vert_offset,
                 orig_idx: orig_idx as u32,
                 geom_id: geom_id as u32,
+                double_sided,
             });
         }
     }
@@ -59,7 +62,7 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
     let remainder = num_triangles % 8;
     if remainder != 0 {
         for _ in 0..(8 - remainder) {
-            build_tris.push(BuildTri { v0: 0, v1: 0, v2: 0, orig_idx: u32::MAX, geom_id: u32::MAX });
+            build_tris.push(BuildTri { v0: 0, v1: 0, v2: 0, orig_idx: u32::MAX, geom_id: u32::MAX, double_sided: false });
         }
     }
 
@@ -115,13 +118,19 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
 
     let mut ordered_soa: Vec<FlatTriangles> = Vec::with_capacity(soa_chunks.len());
     let mut ordered_slots: Vec<TriSlot> = Vec::with_capacity(build_tris.len());
+    let mut double_sided_masks: Vec<u8> = Vec::with_capacity(soa_chunks.len());
 
     for &idx in &chunk_indices {
         ordered_soa.push(soa_chunks[idx]);
+        let mut ds_mask = 0u8;
         for i in 0..8 {
             let bt = &build_tris[idx * 8 + i];
             ordered_slots.push(TriSlot { orig_idx: bt.orig_idx, geom_id: bt.geom_id });
+            if bt.double_sided {
+                ds_mask |= 1 << i;
+            }
         }
+        double_sided_masks.push(ds_mask);
     }
 
     let mut bvh8_nodes: Vec<Bvh8Node> = Vec::new();
@@ -129,7 +138,7 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
         collapse_to_bvh8(0, &nodes, &mut bvh8_nodes);
     }
 
-    BvhInner { nodes: bvh8_nodes, tri_slots: ordered_slots, soa_chunks: ordered_soa }
+    BvhInner { nodes: bvh8_nodes, tri_slots: ordered_slots, soa_chunks: ordered_soa, double_sided_masks }
 }
 
 fn cluster_triangles(vertices: &[Point3<f32>], tris: &mut Vec<BuildTri>) {

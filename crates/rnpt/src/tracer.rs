@@ -1,4 +1,4 @@
-use crate::{Brdf, Bvh, Camera, Color, ColorExt, Light, Pcg32, Ray, Scene, evaluate_surface};
+use crate::{Brdf, Bvh, Camera, Color, ColorExt, Light, Pcg32, Ray, Scene, evaluate_surface, sample_glass};
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
 use std::sync::Arc;
 
@@ -254,8 +254,77 @@ impl PathTracer {
 
             // Evaluate geometry + material at the hit (normal, albedo, emissive).
             let surf = evaluate_surface(&hit, &ray, &self.config.bvh, &self.config.scene);
-            let brdf = surf.brdf();
             let wo = -ray.direction.into_inner(); // toward the previous vertex
+
+            // ── Dielectric (glass) ───────────────────────────────────────────
+            // glTF model: `transmission` fraction → glass BSDF (GGX reflect or refract);
+            // `1 − transmission` fraction → opaque BSDF (diffuse + specular + NEE).
+            // Stochastic lobe selection; throughput is divided by the selection probability.
+            //
+            // Thin  (thickness_factor = 0): GGX-scattered straight-through (eta_eff = 1).
+            // Thick (thickness_factor > 0): Snell refraction + Beer-Lambert absorption.
+            if surf.transmission > 0.0 && rng.next_f32() < surf.transmission {
+                // ── Glass lobe ────────────────────────────────────────────────
+                let is_exit = surf.geo_normal.dot(&wo) < 0.0;
+                let thick = surf.thickness_factor > 0.0;
+                // Flip n so sample_glass always receives a normal in the wo hemisphere.
+                let n = if is_exit { -surf.normal.into_inner() } else { surf.normal.into_inner() };
+
+                // Tint table (baseColor applied once at entry; Beer-Lambert at exit):
+                //   thin  (front/back) → albedo
+                //   thick entry        → albedo
+                //   thick exit         → Beer-Lambert only
+                let tint = if thick {
+                    if is_exit {
+                        let t = hit.hit.t;
+                        let d = surf.attenuation_distance;
+                        if d.is_finite() && d > 0.0 {
+                            let inv_d = t / d;
+                            Color::new(
+                                surf.attenuation_color.x.powf(inv_d),
+                                surf.attenuation_color.y.powf(inv_d),
+                                surf.attenuation_color.z.powf(inv_d),
+                            )
+                        } else {
+                            Color::white()
+                        }
+                    } else {
+                        surf.albedo
+                    }
+                } else {
+                    surf.albedo // baseColor tints the surface interface
+                };
+
+                let Some(gs) = sample_glass(
+                    &n, &wo, surf.roughness, surf.ior, &tint, is_exit, thick, rng,
+                ) else {
+                    break;
+                };
+
+                // Do not divide by the glass lobe selection probability (surf.transmission).
+                // The unscaled weight correctly preserves the specular reflection 
+                // without double-counting it against the opaque branch.
+                throughput = throughput.component_mul(&gs.weight);
+                // Large pdf → MIS weight ≈ 1 (no NEE through glass).
+                bsdf_pdf = 1e30;
+                ray = Ray::new_with_minmax(
+                    surf.position,
+                    UnitVector3::new_normalize(gs.wi),
+                    RAY_EPSILON,
+                    f32::INFINITY,
+                );
+
+                if russian_roulette(&mut throughput, bounce, rng) {
+                    break;
+                }
+                continue;
+            }
+
+            // Opaque lobe selected (or transmission = 0).
+            // Do not scale throughput to compensate for lobe selection probability,
+            // as this elegantly blends the shared specular reflection between branches.
+
+            let brdf = surf.brdf();
 
             // Emission, weighted per strategy (see SamplingStrategy):
             //  - BrdfOnly: every hit, full weight.

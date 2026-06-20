@@ -101,6 +101,10 @@ pub struct BvhInner {
     pub nodes: Vec<Bvh8Node>,
     pub tri_slots: Vec<TriSlot>,
     pub soa_chunks: Vec<FlatTriangles>,
+    /// One bitmask per SoA chunk (8 triangles per chunk). Bit i = 1 means triangle i
+    /// in that chunk accepts backface hits (no culling). Self-hit avoidance for these
+    /// triangles relies on `tmin = RAY_EPSILON` in the caller, not on det sign.
+    pub double_sided_masks: Vec<u8>,
 }
 
 struct BvhStack {
@@ -180,8 +184,9 @@ impl BvhInner {
                 for i in 0..chunk_count {
                     let chunk_idx = start_chunk + i;
                     let chunk = self.get_chunk(chunk_idx);
+                    let ds_mask = self.double_sided_masks.get(chunk_idx as usize).copied().unwrap_or(0);
 
-                    if let Some(simd_hit) = ray.closest_triangle_simd8(chunk, t_max) {
+                    if let Some(simd_hit) = ray.closest_triangle_simd8(chunk, t_max, ds_mask) {
                         t_max = simd_hit.hit.t;
                         let tri_global_idx = chunk_idx * 8 + simd_hit.lane;
                         let slot = self.get_slot(tri_global_idx);
@@ -233,7 +238,8 @@ impl BvhInner {
 
                 for i in 0..chunk_count {
                     let chunk_idx = start_chunk + i;
-                    if ray.any_triangle_simd8(self.get_chunk(chunk_idx), t_max) {
+                    let ds_mask = self.double_sided_masks.get(chunk_idx as usize).copied().unwrap_or(0);
+                    if ray.any_triangle_simd8(self.get_chunk(chunk_idx), t_max, ds_mask) {
                         return true;
                     }
                 }

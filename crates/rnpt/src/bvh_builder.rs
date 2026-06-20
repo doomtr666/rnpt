@@ -117,6 +117,10 @@ impl BvhBuilder {
                         v0,
                         v1,
                         v2,
+                        // Glass triangles accept backface hits in the BVH so that
+                        // rays inside closed meshes can hit the exit face.
+                        // Self-hit avoidance relies on RAY_EPSILON, not det sign.
+                        double_sided: mat.transmission > 0.0,
                     });
 
                     if is_emissive {
@@ -166,8 +170,15 @@ impl BvhBuilder {
             .map(|m| [m.v0, m.v1, m.v2])
             .collect();
 
+        let double_sided_flags: Vec<bool> = self.flat_meta.iter()
+            .map(|m| m.double_sided)
+            .collect();
+
         let mut accel = rnpt_bvh::Scene::new();
-        accel.attach_geometry(rnpt_bvh::Geometry::triangle_mesh(&verts, &tris));
+        accel.attach_geometry(
+            rnpt_bvh::Geometry::triangle_mesh(&verts, &tris)
+                .with_double_sided(double_sided_flags),
+        );
         accel.commit();
 
         let bvh = Bvh {

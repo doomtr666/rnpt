@@ -11,6 +11,11 @@ pub struct SurfaceInteraction {
     pub emissive: Color,
     pub metallic: f32,
     pub roughness: f32,
+    pub transmission: f32,         // KHR_materials_transmission factor [0, 1]
+    pub ior: f32,                  // KHR_materials_ior (default 1.5)
+    pub thickness_factor: f32,     // KHR_materials_volume: 0 = thin, >0 = thick (Snell + Beer-Lambert)
+    pub attenuation_distance: f32, // world units; INFINITY = no absorption
+    pub attenuation_color: Color,  // color at attenuation_distance
 }
 
 impl SurfaceInteraction {
@@ -179,5 +184,10 @@ pub fn evaluate_surface(hit: &BvhHit, ray: &Ray, bvh: &Bvh, scene: &Scene) -> Su
         emissive: modulate(mat.emissive_texture, mat.emissive),
         metallic,
         roughness,
+        transmission: mat.transmission,
+        ior: mat.ior,
+        thickness_factor: mat.thickness_factor,
+        attenuation_distance: mat.attenuation_distance,
+        attenuation_color: mat.attenuation_color,
     }
 }

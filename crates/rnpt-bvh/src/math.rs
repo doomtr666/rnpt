@@ -86,6 +86,7 @@ impl InternalRay {
         &self,
         soa: &FlatTriangles,
         current_t_max: f32,
+        double_sided_mask: u8,
     ) -> Option<TriangleHitSimd> {
         let v0_x = f32x8::from(soa.v0_x);
         let v0_y = f32x8::from(soa.v0_y);
@@ -107,7 +108,15 @@ impl InternalRay {
         let det = e1_x * h_x + e1_y * h_y + e1_z * h_z;
 
         let epsilon = f32x8::splat(1e-7);
-        let det_mask = det.simd_ge(epsilon);
+        // For double-sided triangles, also accept backface hits (det <= -epsilon).
+        // Self-hit avoidance for these triangles relies on tmin = RAY_EPSILON in the caller.
+        let ds = {
+            let t = f32::from_bits(u32::MAX); // all bits set = "true" in wide's mask encoding
+            f32x8::from(std::array::from_fn::<f32, 8, _>(|i| {
+                if double_sided_mask & (1u8 << i) != 0 { t } else { 0.0_f32 }
+            }))
+        };
+        let det_mask = det.simd_ge(epsilon) | (ds & det.simd_le(-epsilon));
         let inv_det = f32x8::splat(1.0) / det;
 
         let origin_x = f32x8::splat(self.origin.x);
@@ -159,7 +168,7 @@ impl InternalRay {
     }
 
     #[inline(always)]
-    pub fn any_triangle_simd8(&self, soa: &FlatTriangles, t_max: f32) -> bool {
+    pub fn any_triangle_simd8(&self, soa: &FlatTriangles, t_max: f32, double_sided_mask: u8) -> bool {
         let v0_x = f32x8::from(soa.v0_x);
         let v0_y = f32x8::from(soa.v0_y);
         let v0_z = f32x8::from(soa.v0_z);
@@ -178,7 +187,14 @@ impl InternalRay {
         let h_y = dir_z * e2_x - dir_x * e2_z;
         let h_z = dir_x * e2_y - dir_y * e2_x;
         let det = e1_x * h_x + e1_y * h_y + e1_z * h_z;
-        let det_mask = det.simd_ge(f32x8::splat(1e-7));
+        let ds = {
+            let t = f32::from_bits(u32::MAX);
+            f32x8::from(std::array::from_fn::<f32, 8, _>(|i| {
+                if double_sided_mask & (1u8 << i) != 0 { t } else { 0.0_f32 }
+            }))
+        };
+        let epsilon = f32x8::splat(1e-7);
+        let det_mask = det.simd_ge(epsilon) | (ds & det.simd_le(-epsilon));
         let inv_det = f32x8::splat(1.0) / det;
 
         let s_x = f32x8::splat(self.origin.x) - v0_x;

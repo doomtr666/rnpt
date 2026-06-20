@@ -105,6 +105,17 @@ pub struct Material {
     pub normal_scale: f32,
     pub alpha_cutoff: Option<f32>, // None = OPAQUE/BLEND, Some(t) = MASK
     pub double_sided: bool,
+    /// KHR_materials_transmission: 0 = opaque, 1 = fully transparent.
+    pub transmission: f32,
+    /// KHR_materials_ior: index of refraction (default 1.5 for glass).
+    pub ior: f32,
+    /// KHR_materials_volume: 0 = thin surface (no refraction), >0 = volume boundary
+    /// with Snell refraction and Beer-Lambert absorption.
+    pub thickness_factor: f32,
+    /// KHR_materials_volume: distance (world units) at which attenuation_color is reached.
+    pub attenuation_distance: f32,
+    /// KHR_materials_volume: color of transmitted light at attenuation_distance.
+    pub attenuation_color: Color,
 }
 
 impl Default for Material {
@@ -121,6 +132,11 @@ impl Default for Material {
             normal_scale: 1.0,
             alpha_cutoff: None,
             double_sided: false,
+            transmission: 0.0,
+            ior: 1.5,
+            thickness_factor: 0.0,
+            attenuation_distance: f32::INFINITY,
+            attenuation_color: Color::new(1.0, 1.0, 1.0),
         }
     }
 }

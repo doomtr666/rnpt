@@ -38,15 +38,23 @@ pub trait RayAccelerator {
     fn any_hit(&self, ray: &Ray) -> bool;
 }
 
-/// Triangle mesh geometry (opaque). Build with `Geometry::triangle_mesh`.
+/// Triangle mesh geometry. Build with `Geometry::triangle_mesh`.
 pub struct Geometry {
     pub(crate) verts: Vec<[f32; 3]>,
     pub(crate) tris:  Vec<[u32; 3]>,
+    /// Per-triangle double-sided flag. Empty means all triangles are single-sided.
+    /// When set, the triangle accepts hits from both front and back.
+    pub(crate) double_sided: Vec<bool>,
 }
 
 impl Geometry {
     pub fn triangle_mesh(verts: &[[f32; 3]], tris: &[[u32; 3]]) -> Self {
-        Self { verts: verts.to_vec(), tris: tris.to_vec() }
+        Self { verts: verts.to_vec(), tris: tris.to_vec(), double_sided: Vec::new() }
+    }
+
+    pub fn with_double_sided(mut self, ds: Vec<bool>) -> Self {
+        self.double_sided = ds;
+        self
     }
 }
 

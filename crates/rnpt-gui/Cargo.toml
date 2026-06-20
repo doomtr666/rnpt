@@ -7,6 +7,6 @@ edition = "2024"
 eframe = "0.28.1"
 rayon = "1.10"
 nalgebra = "0.33"
-gltf = { version = "1.4", features = ["KHR_lights_punctual", "KHR_materials_emissive_strength"] }
+gltf = { version = "1.4", features = ["KHR_lights_punctual", "KHR_materials_emissive_strength", "KHR_materials_transmission", "KHR_materials_ior", "KHR_materials_volume"] }
 image = { version = "0.25", default-features = false, features = ["hdr"] }
 rnpt = { path = "../rnpt" }
