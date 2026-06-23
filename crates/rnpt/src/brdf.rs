@@ -118,7 +118,10 @@ pub fn sample_glass(
                     let wi_r = (h * (2.0 * dot_h_wo) - *wo).normalize();
                     let cos_n_wi_r = n.dot(&wi_r);
                     if cos_n_wi_r <= 0.0 { return None; }
-                    Some(GlassSample { wi: wi_r, weight: Color::new(1.0, 1.0, 1.0) * w(cos_n_wi_r), is_reflect: true })
+                    // Divide by (1 - f) because we took the transmission branch with probability 1 - f,
+                    // but the TIR Fresnel factor is 1.0. This prevents energy loss at grazing angles.
+                    let tir_weight = (Color::new(1.0, 1.0, 1.0) * w(cos_n_wi_r)) / (1.0 - f).max(1e-5);
+                    Some(GlassSample { wi: wi_r, weight: tir_weight, is_reflect: true })
                 }
                 Some(wi_t) => {
                     let cos_n_wi_t = n.dot(&wi_t).abs().max(1e-5);

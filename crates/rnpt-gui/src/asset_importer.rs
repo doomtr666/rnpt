@@ -207,6 +207,11 @@ pub fn import_scene<P: AsRef<Path>>(
                     vol.attenuation_distance(),
                     Color::new(ac[0], ac[1], ac[2]),
                 )
+            } else if transmission > 0.0 {
+                // Fallback for objects exported from Blender without KHR_materials_volume.
+                // We assume they are solid glass (thickness > 0) rather than infinitely thin surfaces,
+                // so they refract light correctly (magnifying glass effect).
+                (1.0, f32::INFINITY, Color::new(1.0, 1.0, 1.0))
             } else {
                 (0.0, f32::INFINITY, Color::new(1.0, 1.0, 1.0))
             };
