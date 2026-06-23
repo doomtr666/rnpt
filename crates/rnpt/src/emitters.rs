@@ -1,4 +1,4 @@
-use crate::{Color, Pcg32, Texture};
+use crate::{AliasTable, Color, Pcg32, Texture};
 use nalgebra::{Point3, UnitVector3, Vector2};
 
 /// One emissive triangle in world space.
@@ -19,7 +19,7 @@ pub struct EmitterTri {
 #[derive(Clone, Debug)]
 pub struct MeshEmitter {
     tris: Vec<EmitterTri>,
-    cdf: Vec<f32>, // normalized cumulative area, len == tris.len(), last == 1.0
+    alias: AliasTable, // O(1) area-weighted triangle selection (replaces CDF binary search)
     total_area: f32,
     emissive: Color, // material is per-mesh, shared by all triangles
     emissive_texture: Option<u32>,
@@ -51,24 +51,21 @@ impl MeshEmitter {
         if tris.is_empty() {
             return None;
         }
-        let mut cdf = Vec::with_capacity(tris.len());
-        let mut acc = 0.0f32;
+        let mut areas = Vec::with_capacity(tris.len());
+        let mut total_area = 0.0f32;
         for t in &tris {
             let e1 = t.v1 - t.v0;
             let e2 = t.v2 - t.v0;
-            acc += 0.5 * e1.cross(&e2).norm();
-            cdf.push(acc);
+            let area = 0.5 * e1.cross(&e2).norm();
+            areas.push(area);
+            total_area += area;
         }
-        let total_area = acc;
         if total_area <= 0.0 {
             return None;
         }
-        for c in &mut cdf {
-            *c /= total_area;
-        }
         Some(Self {
             tris,
-            cdf,
+            alias: AliasTable::new(&areas),
             total_area,
             emissive,
             emissive_texture,
@@ -80,14 +77,10 @@ impl MeshEmitter {
         self.total_area
     }
 
-    /// Geometry-only sample: triangle selection + barycentric, no texture lookup.
+    /// Geometry-only sample: O(1) triangle selection + barycentric, no texture lookup.
     /// Call `le_at()` afterwards — only if the sample passes backface/distance tests.
     pub fn sample_geom(&self, rng: &mut Pcg32) -> EmitterGeomSample {
-        let xi = rng.next_f32();
-        let tri_idx = self
-            .cdf
-            .partition_point(|&c| c < xi)
-            .min(self.tris.len() - 1);
+        let tri_idx = self.alias.sample(rng.next_f32());
         let tri = &self.tris[tri_idx];
 
         let mut u = rng.next_f32();
@@ -120,15 +113,9 @@ impl MeshEmitter {
     /// regardless of the chosen triangle (pick ∝ area cancels the per-triangle
     /// uniform density) — this keeps the NEE estimator unbiased.
     pub fn sample(&self, rng: &mut Pcg32, textures: &[Texture]) -> EmitterSample {
-        // Pick a triangle proportional to its area.
-        let xi = rng.next_f32();
-        let i = self
-            .cdf
-            .partition_point(|&c| c < xi)
-            .min(self.tris.len() - 1);
+        let i = self.alias.sample(rng.next_f32());
         let tri = &self.tris[i];
 
-        // Uniform barycentric point on the triangle (fold method).
         let mut u = rng.next_f32();
         let mut v = rng.next_f32();
         if u + v > 1.0 {
@@ -155,4 +142,3 @@ impl MeshEmitter {
         }
     }
 }
-

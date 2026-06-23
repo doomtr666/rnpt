@@ -195,6 +195,21 @@ fn spec_prob(f0: Color) -> f32 {
     lum.clamp(0.1, 0.9)
 }
 
+// ── BRDF precomputed data ─────────────────────────────────────────────────────
+
+/// Terms that depend only on the material and `wo` — invariant across all `wi`
+/// evaluations in a RIS loop. Built once via `Brdf::precompute()`; passed to
+/// `eval_with_precomp()` / `eval_and_pdf_with_precomp()` to avoid recomputing
+/// a sqrt (the `denom_o` Smith term) per candidate.
+pub struct BrdfPrecomputed {
+    pub a2: f32,
+    pub one_minus_a2: f32,
+    pub f0: Color,
+    pub p_s: f32,     // spec_prob(f0) — lobe-mix weight for pdf
+    pub cos_n_o: f32,
+    pub denom_o: f32, // Smith G₁ denominator for wo
+}
+
 // ── BRDF implementation ───────────────────────────────────────────────────────
 
 impl Brdf {
@@ -261,6 +276,106 @@ impl Brdf {
                 let pdf_diff = cos_n_i / PI;
 
                 p_spec * pdf_spec + (1.0 - p_spec) * pdf_diff
+            }
+        }
+    }
+
+    /// Precompute the wo-dependent (and material-constant) terms shared by all
+    /// `eval_with_precomp` / `eval_and_pdf_with_precomp` calls in a RIS loop.
+    /// Returns `None` for Lambertian (no wo-dependent terms worth caching) or
+    /// when `cos(N,wo) ≤ 0` (surface facing away — all evaluations return 0).
+    pub fn precompute(
+        &self,
+        normal: &UnitVector3<f32>,
+        wo: &Vector3<f32>,
+    ) -> Option<BrdfPrecomputed> {
+        match self {
+            Brdf::Lambertian { .. } => None,
+            Brdf::CookTorrance { albedo, metallic, roughness } => {
+                let cos_n_o = normal.dot(wo);
+                if cos_n_o <= 0.0 {
+                    return None;
+                }
+                let alpha = (*roughness * *roughness).max(0.001_f32);
+                let a2 = alpha * alpha;
+                let one_minus_a2 = 1.0 - a2;
+                let f0 = Color::new(0.04, 0.04, 0.04) * (1.0 - *metallic) + *albedo * *metallic;
+                let p_s = spec_prob(f0);
+                let denom_o = cos_n_o + ((one_minus_a2 * cos_n_o).mul_add(cos_n_o, a2)).sqrt();
+                Some(BrdfPrecomputed { a2, one_minus_a2, f0, p_s, cos_n_o, denom_o })
+            }
+        }
+    }
+
+    /// `eval()` using precomputed wo-side terms — skips `denom_o` sqrt and
+    /// material constant setup. Falls back to the standard path for Lambertian.
+    pub fn eval_with_precomp(
+        &self,
+        normal: &UnitVector3<f32>,
+        wo: &Vector3<f32>,
+        wi: &Vector3<f32>,
+        pre: &BrdfPrecomputed,
+    ) -> Color {
+        match self {
+            Brdf::Lambertian { albedo } => albedo / PI,
+            Brdf::CookTorrance { albedo, metallic, .. } => {
+                let cos_n_i = normal.dot(wi);
+                if cos_n_i <= 0.0 {
+                    return Color::zeros();
+                }
+                let h = (*wo + *wi).normalize();
+                let cos_n_h = normal.dot(&h).max(0.0);
+                let cos_h_o = h.dot(wo).max(0.0);
+
+                let denom_i = cos_n_i + ((pre.one_minus_a2 * cos_n_i).mul_add(cos_n_i, pre.a2)).sqrt();
+                let g_over_d = 1.0 / (pre.denom_o * denom_i);
+
+                let f = schlick(pre.f0, cos_h_o);
+                let d = ggx_d(cos_n_h, pre.a2);
+                let f_spec = f * (d * g_over_d);
+
+                let kd = (Color::new(1.0, 1.0, 1.0) - f) * (1.0 - *metallic);
+                kd.component_mul(albedo) / PI + f_spec
+            }
+        }
+    }
+
+    /// `eval_and_pdf()` using precomputed wo-side terms.
+    pub fn eval_and_pdf_with_precomp(
+        &self,
+        normal: &UnitVector3<f32>,
+        wo: &Vector3<f32>,
+        wi: &Vector3<f32>,
+        pre: &BrdfPrecomputed,
+    ) -> (Color, f32) {
+        match self {
+            Brdf::Lambertian { albedo } => {
+                let cos_n_i = normal.dot(wi).max(0.0);
+                (albedo / PI, cos_n_i / PI)
+            }
+            Brdf::CookTorrance { albedo, metallic, .. } => {
+                let cos_n_i = normal.dot(wi);
+                if cos_n_i <= 0.0 {
+                    return (Color::zeros(), 0.0);
+                }
+                let h = (*wo + *wi).normalize();
+                let cos_n_h = normal.dot(&h).max(0.0);
+                let cos_h_o = h.dot(wo).max(0.0);
+
+                let denom_i = cos_n_i + ((pre.one_minus_a2 * cos_n_i).mul_add(cos_n_i, pre.a2)).sqrt();
+                let g_over_d = 1.0 / (pre.denom_o * denom_i);
+
+                let f = schlick(pre.f0, cos_h_o);
+                let d = ggx_d(cos_n_h, pre.a2);
+                let f_spec = f * (d * g_over_d);
+
+                let kd = (Color::new(1.0, 1.0, 1.0) - f) * (1.0 - *metallic);
+                let brdf_val = kd.component_mul(albedo) / PI + f_spec;
+
+                let pdf_spec = if cos_h_o > 1e-7 { d * cos_n_h / (4.0 * cos_h_o) } else { 0.0 };
+                let pdf_val = pre.p_s * pdf_spec + (1.0 - pre.p_s) * cos_n_i / PI;
+
+                (brdf_val, pdf_val)
             }
         }
     }

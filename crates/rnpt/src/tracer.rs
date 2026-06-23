@@ -455,6 +455,10 @@ impl PathTracer {
 
         let mut r = Reservoir::default();
 
+        // Precompute wo-dependent BRDF terms once — shared across all M candidates.
+        // For CookTorrance: caches a2, f0, denom_o (contains a sqrt) and p_s.
+        let pre = brdf.precompute(normal, wo);
+
         // MIS Weight Factors
         let m_total = (RESTIR_M + RESTIR_M_BRDF) as f32;
         let w_l_factor = RESTIR_M as f32 / m_total;
@@ -475,13 +479,13 @@ impl PathTracer {
                 r.m += 1;
                 continue;
             }
-            
-            // p_hat = lum(brdf * L_i * cos_s)
-            // For non-delta lights eval+pdf share half-vector and GGX terms — use the fused path.
-            let (f, p_b) = if self.config.lights[idx.min(n - 1)].is_delta() {
-                (brdf.eval(normal, wo, &ls.wi), 0.0_f32)
-            } else {
-                brdf.eval_and_pdf(normal, wo, &ls.wi)
+
+            // p_hat = lum(brdf * L_i * cos_s) — use precomputed wo-side terms when available.
+            let (f, p_b) = match (&pre, self.config.lights[idx.min(n - 1)].is_delta()) {
+                (Some(pre), true)  => (brdf.eval_with_precomp(normal, wo, &ls.wi, pre), 0.0_f32),
+                (Some(pre), false) => brdf.eval_and_pdf_with_precomp(normal, wo, &ls.wi, pre),
+                (None, true)       => (brdf.eval(normal, wo, &ls.wi), 0.0_f32),
+                (None, false)      => brdf.eval_and_pdf(normal, wo, &ls.wi),
             };
             let unshadowed = f.component_mul(&ls.li) * cos_s;
             let p_hat = 0.2126 * unshadowed.x + 0.7152 * unshadowed.y + 0.0722 * unshadowed.z;
@@ -567,7 +571,10 @@ impl PathTracer {
                 let wi_prev = to_prev / prev_dist;
                 let prev_cos = normal.dot(&wi_prev).max(0.0);
                 if prev_cos > 0.0 {
-                    let f_prev = brdf.eval(normal, wo, &wi_prev);
+                    let f_prev = match &pre {
+                        Some(pre) => brdf.eval_with_precomp(normal, wo, &wi_prev, pre),
+                        None => brdf.eval(normal, wo, &wi_prev),
+                    };
                     let unshadowed = f_prev.component_mul(&reservoir.li) * prev_cos;
                     let p_hat_cur = 0.2126 * unshadowed.x + 0.7152 * unshadowed.y + 0.0722 * unshadowed.z;
 
@@ -597,7 +604,10 @@ impl PathTracer {
         };
 
         let cos_s = normal.dot(&wi).max(0.0);
-        let f = brdf.eval(normal, wo, &wi);
+        let f = match &pre {
+            Some(pre) => brdf.eval_with_precomp(normal, wo, &wi, pre),
+            None => brdf.eval(normal, wo, &wi),
+        };
         let unshadowed = f.component_mul(&r.li) * cos_s;
         let p_hat_y = 0.2126 * unshadowed.x + 0.7152 * unshadowed.y + 0.0722 * unshadowed.z;
         let big_w = r.big_w(p_hat_y);

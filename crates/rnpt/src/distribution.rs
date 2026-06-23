@@ -1,6 +1,77 @@
 //! Inverse-CDF sampling of piecewise-constant distributions (the same trick as
 //! `MeshEmitter`'s area CDF, generalized to 1D/2D). Used for HDRI importance
 //! sampling: a 2D distribution = a marginal over rows + one conditional per row.
+//!
+//! `AliasTable` provides O(1) *discrete* sampling via Walker's alias method and
+//! is used for triangle selection in `MeshEmitter`.
+
+/// O(1) discrete sampler — Walker's alias method (Vose 1991).
+///
+/// Build cost: O(n). Sample cost: exactly 2 array reads, no branching in the
+/// hot path. Replaces a CDF `partition_point` (O(log n)) for discrete distributions.
+#[derive(Clone, Debug)]
+pub struct AliasTable {
+    prob: Vec<f32>,  // probability of choosing index i directly (vs alias[i])
+    alias: Vec<u32>, // alternative index when U > prob[i]
+}
+
+impl AliasTable {
+    /// Build from non-negative weights. Panics if `weights` is empty.
+    pub fn new(weights: &[f32]) -> Self {
+        let n = weights.len();
+        assert!(n > 0, "AliasTable requires at least one weight");
+
+        let sum: f32 = weights.iter().sum();
+        // Scale weights so that each bin's expected share is 1.0.
+        let mut scaled: Vec<f32> = if sum > 0.0 {
+            weights.iter().map(|&w| w * n as f32 / sum).collect()
+        } else {
+            vec![1.0; n] // degenerate: uniform fallback
+        };
+
+        let mut prob = vec![0.0f32; n];
+        let mut alias = vec![0u32; n];
+
+        // Partition into under-full (< 1) and over-full (>= 1) bins.
+        let mut small: Vec<usize> = Vec::with_capacity(n);
+        let mut large: Vec<usize> = Vec::with_capacity(n);
+        for (i, &s) in scaled.iter().enumerate() {
+            if s < 1.0 { small.push(i); } else { large.push(i); }
+        }
+
+        while !small.is_empty() && !large.is_empty() {
+            let l = small.pop().unwrap();
+            let g = *large.last().unwrap();
+            prob[l] = scaled[l];
+            alias[l] = g as u32;
+            scaled[g] -= 1.0 - scaled[l];
+            if scaled[g] < 1.0 {
+                large.pop();
+                small.push(g);
+            }
+        }
+        // Remaining bins have probability 1 (floating-point rounding residuals).
+        for l in small { prob[l] = 1.0; }
+        for g in large { prob[g] = 1.0; }
+
+        Self { prob, alias }
+    }
+
+    /// O(1) discrete sample. `u` must be in `[0, 1)`.
+    #[inline]
+    pub fn sample(&self, u: f32) -> usize {
+        let n = self.prob.len();
+        let scaled = u * n as f32;
+        let i = (scaled as usize).min(n - 1);
+        let frac = scaled - i as f32;
+        if frac < self.prob[i] { i } else { self.alias[i] as usize }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.prob.len()
+    }
+}
 
 /// 1D piecewise-constant distribution over `n` bins. The CDF is normalized
 /// (`cdf[n] == 1`); `integral` is the un-normalized sum of the input function.
