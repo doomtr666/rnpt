@@ -87,8 +87,7 @@ impl Texture {
         let c01 = get(x0, y1);
         let c11 = get(x1, y1);
 
-        (c00 * (1.0 - tx) + c10 * tx) * (1.0 - ty)
-            + (c01 * (1.0 - tx) + c11 * tx) * ty
+        (c00 * (1.0 - tx) + c10 * tx) * (1.0 - ty) + (c01 * (1.0 - tx) + c11 * tx) * ty
     }
 }
 

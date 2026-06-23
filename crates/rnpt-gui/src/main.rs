@@ -547,6 +547,11 @@ impl eframe::App for RnptGuiApp {
                 ui.add_space(4.0);
                 let prev_strategy = self.strategy;
                 ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.strategy,
+                        rnpt::SamplingStrategy::ReStirDi,
+                        "ReSTIR",
+                    );
                     ui.selectable_value(&mut self.strategy, rnpt::SamplingStrategy::Mis, "MIS");
                     ui.selectable_value(&mut self.strategy, rnpt::SamplingStrategy::NeeOnly, "NEE");
                     ui.selectable_value(

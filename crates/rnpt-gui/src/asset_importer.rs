@@ -133,20 +133,31 @@ pub fn import_scene<P: AsRef<Path>>(
         .par_iter()
         .enumerate()
         .map(|(idx, img)| {
-            let lut = if linear_images.contains(&idx) { &linear_lut } else { &srgb_lut };
+            let lut = if linear_images.contains(&idx) {
+                &linear_lut
+            } else {
+                &srgb_lut
+            };
             let bytes = &img.pixels;
             let pixels: Vec<rnpt::Color> = match img.format {
                 gltf::image::Format::R8G8B8 => bytes
                     .chunks_exact(3)
-                    .map(|p| rnpt::Color::new(lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]))
+                    .map(|p| {
+                        rnpt::Color::new(lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize])
+                    })
                     .collect(),
                 gltf::image::Format::R8G8B8A8 => bytes
                     .chunks_exact(4)
-                    .map(|p| rnpt::Color::new(lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]))
+                    .map(|p| {
+                        rnpt::Color::new(lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize])
+                    })
                     .collect(),
                 gltf::image::Format::R8 => bytes
                     .iter()
-                    .map(|&b| { let l = lut[b as usize]; rnpt::Color::new(l, l, l) })
+                    .map(|&b| {
+                        let l = lut[b as usize];
+                        rnpt::Color::new(l, l, l)
+                    })
                     .collect(),
                 gltf::image::Format::R8G8 => bytes
                     .chunks_exact(2)
@@ -157,7 +168,11 @@ pub fn import_scene<P: AsRef<Path>>(
                     vec![rnpt::Color::new(1.0, 0.0, 1.0); (img.width * img.height) as usize]
                 }
             };
-            rnpt::Texture { width: img.width, height: img.height, pixels }
+            rnpt::Texture {
+                width: img.width,
+                height: img.height,
+                pixels,
+            }
         })
         .collect();
     stats.texture_decode_ms = t_tex.elapsed().as_millis() as u64;
@@ -178,7 +193,8 @@ pub fn import_scene<P: AsRef<Path>>(
         // gltf crate returns Some(cutoff) for Mask mode, None for Opaque/Blend.
         let alpha_cutoff = mat.alpha_cutoff();
 
-        let transmission = mat.transmission()
+        let transmission = mat
+            .transmission()
             .map(|t| t.transmission_factor())
             .unwrap_or(0.0);
         let ior = mat.ior().unwrap_or(1.5);
@@ -198,15 +214,19 @@ pub fn import_scene<P: AsRef<Path>>(
         materials.push(Material {
             albedo: Color::from([base_color[0], base_color[1], base_color[2]]),
             emissive,
-            albedo_texture: pbr.base_color_texture()
+            albedo_texture: pbr
+                .base_color_texture()
                 .map(|info| info.texture().source().index() as u32),
-            emissive_texture: mat.emissive_texture()
+            emissive_texture: mat
+                .emissive_texture()
                 .map(|info| info.texture().source().index() as u32),
             metallic: pbr.metallic_factor(),
             roughness: pbr.roughness_factor(),
-            metallic_roughness_texture: pbr.metallic_roughness_texture()
+            metallic_roughness_texture: pbr
+                .metallic_roughness_texture()
                 .map(|info| info.texture().source().index() as u32),
-            normal_texture: mat.normal_texture()
+            normal_texture: mat
+                .normal_texture()
                 .map(|info| info.texture().source().index() as u32),
             normal_scale: mat.normal_texture().map(|info| info.scale()).unwrap_or(1.0),
             alpha_cutoff,
@@ -360,7 +380,8 @@ pub fn import_scene<P: AsRef<Path>>(
 
             // Convert glTF intensity (Candelas/Lux) back to Blender's intuitive Watts/Strength
             let color = Color::from(gltf_light.color());
-            let punctual_intensity = gltf_light.intensity() / (683.0 / (4.0 * std::f32::consts::PI));
+            let punctual_intensity =
+                gltf_light.intensity() / (683.0 / (4.0 * std::f32::consts::PI));
             let light = match gltf_light.kind() {
                 gltf::khr_lights_punctual::Kind::Directional => Light::Directional {
                     direction: dir,

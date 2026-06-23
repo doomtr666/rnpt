@@ -1,4 +1,4 @@
-use crate::{PathTracer, PathTracerConfig, Pixel};
+use crate::{PathTracer, PathTracerConfig, Pixel, Reservoir, SamplingStrategy};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -30,10 +30,34 @@ impl UnsafePixelBuffer {
     }
 }
 
+/// Per-pixel reservoir buffer for ReSTIR DI, with the same ownership model as
+/// `UnsafePixelBuffer`: each thread accesses a disjoint set of indices.
+struct UnsafeReservoirBuffer {
+    ptr: *mut Reservoir,
+    #[allow(dead_code)]
+    len: usize,
+}
+
+unsafe impl Send for UnsafeReservoirBuffer {}
+unsafe impl Sync for UnsafeReservoirBuffer {}
+
+impl UnsafeReservoirBuffer {
+    fn new(ptr: *mut Reservoir, len: usize) -> Self {
+        Self { ptr, len }
+    }
+
+    #[inline(always)]
+    unsafe fn get_mut(&self, index: usize) -> &mut Reservoir {
+        unsafe { &mut *self.ptr.add(index) }
+    }
+}
+
 pub struct ParallelTracer {
     config: Arc<Mutex<PathTracerConfig>>,
     epoch: Arc<AtomicU32>,
-    pixels: Vec<Pixel>, // The actual memory allocation
+    pixels: Vec<Pixel>,         // owned pixel buffer; threads hold raw pointers into this
+    #[allow(dead_code)]
+    reservoirs: Vec<Reservoir>, // per-pixel ReSTIR DI reservoir; same lifetime as pixels
     threads: Vec<thread::JoinHandle<()>>,
 
     // Performance metrics
@@ -54,6 +78,10 @@ impl ParallelTracer {
         let buffer_ptr = pixels.as_mut_ptr();
         let shared_buffer = Arc::new(UnsafePixelBuffer::new(buffer_ptr, num_pixels));
 
+        let mut reservoirs = vec![Reservoir::default(); num_pixels];
+        let res_ptr = reservoirs.as_mut_ptr();
+        let shared_reservoirs = Arc::new(UnsafeReservoirBuffer::new(res_ptr, num_pixels));
+
         let config = Arc::new(Mutex::new(config));
         let epoch = Arc::new(AtomicU32::new(1));
         let total_rays = Arc::new(AtomicU64::new(0));
@@ -68,6 +96,7 @@ impl ParallelTracer {
 
         for thread_idx in 0..num_threads {
             let buffer = shared_buffer.clone();
+            let reservoir_buffer = shared_reservoirs.clone();
             let config_mutex = config.clone();
             let epoch_atomic = epoch.clone();
             let rays_atomic = total_rays.clone();
@@ -80,6 +109,7 @@ impl ParallelTracer {
                     thread_idx,
                     num_threads,
                     buffer,
+                    reservoir_buffer,
                     config_mutex,
                     epoch_atomic,
                     rays_atomic,
@@ -94,6 +124,7 @@ impl ParallelTracer {
             config,
             epoch,
             pixels,
+            reservoirs,
             threads,
             total_rays,
             total_real_rays,
@@ -141,6 +172,7 @@ impl ParallelTracer {
         thread_idx: usize,
         num_threads: usize,
         buffer: Arc<UnsafePixelBuffer>,
+        reservoir_buffer: Arc<UnsafeReservoirBuffer>,
         config_mutex: Arc<Mutex<PathTracerConfig>>,
         epoch_atomic: Arc<AtomicU32>,
         rays_atomic: Arc<AtomicU64>,
@@ -149,7 +181,8 @@ impl ParallelTracer {
         running_atomic: Arc<AtomicBool>,
     ) {
         let mut local_epoch = 0;
-        let mut path_tracer = None;
+        let mut path_tracer: Option<PathTracer> = None;
+        let mut use_restir = false;
         let mut width = 0;
         let mut height = 0;
 
@@ -168,12 +201,15 @@ impl ParallelTracer {
                 let cfg = config_mutex.lock().unwrap().clone();
                 width = cfg.width;
                 height = cfg.height;
-                path_tracer = Some(PathTracer::new(cfg));
+                let tracer = PathTracer::new(cfg);
+                use_restir = tracer.strategy() == SamplingStrategy::ReStirDi;
+                path_tracer = Some(tracer);
 
-                // Clear the pixels assigned to this thread
+                // Clear the pixels and reservoirs assigned to this thread
                 for i in (thread_idx..buffer.len).step_by(num_threads) {
                     unsafe {
                         *buffer.get_mut(i) = Pixel::default();
+                        *reservoir_buffer.get_mut(i) = Reservoir::default();
                     }
                 }
             }
@@ -234,7 +270,12 @@ impl ParallelTracer {
 
                         unsafe {
                             let pixel = buffer.get_mut(i);
-                            let (r, s) = tracer.sample_pixel(x, y, pixel);
+                            let (r, s) = if use_restir {
+                                let res = reservoir_buffer.get_mut(i);
+                                tracer.sample_pixel_restir(x, y, pixel, res)
+                            } else {
+                                tracer.sample_pixel(x, y, pixel)
+                            };
                             real_rays_traced += r;
                             shadow_rays_traced += s;
                         }
