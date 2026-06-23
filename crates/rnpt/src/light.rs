@@ -234,27 +234,30 @@ impl Light {
                 pdf: 1.0,
             }),
             Light::Area(mesh) => {
-                let s = mesh.sample(rng, textures);
-                let to = s.p - x;
+                // Phase 1: geometry only — check backface BEFORE the texture lookup.
+                let geom = mesh.sample_geom(rng);
+                let to = geom.p - x;
                 let d2 = to.norm_squared();
                 if d2 <= 0.0 {
                     return None;
                 }
                 let dist = d2.sqrt();
                 let wi = to / dist;
-                let cos_l = s.normal.dot(&(-wi));
+                let cos_l = geom.normal.dot(&(-wi));
                 if cos_l <= 0.0 {
                     return None; // emitter back-facing the shading point
                 }
+                // Phase 2: emissive texture — only reached for front-facing samples.
+                let le = mesh.le_at(&geom, textures);
                 // area-measure pdf -> solid-angle pdf
-                let pdf = s.pdf_area * d2 / cos_l;
+                let pdf = geom.pdf_area * d2 / cos_l;
                 if pdf <= 0.0 {
                     return None;
                 }
                 Some(LightSample {
                     wi,
                     distance: dist,
-                    li: s.le,
+                    li: le,
                     pdf,
                 })
             }

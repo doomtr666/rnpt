@@ -154,15 +154,26 @@ fn schlick(f0: Color, cos_h: f32) -> Color {
 /// GGX NDF — D(cos_n_h, a²).
 #[inline]
 fn ggx_d(cos_n_h: f32, a2: f32) -> f32 {
-    let d = cos_n_h * cos_n_h * (a2 - 1.0) + 1.0;
+    let d = (cos_n_h * (a2 - 1.0)).mul_add(cos_n_h, 1.0);
     a2 / (PI * d * d)
 }
 
 /// Smith masking function G₁ (uncorrelated Schlick-GGX).
 #[inline]
 fn smith_g1(cos_theta: f32, a2: f32) -> f32 {
-    let denom = cos_theta + (a2 + (1.0 - a2) * cos_theta * cos_theta).sqrt();
+    let denom = cos_theta + ((1.0 - a2) * cos_theta).mul_add(cos_theta, a2).sqrt();
     2.0 * cos_theta / denom
+}
+
+/// G₁(o)·G₁(i) / (4·cosₒ·cosᵢ) in one pass — avoids redundant sqrt and divides.
+/// smith_g1(x) = 2x / (x + sqrt(a2 + (1-a2)·x²))
+/// ⟹ G1(o)·G1(i) / (4·cosₒ·cosᵢ) = 1 / (denom_o · denom_i)
+#[inline]
+fn smith_g2_over_denom4(cos_o: f32, cos_i: f32, a2: f32) -> f32 {
+    let one_minus_a2 = 1.0 - a2;
+    let denom_o = cos_o + ((one_minus_a2 * cos_o).mul_add(cos_o, a2)).sqrt();
+    let denom_i = cos_i + ((one_minus_a2 * cos_i).mul_add(cos_i, a2)).sqrt();
+    1.0 / (denom_o * denom_i)
 }
 
 /// Builds (tangent, bitangent) orthonormal to `n` via Frisvad.
@@ -211,10 +222,8 @@ impl Brdf {
                 let f0 = Color::new(0.04, 0.04, 0.04) * (1.0 - *metallic) + *albedo * *metallic;
                 let f = schlick(f0, cos_h_o);
                 let d = ggx_d(cos_n_h, a2);
-                let g = smith_g1(cos_n_o, a2) * smith_g1(cos_n_i, a2);
-
-                let denom = (4.0 * cos_n_o * cos_n_i).max(1e-7);
-                let f_spec = f * (d * g / denom);
+                let g_over_d = smith_g2_over_denom4(cos_n_o, cos_n_i, a2);
+                let f_spec = f * (d * g_over_d);
 
                 // Diffuse: no energy from the specular Fresnel, none for metals.
                 let kd = (Color::new(1.0, 1.0, 1.0) - f) * (1.0 - *metallic);
@@ -252,6 +261,51 @@ impl Brdf {
                 let pdf_diff = cos_n_i / PI;
 
                 p_spec * pdf_spec + (1.0 - p_spec) * pdf_diff
+            }
+        }
+    }
+
+    /// Combined f_r + pdf in one pass — avoids recomputing half-vector and GGX terms
+    /// when both are needed (e.g. RIS loops, BRDF sampling).
+    pub fn eval_and_pdf(
+        &self,
+        normal: &UnitVector3<f32>,
+        wo: &Vector3<f32>,
+        wi: &Vector3<f32>,
+    ) -> (Color, f32) {
+        match self {
+            Brdf::Lambertian { albedo } => {
+                let cos_n_i = normal.dot(wi).max(0.0);
+                (albedo / PI, cos_n_i / PI)
+            }
+            Brdf::CookTorrance { albedo, metallic, roughness } => {
+                let cos_n_i = normal.dot(wi);
+                let cos_n_o = normal.dot(wo);
+                if cos_n_i <= 0.0 || cos_n_o <= 0.0 {
+                    return (Color::zeros(), 0.0);
+                }
+
+                let h = (*wo + *wi).normalize();
+                let cos_n_h = normal.dot(&h).max(0.0);
+                let cos_h_o = h.dot(wo).max(0.0);
+
+                let alpha = (*roughness * *roughness).max(0.001_f32);
+                let a2 = alpha * alpha;
+
+                let f0 = Color::new(0.04, 0.04, 0.04) * (1.0 - *metallic) + *albedo * *metallic;
+                let f = schlick(f0, cos_h_o);
+                let d = ggx_d(cos_n_h, a2);
+                let g_over_d = smith_g2_over_denom4(cos_n_o, cos_n_i, a2);
+                let f_spec = f * (d * g_over_d);
+
+                let kd = (Color::new(1.0, 1.0, 1.0) - f) * (1.0 - *metallic);
+                let brdf_val = kd.component_mul(albedo) / PI + f_spec;
+
+                let p_s = spec_prob(f0);
+                let pdf_spec = if cos_h_o > 1e-7 { d * cos_n_h / (4.0 * cos_h_o) } else { 0.0 };
+                let pdf_val = p_s * pdf_spec + (1.0 - p_s) * cos_n_i / PI;
+
+                (brdf_val, pdf_val)
             }
         }
     }
@@ -315,9 +369,8 @@ impl Brdf {
                     wi
                 };
 
-                // Combined f and pdf (MIS mixture over both lobes).
-                let f = self.eval(normal, wo, &wi);
-                let pdf = self.pdf(normal, wo, &wi);
+                // Combined f and pdf (MIS mixture over both lobes) — fused to share GGX terms.
+                let (f, pdf) = self.eval_and_pdf(normal, wo, &wi);
                 if pdf <= 0.0 {
                     return None;
                 }

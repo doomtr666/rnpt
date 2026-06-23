@@ -477,16 +477,16 @@ impl PathTracer {
             }
             
             // p_hat = lum(brdf * L_i * cos_s)
-            let f = brdf.eval(normal, wo, &ls.wi);
+            // For non-delta lights eval+pdf share half-vector and GGX terms — use the fused path.
+            let (f, p_b) = if self.config.lights[idx.min(n - 1)].is_delta() {
+                (brdf.eval(normal, wo, &ls.wi), 0.0_f32)
+            } else {
+                brdf.eval_and_pdf(normal, wo, &ls.wi)
+            };
             let unshadowed = f.component_mul(&ls.li) * cos_s;
             let p_hat = 0.2126 * unshadowed.x + 0.7152 * unshadowed.y + 0.0722 * unshadowed.z;
 
             let p_l = ls.pdf / n as f32;
-            let p_b = if self.config.lights[idx.min(n - 1)].is_delta() {
-                0.0
-            } else {
-                brdf.pdf(normal, wo, &ls.wi)
-            };
 
             let p_combined = w_l_factor * p_l + w_b_factor * p_b;
             let w = if p_combined > 0.0 { p_hat / p_combined } else { 0.0 };

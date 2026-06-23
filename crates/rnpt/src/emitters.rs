@@ -25,6 +25,17 @@ pub struct MeshEmitter {
     emissive_texture: Option<u32>,
 }
 
+/// Geometric sample on an area light — position and normal only, no texture evaluation.
+/// Used for deferred emissive lookup: check backface/distance before paying for bilinear fetch.
+pub struct EmitterGeomSample {
+    pub p: Point3<f32>,
+    pub normal: UnitVector3<f32>,
+    pub tri_idx: usize,
+    pub u: f32,
+    pub v: f32,
+    pub pdf_area: f32,
+}
+
 /// Result of sampling a point on an area light.
 pub struct EmitterSample {
     pub p: Point3<f32>,
@@ -67,6 +78,42 @@ impl MeshEmitter {
     #[inline]
     pub fn total_area(&self) -> f32 {
         self.total_area
+    }
+
+    /// Geometry-only sample: triangle selection + barycentric, no texture lookup.
+    /// Call `le_at()` afterwards — only if the sample passes backface/distance tests.
+    pub fn sample_geom(&self, rng: &mut Pcg32) -> EmitterGeomSample {
+        let xi = rng.next_f32();
+        let tri_idx = self
+            .cdf
+            .partition_point(|&c| c < xi)
+            .min(self.tris.len() - 1);
+        let tri = &self.tris[tri_idx];
+
+        let mut u = rng.next_f32();
+        let mut v = rng.next_f32();
+        if u + v > 1.0 {
+            u = 1.0 - u;
+            v = 1.0 - v;
+        }
+        let w = 1.0 - u - v;
+        let p = Point3::from(tri.v0.coords * w + tri.v1.coords * u + tri.v2.coords * v);
+
+        EmitterGeomSample { p, normal: tri.normal, tri_idx, u, v, pdf_area: 1.0 / self.total_area }
+    }
+
+    /// Evaluate emitted radiance at a previously sampled geometry point.
+    pub fn le_at(&self, s: &EmitterGeomSample, textures: &[Texture]) -> Color {
+        let tri = &self.tris[s.tri_idx];
+        let w = 1.0 - s.u - s.v;
+        let mut le = self.emissive;
+        if let Some(tex_idx) = self.emissive_texture {
+            if (tex_idx as usize) < textures.len() {
+                let uv = tri.uv0 * w + tri.uv1 * s.u + tri.uv2 * s.v;
+                le = le.component_mul(&textures[tex_idx as usize].sample_bilinear(uv));
+            }
+        }
+        le
     }
 
     /// Area-weighted sample of a point on the mesh. `pdf_area = 1 / total_area`
