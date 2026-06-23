@@ -63,20 +63,29 @@ pub struct InternalRay {
     pub origin: Point3<f32>,
     pub direction: UnitVector3<f32>,
     pub inv_direction: Vector3<f32>,
+    /// -origin * inv_direction, precomputed for FMA in AABB slab test
+    pub neg_o_inv: Vector3<f32>,
     pub tmin: f32,
     pub tmax: f32,
 }
 
 impl InternalRay {
     pub fn new(origin: Point3<f32>, direction: UnitVector3<f32>, tmin: f32, tmax: f32) -> Self {
+        let inv_direction = Vector3::new(
+            1.0 / direction.x,
+            1.0 / direction.y,
+            1.0 / direction.z,
+        );
+        let neg_o_inv = Vector3::new(
+            -origin.x * inv_direction.x,
+            -origin.y * inv_direction.y,
+            -origin.z * inv_direction.z,
+        );
         Self {
             origin,
             direction,
-            inv_direction: Vector3::new(
-                1.0 / direction.x,
-                1.0 / direction.y,
-                1.0 / direction.z,
-            ),
+            inv_direction,
+            neg_o_inv,
             tmin,
             tmax,
         }
@@ -102,10 +111,10 @@ impl InternalRay {
         let dir_y = f32x8::splat(self.direction.y);
         let dir_z = f32x8::splat(self.direction.z);
 
-        let h_x = dir_y * e2_z - dir_z * e2_y;
-        let h_y = dir_z * e2_x - dir_x * e2_z;
-        let h_z = dir_x * e2_y - dir_y * e2_x;
-        let det = e1_x * h_x + e1_y * h_y + e1_z * h_z;
+        let h_x = dir_y.mul_add(e2_z, -(dir_z * e2_y));
+        let h_y = dir_z.mul_add(e2_x, -(dir_x * e2_z));
+        let h_z = dir_x.mul_add(e2_y, -(dir_y * e2_x));
+        let det = e1_z.mul_add(h_z, e1_y.mul_add(h_y, e1_x * h_x));
 
         let epsilon = f32x8::splat(1e-7);
         // For double-sided triangles, also accept backface hits (det <= -epsilon).
@@ -119,25 +128,21 @@ impl InternalRay {
         let det_mask = det.simd_ge(epsilon) | (ds & det.simd_le(-epsilon));
         let inv_det = f32x8::splat(1.0) / det;
 
-        let origin_x = f32x8::splat(self.origin.x);
-        let origin_y = f32x8::splat(self.origin.y);
-        let origin_z = f32x8::splat(self.origin.z);
+        let s_x = f32x8::splat(self.origin.x) - v0_x;
+        let s_y = f32x8::splat(self.origin.y) - v0_y;
+        let s_z = f32x8::splat(self.origin.z) - v0_z;
 
-        let s_x = origin_x - v0_x;
-        let s_y = origin_y - v0_y;
-        let s_z = origin_z - v0_z;
-
-        let u = inv_det * (s_x * h_x + s_y * h_y + s_z * h_z);
+        let u = inv_det * s_z.mul_add(h_z, s_y.mul_add(h_y, s_x * h_x));
         let u_mask = u.simd_ge(f32x8::ZERO) & u.simd_le(f32x8::splat(1.0));
 
-        let q_x = s_y * e1_z - s_z * e1_y;
-        let q_y = s_z * e1_x - s_x * e1_z;
-        let q_z = s_x * e1_y - s_y * e1_x;
+        let q_x = s_y.mul_add(e1_z, -(s_z * e1_y));
+        let q_y = s_z.mul_add(e1_x, -(s_x * e1_z));
+        let q_z = s_x.mul_add(e1_y, -(s_y * e1_x));
 
-        let v = inv_det * (dir_x * q_x + dir_y * q_y + dir_z * q_z);
+        let v = inv_det * dir_z.mul_add(q_z, dir_y.mul_add(q_y, dir_x * q_x));
         let uv_mask = v.simd_ge(f32x8::ZERO) & (u + v).simd_le(f32x8::splat(1.0));
 
-        let t = inv_det * (e2_x * q_x + e2_y * q_y + e2_z * q_z);
+        let t = inv_det * e2_z.mul_add(q_z, e2_y.mul_add(q_y, e2_x * q_x));
         let tmin_mask = t.simd_ge(f32x8::splat(self.tmin));
         let tmax_mask = t.simd_le(f32x8::splat(current_t_max));
 
@@ -183,10 +188,10 @@ impl InternalRay {
         let dir_y = f32x8::splat(self.direction.y);
         let dir_z = f32x8::splat(self.direction.z);
 
-        let h_x = dir_y * e2_z - dir_z * e2_y;
-        let h_y = dir_z * e2_x - dir_x * e2_z;
-        let h_z = dir_x * e2_y - dir_y * e2_x;
-        let det = e1_x * h_x + e1_y * h_y + e1_z * h_z;
+        let h_x = dir_y.mul_add(e2_z, -(dir_z * e2_y));
+        let h_y = dir_z.mul_add(e2_x, -(dir_x * e2_z));
+        let h_z = dir_x.mul_add(e2_y, -(dir_y * e2_x));
+        let det = e1_z.mul_add(h_z, e1_y.mul_add(h_y, e1_x * h_x));
         let ds = {
             let t = f32::from_bits(u32::MAX);
             f32x8::from(std::array::from_fn::<f32, 8, _>(|i| {
@@ -201,17 +206,17 @@ impl InternalRay {
         let s_y = f32x8::splat(self.origin.y) - v0_y;
         let s_z = f32x8::splat(self.origin.z) - v0_z;
 
-        let u = inv_det * (s_x * h_x + s_y * h_y + s_z * h_z);
+        let u = inv_det * s_z.mul_add(h_z, s_y.mul_add(h_y, s_x * h_x));
         let u_mask = u.simd_ge(f32x8::ZERO) & u.simd_le(f32x8::splat(1.0));
 
-        let q_x = s_y * e1_z - s_z * e1_y;
-        let q_y = s_z * e1_x - s_x * e1_z;
-        let q_z = s_x * e1_y - s_y * e1_x;
+        let q_x = s_y.mul_add(e1_z, -(s_z * e1_y));
+        let q_y = s_z.mul_add(e1_x, -(s_x * e1_z));
+        let q_z = s_x.mul_add(e1_y, -(s_y * e1_x));
 
-        let v = inv_det * (dir_x * q_x + dir_y * q_y + dir_z * q_z);
+        let v = inv_det * dir_z.mul_add(q_z, dir_y.mul_add(q_y, dir_x * q_x));
         let uv_mask = v.simd_ge(f32x8::ZERO) & (u + v).simd_le(f32x8::splat(1.0));
 
-        let t = inv_det * (e2_x * q_x + e2_y * q_y + e2_z * q_z);
+        let t = inv_det * e2_z.mul_add(q_z, e2_y.mul_add(q_y, e2_x * q_x));
         let tmin_mask = t.simd_ge(f32x8::splat(self.tmin));
         let tmax_mask = t.simd_le(f32x8::splat(t_max));
 
@@ -228,25 +233,26 @@ impl InternalRay {
         let p_max_y = f32x8::from(node.p_max_y);
         let p_max_z = f32x8::from(node.p_max_z);
 
-        let origin_x = f32x8::splat(self.origin.x);
-        let origin_y = f32x8::splat(self.origin.y);
-        let origin_z = f32x8::splat(self.origin.z);
         let inv_dir_x = f32x8::splat(self.inv_direction.x);
         let inv_dir_y = f32x8::splat(self.inv_direction.y);
         let inv_dir_z = f32x8::splat(self.inv_direction.z);
+        let nox = f32x8::splat(self.neg_o_inv.x);
+        let noy = f32x8::splat(self.neg_o_inv.y);
+        let noz = f32x8::splat(self.neg_o_inv.z);
 
-        let t0_x = (p_min_x - origin_x) * inv_dir_x;
-        let t1_x = (p_max_x - origin_x) * inv_dir_x;
+        // t = (p - origin) * inv_dir = p.mul_add(inv_dir, -origin*inv_dir)
+        let t0_x = p_min_x.mul_add(inv_dir_x, nox);
+        let t1_x = p_max_x.mul_add(inv_dir_x, nox);
         let tmin_x = t0_x.fast_min(t1_x);
         let tmax_x = t0_x.fast_max(t1_x);
 
-        let t0_y = (p_min_y - origin_y) * inv_dir_y;
-        let t1_y = (p_max_y - origin_y) * inv_dir_y;
+        let t0_y = p_min_y.mul_add(inv_dir_y, noy);
+        let t1_y = p_max_y.mul_add(inv_dir_y, noy);
         let tmin_y = tmin_x.fast_max(t0_y.fast_min(t1_y));
         let tmax_y = tmax_x.fast_min(t0_y.fast_max(t1_y));
 
-        let t0_z = (p_min_z - origin_z) * inv_dir_z;
-        let t1_z = (p_max_z - origin_z) * inv_dir_z;
+        let t0_z = p_min_z.mul_add(inv_dir_z, noz);
+        let t1_z = p_max_z.mul_add(inv_dir_z, noz);
         let tmin_z = tmin_y
             .fast_max(t0_z.fast_min(t1_z))
             .fast_max(f32x8::splat(self.tmin));
