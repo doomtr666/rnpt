@@ -510,6 +510,12 @@ impl PathTracer {
         }
 
         // RIS: generate M candidates from BRDF, stream into reservoir.
+        // p_l below is the probability that the alias-table light stream would have
+        // generated the same direction — needed for the balance-heuristic denominator.
+        //   Triangle hit: p_l = (area×lum/W_total) × (1/area) × dist²/cos_l
+        //                     = lum(li) × dist² / (W_total × cos_l)   [area cancels]
+        //   Env hit:      p_l = (avg_lum/W_total) × env_pdf(wi)
+        let restir_total_w = self.config.restir_alias.total_weight();
         for _ in 0..RESTIR_M_BRDF {
             let Some(bs) = brdf.sample(normal, wo, rng) else {
                 r.m += 1;
@@ -532,15 +538,19 @@ impl PathTracer {
                     li = surf.emissive;
                     distance = hit.hit.t;
                     let cos_l = surf.geo_normal.dot(&(-bs.wi)).max(0.0);
-                    if let Some(light) = self.config.lights.get(hit.light as usize) {
-                        p_l = light.area_pdf(distance * distance, cos_l) / n_restir as f32;
+                    if cos_l > 0.0 && restir_total_w > 0.0 {
+                        let mat = &self.config.scene.materials[hit.material as usize];
+                        let base_lum = (0.2126 * mat.emissive.x + 0.7152 * mat.emissive.y + 0.0722 * mat.emissive.z).max(1e-6);
+                        p_l = base_lum * distance * distance / (restir_total_w * cos_l);
                     }
                 }
             } else {
                 if let Some(env_idx) = self.config.env {
                     let env = &self.config.lights[env_idx];
                     li = env.radiance(&bs.wi);
-                    p_l = env.env_pdf(&bs.wi) / n_restir as f32;
+                    if restir_total_w > 0.0 {
+                        p_l = env.average_luminance().max(1e-6) / restir_total_w * env.env_pdf(&bs.wi);
+                    }
                 }
             }
 

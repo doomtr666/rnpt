@@ -11,9 +11,10 @@
 /// hot path. Replaces a CDF `partition_point` (O(log n)) for discrete distributions.
 #[derive(Clone, Debug)]
 pub struct AliasTable {
-    prob: Vec<f32>,       // probability of choosing index i directly (vs alias[i])
-    alias: Vec<u32>,      // alternative index when U > prob[i]
-    source_pdf: Vec<f32>, // normalized weight[i]/sum — true sampling probability per entry
+    prob: Vec<f32>,         // probability of choosing index i directly (vs alias[i])
+    alias: Vec<u32>,        // alternative index when U > prob[i]
+    source_pdf: Vec<f32>,   // normalized weight[i]/sum — true sampling probability per entry
+    total_weight: f32,      // un-normalized sum of all weights (used to reconstruct p_l)
 }
 
 impl AliasTable {
@@ -60,7 +61,7 @@ impl AliasTable {
         for l in small { prob[l] = 1.0; }
         for g in large { prob[g] = 1.0; }
 
-        Self { prob, alias, source_pdf }
+        Self { prob, alias, source_pdf, total_weight: sum }
     }
 
     /// O(1) discrete sample. `u` must be in `[0, 1)`.
@@ -77,6 +78,12 @@ impl AliasTable {
     #[inline]
     pub fn entry_pdf(&self, i: usize) -> f32 {
         self.source_pdf[i]
+    }
+
+    /// Un-normalized sum of all weights passed to `new()`.
+    #[inline]
+    pub fn total_weight(&self) -> f32 {
+        self.total_weight
     }
 
     #[inline]

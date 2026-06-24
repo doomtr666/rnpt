@@ -158,6 +158,14 @@ impl Light {
         )
     }
 
+    /// Average luminance over the light (for restir weight lookup from the BRDF stream).
+    pub fn average_luminance(&self) -> f32 {
+        match self {
+            Light::Environment(env) => env.average_luminance(),
+            _ => 0.0,
+        }
+    }
+
     /// Solid-angle pdf this light assigns to a direction — non-zero only for the
     /// environment, for the MIS weight when a BRDF ray escapes into it.
     pub fn env_pdf(&self, dir: &Vector3<f32>) -> f32 {
