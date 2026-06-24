@@ -159,6 +159,7 @@ impl RnptGuiApp {
         };
 
         let strategy = rnpt::SamplingStrategy::Mis;
+        let (restir_lights_vec, restir_alias) = rnpt::build_restir_lights(&lights);
         let config = rnpt::PathTracerConfig {
             width,
             height,
@@ -168,6 +169,8 @@ impl RnptGuiApp {
             lights,
             env: None,
             strategy,
+            restir_lights: std::sync::Arc::new(restir_lights_vec),
+            restir_alias: std::sync::Arc::new(restir_alias),
         };
 
         let tracer = Some(rnpt::ParallelTracer::new(config));
@@ -249,6 +252,7 @@ impl RnptGuiApp {
             }
         };
         let (lights, env) = with_env(&lights, &self.env);
+        let (restir_lights_vec, restir_alias) = rnpt::build_restir_lights(&lights);
 
         let config = rnpt::PathTracerConfig {
             width: self.resolution[0],
@@ -259,6 +263,8 @@ impl RnptGuiApp {
             lights,
             env,
             strategy: self.strategy,
+            restir_lights: std::sync::Arc::new(restir_lights_vec),
+            restir_alias: std::sync::Arc::new(restir_alias),
         };
 
         // Always recreate tracer to ensure clean memory state and no race conditions

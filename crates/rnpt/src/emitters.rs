@@ -13,6 +13,13 @@ pub struct EmitterTri {
     pub normal: UnitVector3<f32>, // geometric normal = normalize(cross(e1, e2))
 }
 
+impl EmitterTri {
+    #[inline]
+    pub fn area(&self) -> f32 {
+        0.5 * (self.v1 - self.v0).cross(&(self.v2 - self.v0)).norm()
+    }
+}
+
 /// One emissive mesh instance = one area light. Triangles are sampled
 /// area-weighted within the mesh, so the area-measure pdf is constant
 /// (`1 / total_area`).
@@ -75,6 +82,21 @@ impl MeshEmitter {
     #[inline]
     pub fn total_area(&self) -> f32 {
         self.total_area
+    }
+
+    #[inline]
+    pub fn tris(&self) -> &[EmitterTri] {
+        &self.tris
+    }
+
+    #[inline]
+    pub fn emissive(&self) -> Color {
+        self.emissive
+    }
+
+    #[inline]
+    pub fn emissive_texture(&self) -> Option<u32> {
+        self.emissive_texture
     }
 
     /// Geometry-only sample: O(1) triangle selection + barycentric, no texture lookup.

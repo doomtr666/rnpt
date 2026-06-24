@@ -11,8 +11,9 @@
 /// hot path. Replaces a CDF `partition_point` (O(log n)) for discrete distributions.
 #[derive(Clone, Debug)]
 pub struct AliasTable {
-    prob: Vec<f32>,  // probability of choosing index i directly (vs alias[i])
-    alias: Vec<u32>, // alternative index when U > prob[i]
+    prob: Vec<f32>,       // probability of choosing index i directly (vs alias[i])
+    alias: Vec<u32>,      // alternative index when U > prob[i]
+    source_pdf: Vec<f32>, // normalized weight[i]/sum — true sampling probability per entry
 }
 
 impl AliasTable {
@@ -22,6 +23,11 @@ impl AliasTable {
         assert!(n > 0, "AliasTable requires at least one weight");
 
         let sum: f32 = weights.iter().sum();
+        let source_pdf: Vec<f32> = if sum > 0.0 {
+            weights.iter().map(|&w| w / sum).collect()
+        } else {
+            vec![1.0 / n as f32; n]
+        };
         // Scale weights so that each bin's expected share is 1.0.
         let mut scaled: Vec<f32> = if sum > 0.0 {
             weights.iter().map(|&w| w * n as f32 / sum).collect()
@@ -54,7 +60,7 @@ impl AliasTable {
         for l in small { prob[l] = 1.0; }
         for g in large { prob[g] = 1.0; }
 
-        Self { prob, alias }
+        Self { prob, alias, source_pdf }
     }
 
     /// O(1) discrete sample. `u` must be in `[0, 1)`.
@@ -65,6 +71,12 @@ impl AliasTable {
         let i = (scaled as usize).min(n - 1);
         let frac = scaled - i as f32;
         if frac < self.prob[i] { i } else { self.alias[i] as usize }
+    }
+
+    /// True selection probability for entry `i` (= weight[i] / sum(weights)).
+    #[inline]
+    pub fn entry_pdf(&self, i: usize) -> f32 {
+        self.source_pdf[i]
     }
 
     #[inline]

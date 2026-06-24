@@ -1,5 +1,5 @@
-use crate::{Color, Distribution2D, MeshEmitter, Pcg32, Texture};
-use nalgebra::{Point3, Vector3};
+use crate::{AliasTable, Color, Distribution2D, MeshEmitter, Pcg32, Texture};
+use nalgebra::{Point3, UnitVector3, Vector2, Vector3};
 
 use std::f32::consts::PI;
 use std::sync::Arc;
@@ -104,6 +104,16 @@ impl EnvLight {
     fn radiance(&self, dir: &Vector3<f32>) -> Color {
         let (u, v) = self.dir_to_uv(dir);
         self.radiance_uv(u, v)
+    }
+
+    pub fn average_luminance(&self) -> f32 {
+        if self.pixels.is_empty() {
+            return 0.0;
+        }
+        let sum: f32 = self.pixels.iter()
+            .map(|p| 0.2126 * p.x + 0.7152 * p.y + 0.0722 * p.z)
+            .sum();
+        (sum / self.pixels.len() as f32) * self.intensity
     }
 }
 
@@ -289,4 +299,155 @@ pub fn build_lights(punctual: &[Light], emitters: Vec<MeshEmitter>) -> Vec<Light
     let mut lights = punctual.to_vec();
     lights.extend(emitters.into_iter().map(Light::Area));
     lights
+}
+
+// ---------------------------------------------------------------------------
+// ReSTIR per-primitive light list
+// ---------------------------------------------------------------------------
+
+/// A single emissive triangle stored inline for O(1) ReSTIR candidate sampling.
+#[derive(Clone, Debug)]
+pub struct RestirTriangle {
+    pub v0: Point3<f32>,
+    pub v1: Point3<f32>,
+    pub v2: Point3<f32>,
+    pub normal: UnitVector3<f32>,
+    pub uv0: Vector2<f32>,
+    pub uv1: Vector2<f32>,
+    pub uv2: Vector2<f32>,
+    pub emissive: Color,
+    pub emissive_texture: Option<u32>,
+    pub area: f32,
+}
+
+/// One entry in the ReSTIR candidate list.
+/// `Triangle` = one emissive triangle (from a `MeshEmitter`).
+/// `Punctual` = delegate to `lights[idx]` (Point / Directional / Spot / Environment).
+///   `delta` = true for Point/Directional/Spot (no BRDF-side MIS), false for Environment.
+#[derive(Clone, Debug)]
+pub enum RestirEntry {
+    Triangle(RestirTriangle),
+    Punctual { idx: usize, delta: bool },
+}
+
+impl RestirEntry {
+    /// Delta lights (punctual) never participate in BRDF-side MIS.
+    #[inline]
+    pub fn is_delta(&self) -> bool {
+        match self {
+            RestirEntry::Punctual { delta, .. } => *delta,
+            RestirEntry::Triangle(_) => false,
+        }
+    }
+}
+
+/// Sample a `LightSample` from one `RestirEntry`.
+/// For triangles: uniform barycentric + backface check + deferred texture.
+/// For punctual: delegates to `lights[i].sample_li()`.
+pub fn sample_restir_entry(
+    entry: &RestirEntry,
+    x: &Point3<f32>,
+    rng: &mut Pcg32,
+    textures: &[Texture],
+    lights: &[Light],
+) -> Option<LightSample> {
+    match entry {
+        RestirEntry::Triangle(tri) => {
+            let mut u = rng.next_f32();
+            let mut v = rng.next_f32();
+            if u + v > 1.0 {
+                u = 1.0 - u;
+                v = 1.0 - v;
+            }
+            let w = 1.0 - u - v;
+            let p = Point3::from(tri.v0.coords * w + tri.v1.coords * u + tri.v2.coords * v);
+            let to = p - x;
+            let d2 = to.norm_squared();
+            if d2 <= 0.0 {
+                return None;
+            }
+            let dist = d2.sqrt();
+            let wi = to / dist;
+            let cos_l = tri.normal.dot(&(-wi));
+            if cos_l <= 0.0 {
+                return None;
+            }
+            let uv = tri.uv0 * w + tri.uv1 * u + tri.uv2 * v;
+            let mut le = tri.emissive;
+            if let Some(tex_idx) = tri.emissive_texture {
+                if (tex_idx as usize) < textures.len() {
+                    le = le.component_mul(&textures[tex_idx as usize].sample_bilinear(uv));
+                }
+            }
+            // area PDF -> solid-angle PDF
+            let pdf = d2 / (tri.area * cos_l);
+            if pdf <= 0.0 {
+                return None;
+            }
+            Some(LightSample { wi, distance: dist, li: le, pdf })
+        }
+        RestirEntry::Punctual { idx, .. } => lights.get(*idx)?.sample_li(x, rng, textures),
+    }
+}
+
+#[inline]
+fn luminance(c: Color) -> f32 {
+    0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z
+}
+
+/// Build the per-primitive light list used by ReSTIR candidate sampling.
+///
+/// Each emissive triangle in every `Light::Area` becomes one `RestirEntry::Triangle`.
+/// Punctual and environment lights each become one `RestirEntry::Punctual`.
+/// An `AliasTable` is built with weights proportional to emissive power so that
+/// bright lights are sampled more often.
+pub fn build_restir_lights(lights: &[Light]) -> (Vec<RestirEntry>, AliasTable) {
+    let mut entries: Vec<RestirEntry> = Vec::new();
+    let mut weights: Vec<f32> = Vec::new();
+
+    for (i, light) in lights.iter().enumerate() {
+        match light {
+            Light::Area(mesh) => {
+                let base_lum = luminance(mesh.emissive()).max(1e-6);
+                for tri in mesh.tris() {
+                    let area = tri.area();
+                    if area <= 0.0 {
+                        continue;
+                    }
+                    entries.push(RestirEntry::Triangle(RestirTriangle {
+                        v0: tri.v0,
+                        v1: tri.v1,
+                        v2: tri.v2,
+                        normal: tri.normal,
+                        uv0: tri.uv0,
+                        uv1: tri.uv1,
+                        uv2: tri.uv2,
+                        emissive: mesh.emissive(),
+                        emissive_texture: mesh.emissive_texture(),
+                        area,
+                    }));
+                    weights.push(area * base_lum);
+                }
+            }
+            Light::Point { color, intensity, .. } | Light::Spot { color, intensity, .. } => {
+                entries.push(RestirEntry::Punctual { idx: i, delta: true });
+                weights.push((intensity * luminance(*color)).max(1e-6));
+            }
+            Light::Directional { color, intensity, .. } => {
+                entries.push(RestirEntry::Punctual { idx: i, delta: true });
+                weights.push((intensity * luminance(*color)).max(1e-6));
+            }
+            Light::Environment(env) => {
+                entries.push(RestirEntry::Punctual { idx: i, delta: false });
+                weights.push(env.average_luminance().max(1e-6));
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return (entries, AliasTable::new(&[1.0]));
+    }
+
+    let alias = AliasTable::new(&weights);
+    (entries, alias)
 }

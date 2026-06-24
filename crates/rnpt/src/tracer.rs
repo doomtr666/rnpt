@@ -1,4 +1,4 @@
-use crate::{Brdf, Bvh, Camera, Color, ColorExt, Light, Pcg32, Ray, Reservoir, Scene, evaluate_surface, sample_glass};
+use crate::{AliasTable, Brdf, Bvh, Camera, Color, ColorExt, Light, Pcg32, Ray, Reservoir, RestirEntry, Scene, evaluate_surface, sample_restir_entry, sample_glass};
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
 use std::sync::Arc;
 
@@ -49,6 +49,10 @@ pub struct PathTracerConfig {
     /// background / BRDF-side MIS). `None` → black background.
     pub env: Option<usize>,
     pub strategy: SamplingStrategy,
+    /// Per-primitive light list for ReSTIR candidate sampling (one entry per
+    /// emissive triangle + one per punctual/env light), with power-weighted alias table.
+    pub restir_lights: Arc<Vec<RestirEntry>>,
+    pub restir_alias: Arc<AliasTable>,
 }
 
 /// No hard path-length cap: paths terminate via Russian roulette only (PBRT
@@ -447,8 +451,8 @@ impl PathTracer {
         shadow_rays: &mut u64,
         rng: &mut Pcg32,
     ) -> Color {
-        let n = self.config.lights.len();
-        if n == 0 {
+        let n_restir = self.config.restir_lights.len();
+        if n_restir == 0 {
             return Color::zeros();
         }
         let textures = &self.config.scene.textures;
@@ -468,8 +472,9 @@ impl PathTracer {
         // IMPORTANT: every attempted candidate — including invalid ones (cos_s ≤ 0,
         // degenerate pdf, or None from sample_li) — must increment r.m.
         for _ in 0..RESTIR_M {
-            let idx = (rng.next_f32() * n as f32) as usize;
-            let Some(ls) = self.config.lights[idx.min(n - 1)].sample_li(hit_pos, rng, textures)
+            let restir_idx = self.config.restir_alias.sample(rng.next_f32());
+            let entry = &self.config.restir_lights[restir_idx];
+            let Some(ls) = sample_restir_entry(entry, hit_pos, rng, textures, &self.config.lights)
             else {
                 r.m += 1; // zero-weight candidate still drawn from the source distribution
                 continue;
@@ -481,7 +486,7 @@ impl PathTracer {
             }
 
             // p_hat = lum(brdf * L_i * cos_s) — use precomputed wo-side terms when available.
-            let (f, p_b) = match (&pre, self.config.lights[idx.min(n - 1)].is_delta()) {
+            let (f, p_b) = match (&pre, entry.is_delta()) {
                 (Some(pre), true)  => (brdf.eval_with_precomp(normal, wo, &ls.wi, pre), 0.0_f32),
                 (Some(pre), false) => brdf.eval_and_pdf_with_precomp(normal, wo, &ls.wi, pre),
                 (None, true)       => (brdf.eval(normal, wo, &ls.wi), 0.0_f32),
@@ -490,7 +495,8 @@ impl PathTracer {
             let unshadowed = f.component_mul(&ls.li) * cos_s;
             let p_hat = 0.2126 * unshadowed.x + 0.7152 * unshadowed.y + 0.0722 * unshadowed.z;
 
-            let p_l = ls.pdf / n as f32;
+            // Source PDF: alias selection probability × within-entry sampling PDF.
+            let p_l = self.config.restir_alias.entry_pdf(restir_idx) * ls.pdf;
 
             let p_combined = w_l_factor * p_l + w_b_factor * p_b;
             let w = if p_combined > 0.0 { p_hat / p_combined } else { 0.0 };
@@ -527,14 +533,14 @@ impl PathTracer {
                     distance = hit.hit.t;
                     let cos_l = surf.geo_normal.dot(&(-bs.wi)).max(0.0);
                     if let Some(light) = self.config.lights.get(hit.light as usize) {
-                        p_l = light.area_pdf(distance * distance, cos_l) / n as f32;
+                        p_l = light.area_pdf(distance * distance, cos_l) / n_restir as f32;
                     }
                 }
             } else {
                 if let Some(env_idx) = self.config.env {
                     let env = &self.config.lights[env_idx];
                     li = env.radiance(&bs.wi);
-                    p_l = env.env_pdf(&bs.wi) / n as f32;
+                    p_l = env.env_pdf(&bs.wi) / n_restir as f32;
                 }
             }
 
