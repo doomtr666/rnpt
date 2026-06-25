@@ -13,6 +13,9 @@ pub struct Reservoir {
     /// Stored unbiased contribution weight W from the previous frame.
     /// Next frame's temporal combine: `combine_w = p̂_cur(y_prev) * big_w_stored * m_prev`.
     pub big_w_stored: f32,
+    /// Hit position and normal for geometry-aware temporal reuse rejection
+    pub hit_pos: Point3<f32>,
+    pub hit_normal: nalgebra::Vector3<f32>,
 }
 
 impl Default for Reservoir {
@@ -23,6 +26,8 @@ impl Default for Reservoir {
             w_sum: 0.0,
             m: 0,
             big_w_stored: 0.0,
+            hit_pos: Point3::origin(),
+            hit_normal: nalgebra::Vector3::zeros(),
         }
     }
 }

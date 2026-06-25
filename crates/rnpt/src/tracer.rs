@@ -1,4 +1,7 @@
-use crate::{AliasTable, Brdf, Bvh, Camera, Color, ColorExt, Light, Pcg32, Ray, Reservoir, RestirEntry, Scene, evaluate_surface, sample_restir_entry, sample_glass};
+use crate::{
+    AliasTable, Brdf, Bvh, Camera, Color, ColorExt, Light, Pcg32, Ray, Reservoir, RestirEntry,
+    Scene, evaluate_surface, sample_glass, sample_restir_entry,
+};
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
 use std::sync::Arc;
 
@@ -69,6 +72,10 @@ const RAY_EPSILON: f32 = 0.001;
 const RR_START_BOUNCE: u32 = 3;
 /// Floor on the RR termination probability.
 const RR_MIN_Q: f32 = 0.05;
+/// Diagnostic: set to false to disable temporal reuse entirely (single-frame RIS only).
+/// Use this to isolate whether a bias comes from temporal reuse or from the RIS formula itself.
+/// When false, each frame is independent — the image should converge to the same mean as MIS.
+const RESTIR_TEMPORAL: bool = true;
 
 /// Russian roulette: unbiasedly terminate low-energy paths. Returns `true` if
 /// the path should stop; otherwise rescales `throughput` to stay unbiased.
@@ -183,19 +190,19 @@ impl PathTracer {
             } else {
                 f32::INFINITY
             };
-            let shadow_ray = Ray::new_with_minmax(
-                *hit_position,
-                UnitVector3::new_unchecked(s.wi),
-                0.0,
-                tmax,
-            );
+            let shadow_ray =
+                Ray::new_with_minmax(*hit_position, UnitVector3::new_unchecked(s.wi), 0.0, tmax);
 
             *shadow_rays += 1;
             if !self.config.bvh.is_occluded(&shadow_ray) {
                 let f = brdf.eval(normal, wo, &s.wi);
                 // MIS balance-heuristic weight against BRDF sampling, for non-delta
                 // lights (area + env); delta lights can't be BRDF-sampled → weight 1.
-                let w = if matches!(self.config.strategy, SamplingStrategy::Mis | SamplingStrategy::ReStirDi) && !light.is_delta() {
+                let w = if matches!(
+                    self.config.strategy,
+                    SamplingStrategy::Mis | SamplingStrategy::ReStirDi
+                ) && !light.is_delta()
+                {
                     let p_b = brdf.pdf(normal, wo, &s.wi);
                     s.pdf / (s.pdf + p_b)
                 } else {
@@ -252,11 +259,7 @@ impl PathTracer {
                             } else {
                                 let p_l = env.env_pdf(&dir);
                                 let denom = bsdf_pdf + p_l;
-                                if denom > 0.0 {
-                                    bsdf_pdf / denom
-                                } else {
-                                    1.0
-                                }
+                                if denom > 0.0 { bsdf_pdf / denom } else { 1.0 }
                             }
                         }
                     };
@@ -281,7 +284,11 @@ impl PathTracer {
                 let is_exit = surf.geo_normal.dot(&wo) < 0.0;
                 let thick = surf.thickness_factor > 0.0;
                 // Flip n so sample_glass always receives a normal in the wo hemisphere.
-                let n = if is_exit { -surf.normal.into_inner() } else { surf.normal.into_inner() };
+                let n = if is_exit {
+                    -surf.normal.into_inner()
+                } else {
+                    surf.normal.into_inner()
+                };
 
                 // Tint table (baseColor applied once at entry; Beer-Lambert at exit):
                 //   thin  (front/back) → albedo
@@ -309,13 +316,20 @@ impl PathTracer {
                 };
 
                 let Some(gs) = sample_glass(
-                    &n, &wo, surf.roughness, surf.ior, &tint, is_exit, thick, rng,
+                    &n,
+                    &wo,
+                    surf.roughness,
+                    surf.ior,
+                    &tint,
+                    is_exit,
+                    thick,
+                    rng,
                 ) else {
                     break;
                 };
 
                 // Do not divide by the glass lobe selection probability (surf.transmission).
-                // The unscaled weight correctly preserves the specular reflection 
+                // The unscaled weight correctly preserves the specular reflection
                 // without double-counting it against the opaque branch.
                 throughput = throughput.component_mul(&gs.weight);
                 // Large pdf → MIS weight ≈ 1 (no NEE through glass).
@@ -366,11 +380,7 @@ impl PathTracer {
                                 .get(hit.light as usize)
                                 .map_or(0.0, |l| l.area_pdf(hit.hit.t * hit.hit.t, cos_l));
                             let denom = bsdf_pdf + p_l;
-                            if denom > 0.0 {
-                                bsdf_pdf / denom
-                            } else {
-                                1.0
-                            }
+                            if denom > 0.0 { bsdf_pdf / denom } else { 1.0 }
                         }
                     }
                 };
@@ -447,6 +457,7 @@ impl PathTracer {
         normal: &UnitVector3<f32>,
         brdf: &Brdf,
         wo: &Vector3<f32>,
+        t: f32, // depth for temporal rejection
         reservoir: &mut Reservoir,
         shadow_rays: &mut u64,
         rng: &mut Pcg32,
@@ -487,10 +498,10 @@ impl PathTracer {
 
             // p_hat = lum(brdf * L_i * cos_s) — use precomputed wo-side terms when available.
             let (f, p_b) = match (&pre, entry.is_delta()) {
-                (Some(pre), true)  => (brdf.eval_with_precomp(normal, wo, &ls.wi, pre), 0.0_f32),
+                (Some(pre), true) => (brdf.eval_with_precomp(normal, wo, &ls.wi, pre), 0.0_f32),
                 (Some(pre), false) => brdf.eval_and_pdf_with_precomp(normal, wo, &ls.wi, pre),
-                (None, true)       => (brdf.eval(normal, wo, &ls.wi), 0.0_f32),
-                (None, false)      => brdf.eval_and_pdf(normal, wo, &ls.wi),
+                (None, true) => (brdf.eval(normal, wo, &ls.wi), 0.0_f32),
+                (None, false) => brdf.eval_and_pdf(normal, wo, &ls.wi),
             };
             let unshadowed = f.component_mul(&ls.li) * cos_s;
             let p_hat = 0.2126 * unshadowed.x + 0.7152 * unshadowed.y + 0.0722 * unshadowed.z;
@@ -499,7 +510,11 @@ impl PathTracer {
             let p_l = self.config.restir_alias.entry_pdf(restir_idx) * ls.pdf;
 
             let p_combined = w_l_factor * p_l + w_b_factor * p_b;
-            let w = if p_combined > 0.0 { p_hat / p_combined } else { 0.0 };
+            let w = if p_combined > 0.0 {
+                p_hat / p_combined
+            } else {
+                0.0
+            };
 
             let light_pos = if ls.distance.is_finite() {
                 hit_pos + ls.wi * ls.distance
@@ -540,7 +555,10 @@ impl PathTracer {
                     let cos_l = surf.geo_normal.dot(&(-bs.wi)).max(0.0);
                     if cos_l > 0.0 && restir_total_w > 0.0 {
                         let mat = &self.config.scene.materials[hit.material as usize];
-                        let base_lum = (0.2126 * mat.emissive.x + 0.7152 * mat.emissive.y + 0.0722 * mat.emissive.z).max(1e-6);
+                        let base_lum = (0.2126 * mat.emissive.x
+                            + 0.7152 * mat.emissive.y
+                            + 0.0722 * mat.emissive.z)
+                            .max(1e-6);
                         p_l = base_lum * distance * distance / (restir_total_w * cos_l);
                     }
                 }
@@ -549,7 +567,8 @@ impl PathTracer {
                     let env = &self.config.lights[env_idx];
                     li = env.radiance(&bs.wi);
                     if restir_total_w > 0.0 {
-                        p_l = env.average_luminance().max(1e-6) / restir_total_w * env.env_pdf(&bs.wi);
+                        p_l = env.average_luminance().max(1e-6) / restir_total_w
+                            * env.env_pdf(&bs.wi);
                     }
                 }
             }
@@ -564,7 +583,11 @@ impl PathTracer {
 
             let p_b = bs.pdf;
             let p_combined = w_l_factor * p_l + w_b_factor * p_b;
-            let w = if p_combined > 0.0 { p_hat / p_combined } else { 0.0 };
+            let w = if p_combined > 0.0 {
+                p_hat / p_combined
+            } else {
+                0.0
+            };
 
             let light_pos = if distance.is_finite() {
                 hit_pos + bs.wi * distance
@@ -578,12 +601,21 @@ impl PathTracer {
         // Correct formula (Bitterli 2020): combine_w = p̂_cur(y_prev) * W_prev * m_prev.
         // Recomputing wi from the stored light_pos handles the p̂ mismatch caused by
         // sub-pixel jitter shifting the shading point between frames.
-        if reservoir.is_valid() && reservoir.big_w_stored > 0.0 {
+        // RESTIR_TEMPORAL=false skips this block to diagnose whether any bias is in temporal
+        // reuse or in the single-frame RIS formula. The image should converge to the same
+        // mean as MIS when temporal is disabled (just higher variance).
+
+        let is_same_surface = reservoir.hit_normal.dot(normal.as_ref()) > 0.9
+            && (reservoir.hit_pos - hit_pos).norm() < 0.1 * t;
+
+        if RESTIR_TEMPORAL && reservoir.is_valid() && is_same_surface {
             let m_cap = 20 * (RESTIR_M + RESTIR_M_BRDF);
             let capped_prev_m = reservoir.m.min(m_cap);
             let to_prev = reservoir.light_pos.coords - hit_pos.coords;
             let prev_dist = to_prev.norm();
-            if prev_dist > 0.0 {
+            let mut combine_w = 0.0;
+
+            if reservoir.big_w_stored > 0.0 && prev_dist > 0.0 {
                 let wi_prev = to_prev / prev_dist;
                 let prev_cos = normal.dot(&wi_prev).max(0.0);
                 if prev_cos > 0.0 {
@@ -592,16 +624,18 @@ impl PathTracer {
                         None => brdf.eval(normal, wo, &wi_prev),
                     };
                     let unshadowed = f_prev.component_mul(&reservoir.li) * prev_cos;
-                    let p_hat_cur = 0.2126 * unshadowed.x + 0.7152 * unshadowed.y + 0.0722 * unshadowed.z;
+                    let p_hat_cur =
+                        0.2126 * unshadowed.x + 0.7152 * unshadowed.y + 0.0722 * unshadowed.z;
 
                     // p̂_cur(y_prev) * W_prev * m_prev
-                    let combine_w = p_hat_cur * reservoir.big_w_stored * capped_prev_m as f32;
-                    let m_before = r.m;
-                    r.update(reservoir.light_pos, reservoir.li, combine_w, rng);
-                    // update() incremented r.m by 1; set it to the correct combined total.
-                    r.m = m_before + capped_prev_m;
+                    combine_w = p_hat_cur * reservoir.big_w_stored * capped_prev_m as f32;
                 }
             }
+
+            let m_before = r.m;
+            r.update(reservoir.light_pos, reservoir.li, combine_w, rng);
+            // update() incremented r.m by 1; set it to the correct combined total.
+            r.m = m_before + capped_prev_m;
         }
 
         if !r.is_valid() {
@@ -650,6 +684,8 @@ impl PathTracer {
         };
 
         // Store updated reservoir for next frame's temporal reuse.
+        r.hit_pos = *hit_pos;
+        r.hit_normal = normal.into_inner();
         *reservoir = r;
         contribution
     }
@@ -677,12 +713,11 @@ impl PathTracer {
                     let dir = ray.direction.into_inner();
                     let w = if bounce == 0 {
                         1.0
-                    } else if restir_used {
-                        // NeeOnly-style: ReSTIR at bounce 0 already estimated all direct
-                        // illumination, including the env. Suppress the BRDF-side env hit.
+                    } else if restir_used && bounce == 1 {
+                        // ReSTIR BRDF stream at S0 covers S0→env; suppress to avoid double-count.
                         0.0
                     } else {
-                        // Bounce 0 was glass → fell back to regular MIS.
+                        // bounce 2+ (restir) or bounce 1+ (glass fallback): full MIS.
                         let p_l = env.env_pdf(&dir);
                         let denom = bsdf_pdf + p_l;
                         if denom > 0.0 { bsdf_pdf / denom } else { 1.0 }
@@ -705,7 +740,11 @@ impl PathTracer {
                 }
                 let is_exit = surf.geo_normal.dot(&wo) < 0.0;
                 let thick = surf.thickness_factor > 0.0;
-                let n = if is_exit { -surf.normal.into_inner() } else { surf.normal.into_inner() };
+                let n = if is_exit {
+                    -surf.normal.into_inner()
+                } else {
+                    surf.normal.into_inner()
+                };
                 let tint = if thick {
                     if is_exit {
                         let t = hit.hit.t;
@@ -726,8 +765,16 @@ impl PathTracer {
                 } else {
                     surf.albedo
                 };
-                let Some(gs) = sample_glass(&n, &wo, surf.roughness, surf.ior, &tint, is_exit, thick, rng)
-                else {
+                let Some(gs) = sample_glass(
+                    &n,
+                    &wo,
+                    surf.roughness,
+                    surf.ior,
+                    &tint,
+                    is_exit,
+                    thick,
+                    rng,
+                ) else {
                     break;
                 };
                 throughput = throughput.component_mul(&gs.weight);
@@ -747,14 +794,15 @@ impl PathTracer {
             let brdf = surf.brdf();
 
             // Emission weight:
-            //   bounce 0         → 1.0 (camera ray hit an emitter directly)
-            //   bounce > 0, ReSTIR was used → 0.0 (NeeOnly-style: ReSTIR at bounce 0
-            //     already estimated all direct illumination; suppress the BRDF-side hit)
-            //   bounce > 0, no ReSTIR (glass at bounce 0) → MIS balance heuristic
+            //   bounce 0                       → 1.0 (camera ray hit an emitter directly)
+            //   bounce 1, restir_used          → 0.0 (ReSTIR BRDF stream at S0 already covers
+            //                                         S0→S1 emissive; adding emit_1 would double-count)
+            //   bounce 2+, restir_used         → MIS balance heuristic (no conflict with ReSTIR)
+            //   bounce 1+, no ReSTIR (glass)   → MIS balance heuristic
             let emission = if surf.emissive != Color::zeros() {
                 let emit_w = if bounce == 0 {
                     1.0
-                } else if restir_used {
+                } else if restir_used && bounce == 1 {
                     0.0
                 } else {
                     let cos_l = surf.geo_normal.dot(&wo).max(0.0);
@@ -781,11 +829,15 @@ impl PathTracer {
                     &surf.normal,
                     &brdf,
                     &wo,
+                    hit.hit.t,
                     reservoir,
                     shadow_rays,
                     rng,
                 )
             } else {
+                // bounce 1+ with restir_used: emit_w=0 at bounce 1 and emit_w=MIS at bounce 2+ means
+                // the NEE balance heuristic is correct — p_l/(p_l+p_b) at bounce 1 pairs with
+                // p_b/(p_l+p_b) from emit_w at bounce 2, together covering the full integral.
                 self.compute_direct_lighting(
                     &surf.position,
                     &surf.normal,
@@ -798,7 +850,9 @@ impl PathTracer {
 
             accumulated_radiance += throughput.component_mul(&(emission + direct));
 
-            let Some(bs) = brdf.sample(&surf.normal, &wo, rng) else { break; };
+            let Some(bs) = brdf.sample(&surf.normal, &wo, rng) else {
+                break;
+            };
             let cos_theta = surf.normal.dot(&bs.wi).max(0.0);
             if bs.pdf <= 0.0 || cos_theta <= 0.0 {
                 break;
