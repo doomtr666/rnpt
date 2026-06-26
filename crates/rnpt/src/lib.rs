@@ -31,9 +31,6 @@ pub use distribution::*;
 mod tracer;
 pub use tracer::*;
 
-mod reservoir;
-pub use reservoir::*;
-
 mod parallel_tracer;
 pub use parallel_tracer::*;
 

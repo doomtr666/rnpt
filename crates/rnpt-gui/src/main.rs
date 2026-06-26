@@ -159,7 +159,6 @@ impl RnptGuiApp {
         };
 
         let strategy = rnpt::SamplingStrategy::Mis;
-        let (restir_lights_vec, restir_alias) = rnpt::build_restir_lights(&lights);
         let config = rnpt::PathTracerConfig {
             width,
             height,
@@ -169,8 +168,6 @@ impl RnptGuiApp {
             lights,
             env: None,
             strategy,
-            restir_lights: std::sync::Arc::new(restir_lights_vec),
-            restir_alias: std::sync::Arc::new(restir_alias),
         };
 
         let tracer = Some(rnpt::ParallelTracer::new(config));
@@ -252,7 +249,6 @@ impl RnptGuiApp {
             }
         };
         let (lights, env) = with_env(&lights, &self.env);
-        let (restir_lights_vec, restir_alias) = rnpt::build_restir_lights(&lights);
 
         let config = rnpt::PathTracerConfig {
             width: self.resolution[0],
@@ -263,8 +259,6 @@ impl RnptGuiApp {
             lights,
             env,
             strategy: self.strategy,
-            restir_lights: std::sync::Arc::new(restir_lights_vec),
-            restir_alias: std::sync::Arc::new(restir_alias),
         };
 
         // Always recreate tracer to ensure clean memory state and no race conditions
@@ -553,11 +547,6 @@ impl eframe::App for RnptGuiApp {
                 ui.add_space(4.0);
                 let prev_strategy = self.strategy;
                 ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.strategy,
-                        rnpt::SamplingStrategy::ReStirDi,
-                        "ReSTIR",
-                    );
                     ui.selectable_value(&mut self.strategy, rnpt::SamplingStrategy::Mis, "MIS");
                     ui.selectable_value(&mut self.strategy, rnpt::SamplingStrategy::NeeOnly, "NEE");
                     ui.selectable_value(
