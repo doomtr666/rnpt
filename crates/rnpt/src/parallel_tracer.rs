@@ -1,10 +1,13 @@
-use crate::{PathTracer, PathTracerConfig, Pixel};
+use crate::{
+    PathTracer, PathTracerConfig, Pixel,
+    nirc::{NircConfig, NircTrainer},
+};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 const TILE_SIZE: usize = 128;
-const BATCH_SIZE: u64 = 1024;
+const BATCH_SIZE: u64 = 256;
 
 /// A lock-free pixel buffer that multiple threads can write to concurrently.
 /// This is safe because each worker thread writes to a unique disjoint set of pixels.
@@ -13,15 +16,14 @@ const BATCH_SIZE: u64 = 1024;
 /// this creates absolutely zero visual artifacts.
 struct UnsafePixelBuffer {
     ptr: *mut Pixel,
-    len: usize,
 }
 
 unsafe impl Send for UnsafePixelBuffer {}
 unsafe impl Sync for UnsafePixelBuffer {}
 
 impl UnsafePixelBuffer {
-    fn new(ptr: *mut Pixel, len: usize) -> Self {
-        Self { ptr, len }
+    fn new(ptr: *mut Pixel) -> Self {
+        Self { ptr }
     }
 
     #[inline(always)]
@@ -30,12 +32,10 @@ impl UnsafePixelBuffer {
     }
 }
 
-
-
 pub struct ParallelTracer {
     config: Arc<Mutex<PathTracerConfig>>,
     epoch: Arc<AtomicU32>,
-    pixels: Vec<Pixel>,         // owned pixel buffer; threads hold raw pointers into this
+    pixels: Vec<Pixel>, // owned pixel buffer; threads hold raw pointers into this
     threads: Vec<thread::JoinHandle<()>>,
 
     // Performance metrics
@@ -44,6 +44,9 @@ pub struct ParallelTracer {
     total_shadow_rays: Arc<AtomicU64>, // any-hit shadow rays
     // We keep a flag to terminate threads on drop
     running: Arc<AtomicBool>,
+
+    // NIRC Training State
+    nirc_trainer: Mutex<NircTrainer>,
 }
 
 impl ParallelTracer {
@@ -54,7 +57,7 @@ impl ParallelTracer {
 
         let mut pixels = vec![Pixel::default(); num_pixels];
         let buffer_ptr = pixels.as_mut_ptr();
-        let shared_buffer = Arc::new(UnsafePixelBuffer::new(buffer_ptr, num_pixels));
+        let shared_buffer = Arc::new(UnsafePixelBuffer::new(buffer_ptr));
 
         let config = Arc::new(Mutex::new(config));
         let epoch = Arc::new(AtomicU32::new(1));
@@ -77,19 +80,25 @@ impl ParallelTracer {
             let shadow_rays_atomic = total_shadow_rays.clone();
             let running_atomic = running.clone();
 
-            threads.push(thread::spawn(move || {
-                Self::worker_loop(
-                    thread_idx,
-                    num_threads,
-                    buffer,
-                    config_mutex,
-                    epoch_atomic,
-                    rays_atomic,
-                    real_rays_atomic,
-                    shadow_rays_atomic,
-                    running_atomic,
-                )
-            }));
+            threads.push(
+                thread::Builder::new()
+                    .name(format!("Worker-{}", thread_idx))
+                    .stack_size(16 * 1024 * 1024) // 16MB stack to avoid overflows with large NircMlp
+                    .spawn(move || {
+                        Self::worker_loop(
+                            thread_idx,
+                            num_threads,
+                            buffer,
+                            config_mutex,
+                            epoch_atomic,
+                            rays_atomic,
+                            real_rays_atomic,
+                            shadow_rays_atomic,
+                            running_atomic,
+                        )
+                    })
+                    .expect("Failed to spawn worker thread"),
+            );
         }
 
         Self {
@@ -101,7 +110,42 @@ impl ParallelTracer {
             total_real_rays,
             total_shadow_rays,
             running,
+            nirc_trainer: Mutex::new(NircTrainer::new(NircConfig::default())),
         }
+    }
+
+    pub fn train_nirc(&self, budget: usize) {
+        let config = self.config.lock().unwrap().clone();
+        if config.strategy != crate::SamplingStrategy::Nirc {
+            return;
+        }
+
+        // Only one thread trains at a time
+        let mut trainer = match self.nirc_trainer.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+
+        // Use a local tracer to generate paths
+        let tracer = PathTracer::new(config.clone());
+        let mut rng = crate::Pcg32::from_seed_128(self.epoch.load(Ordering::Relaxed) as u128);
+
+        trainer.train(&tracer, &mut rng, budget);
+
+        // Update the active inference network via EMA
+        let new_active = if let Some(old) = &self.config.lock().unwrap().nirc_network {
+            let mut updated = (**old).clone();
+            updated.ema(&*trainer.network, 0.05); // Alpha = 0.05 (learning rate for EMA)
+            updated
+        } else {
+            (*trainer.network).clone()
+        };
+
+        // Update the shared config
+        let mut cfg_lock = self.config.lock().unwrap();
+        cfg_lock.nirc_network = Some(Arc::new(new_active));
+        // Trigger epoch change so threads reload the config with the new network
+        self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn update_scene(&mut self, new_config: PathTracerConfig) {
@@ -163,7 +207,7 @@ impl ParallelTracer {
         while running_atomic.load(Ordering::Relaxed) {
             let current_epoch = epoch_atomic.load(Ordering::Relaxed);
 
-            // If the epoch changed, we need to reload the scene and clear our pixels
+            // If the epoch changed, we need to reload the scene
             if current_epoch != local_epoch {
                 local_epoch = current_epoch;
 
@@ -172,13 +216,6 @@ impl ParallelTracer {
                 height = cfg.height;
                 let tracer = PathTracer::new(cfg);
                 path_tracer = Some(tracer);
-
-                // Clear the pixels assigned to this thread
-                for i in (thread_idx..buffer.len).step_by(num_threads) {
-                    unsafe {
-                        *buffer.get_mut(i) = Pixel::default();
-                    }
-                }
             }
 
             let tracer = path_tracer.as_ref().unwrap();

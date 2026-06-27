@@ -37,6 +37,8 @@ pub struct Bvh {
     /// Zero-initialized (w == 0) when the mesh had no TANGENT attribute.
     pub tangents:      Vec<Vector4<f32>>,
     pub triangle_meta: Vec<TriangleMeta>,
+    pub bounds_min:    Point3<f32>,
+    pub bounds_max:    Point3<f32>,
 }
 
 impl Bvh {

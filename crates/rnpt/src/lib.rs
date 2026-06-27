@@ -34,7 +34,7 @@ pub use tracer::*;
 mod parallel_tracer;
 pub use parallel_tracer::*;
 
-mod nrc;
-pub use nrc::*;
+mod nirc;
+pub use nirc::*;
 
 pub use nalgebra::{Point3, Transform3, UnitVector3, Vector3};

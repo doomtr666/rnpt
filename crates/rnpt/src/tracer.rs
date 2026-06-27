@@ -1,6 +1,6 @@
 use crate::{
-    Brdf, Bvh, BvhHit, Camera, Color, ColorExt, Light, Pcg32, Ray,
-    Scene, SurfaceInteraction, evaluate_surface, sample_glass,
+    Brdf, Bvh, BvhHit, Camera, Color, ColorExt, Light, Pcg32, Ray, Scene, SurfaceInteraction,
+    evaluate_surface, sample_glass,
 };
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
 use std::sync::Arc;
@@ -33,6 +33,10 @@ pub enum SamplingStrategy {
     NeeOnly,
     /// Multiple importance sampling (balance heuristic) of NEE and BRDF.
     Mis,
+    /// Neural Incident Radiance Cache. Inferences incident radiance at bounce 1.
+    Nirc,
+    /// Traces only the primary bounce (direct lighting + emission).
+    DirectOnly,
 }
 
 #[derive(Clone)]
@@ -48,6 +52,8 @@ pub struct PathTracerConfig {
     /// background / BRDF-side MIS). `None` → black background.
     pub env: Option<usize>,
     pub strategy: SamplingStrategy,
+    /// Active network for NIRC inference.
+    pub nirc_network: Option<Arc<crate::nirc::NircMlp>>,
 }
 
 /// No hard path-length cap: paths terminate via Russian roulette only (PBRT
@@ -146,6 +152,7 @@ impl PathTracer {
         wo: &Vector3<f32>,
         shadow_rays: &mut u64,
         rng: &mut Pcg32,
+        strategy: SamplingStrategy,
     ) -> Color {
         let mut total_direct = Color::zeros();
         let textures = &self.config.scene.textures;
@@ -154,7 +161,7 @@ impl PathTracer {
             // BrdfOnly draws no light samples for non-delta lights (area + env;
             // their contribution comes from BRDF rays hitting emitters / escaping
             // into the environment); delta lights always need NEE.
-            if self.config.strategy == SamplingStrategy::BrdfOnly && !light.is_delta() {
+            if strategy == SamplingStrategy::BrdfOnly && !light.is_delta() {
                 continue;
             }
 
@@ -182,8 +189,7 @@ impl PathTracer {
                 let f = brdf.eval(normal, wo, &s.wi);
                 // MIS balance-heuristic weight against BRDF sampling, for non-delta
                 // lights (area + env); delta lights can't be BRDF-sampled → weight 1.
-                let w = if self.config.strategy == SamplingStrategy::Mis && !light.is_delta()
-                {
+                let w = if strategy == SamplingStrategy::Mis && !light.is_delta() {
                     let p_b = brdf.pdf(normal, wo, &s.wi);
                     s.pdf / (s.pdf + p_b)
                 } else {
@@ -207,6 +213,7 @@ impl PathTracer {
         rng: &mut Pcg32,
         rays: &mut u64,
         shadow_rays: &mut u64,
+        strategy: SamplingStrategy,
     ) -> Color {
         let mut accumulated_radiance = Color::black();
         let mut throughput = Color::white(); // Current path attenuation factor
@@ -218,7 +225,14 @@ impl PathTracer {
             // Closest-hit intersection with the scene.
             *rays += 1;
             let Some(hit) = self.config.bvh.intersect(&ray) else {
-                self.handle_environment_hit(&ray, bounce, bsdf_pdf, &throughput, &mut accumulated_radiance);
+                self.handle_environment_hit(
+                    &ray,
+                    bounce,
+                    bsdf_pdf,
+                    &throughput,
+                    &mut accumulated_radiance,
+                    strategy,
+                );
                 break;
             };
 
@@ -226,9 +240,23 @@ impl PathTracer {
             let surf = evaluate_surface(&hit, &ray, &self.config.bvh, &self.config.scene);
             let wo = -ray.direction.into_inner(); // toward the previous vertex
 
+            // ── Direct Only (Bounce 1) ───────────────────────────────────────
+            if strategy == SamplingStrategy::DirectOnly && bounce == 1 {
+                break;
+            }
+
             // ── Dielectric (glass) ───────────────────────────────────────────
             if surf.transmission > 0.0 && rng.next_f32() < surf.transmission {
-                if !self.handle_dielectric_bounce(&surf, &hit, &wo, &mut throughput, &mut bsdf_pdf, &mut ray, bounce, rng) {
+                if !self.handle_dielectric_bounce(
+                    &surf,
+                    &hit,
+                    &wo,
+                    &mut throughput,
+                    &mut bsdf_pdf,
+                    &mut ray,
+                    bounce,
+                    rng,
+                ) {
                     break;
                 }
                 continue;
@@ -236,12 +264,112 @@ impl PathTracer {
 
             // ── Opaque ───────────────────────────────────────────────────────
             let brdf = surf.brdf();
-            if !self.handle_opaque_bounce(&surf, &hit, &wo, &brdf, &mut throughput, &mut bsdf_pdf, &mut accumulated_radiance, &mut ray, shadow_rays, bounce, rng) {
+            if !self.handle_opaque_bounce(
+                &surf,
+                &hit,
+                &wo,
+                &brdf,
+                &mut throughput,
+                &mut bsdf_pdf,
+                &mut accumulated_radiance,
+                &mut ray,
+                shadow_rays,
+                bounce,
+                rng,
+                strategy,
+            ) {
                 break;
             }
         }
 
         accumulated_radiance
+    }
+
+    /// Traces a single random path to collect a training sample for the NIRC.
+    /// Returns `Some((input, target_radiance))` if a valid path was generated.
+    pub fn trace_training_path(
+        &self,
+        rng: &mut Pcg32,
+    ) -> Option<(nalgebra::SVector<f32, { crate::nirc::INPUT_DIM }>, Color)> {
+        // 1. Generate a random primary ray
+        let x = rng.next_f32() * self.config.width as f32;
+        let y = rng.next_f32() * self.config.height as f32;
+        let ray = self.generate_ray(rng, x, y);
+
+        // 2. Find primary intersection
+        let Some(hit) = self.config.bvh.intersect(&ray) else {
+            return None;
+        };
+        let surf = evaluate_surface(&hit, &ray, &self.config.bvh, &self.config.scene);
+        let wo = -ray.direction.into_inner();
+
+        // 3. Sample outgoing direction
+        let brdf = surf.brdf();
+        let Some(bs) = brdf.sample(&surf.normal, &wo, rng) else {
+            return None;
+        };
+        let cos_theta = surf.normal.dot(&bs.wi).max(0.0);
+        if bs.pdf <= 0.0 || cos_theta <= 0.0 {
+            return None;
+        }
+
+        let input = crate::nirc::NircMlp::encode_inputs(
+            &surf.position,
+            &bs.wi,
+            &self.config.bvh.bounds_min,
+            &self.config.bvh.bounds_max,
+        );
+
+        // 4. Single BVH traversal to find bounce-1.
+        let secondary_ray = Ray::new(surf.position, nalgebra::UnitVector3::new_unchecked(bs.wi));
+        let Some(hit1) = self.config.bvh.intersect(&secondary_ray) else {
+            // Ray escaped to environment; Nirc is not queried at inference for env hits.
+            return None;
+        };
+        let surf1 = evaluate_surface(&hit1, &secondary_ray, &self.config.bvh, &self.config.scene);
+
+        // Skip transmissive b1: Nirc is not queried at inference for dielectric bounces.
+        if surf1.transmission > 0.0 {
+            return None;
+        }
+
+        let wo1 = -secondary_ray.direction.into_inner();
+        let brdf1 = surf1.brdf();
+
+        // 5. Ground-truth target = NEE at b1 + indirect from b2.
+        //    Emission at b1 is deliberately omitted: inference re-adds it with the correct MIS weight.
+        let mut dummy_shadow = 0u64;
+        let direct_b1 = self.compute_direct_lighting(
+            &surf1.position,
+            &surf1.normal,
+            &brdf1,
+            &wo1,
+            &mut dummy_shadow,
+            rng,
+            SamplingStrategy::Mis,
+        );
+
+        let indirect_b1 = if let Some(bs1) = brdf1.sample(&surf1.normal, &wo1, rng) {
+            let cos1 = surf1.normal.dot(&bs1.wi).max(0.0);
+            if bs1.pdf > 0.0 && cos1 > 0.0 {
+                let ray_b2 = Ray::new(surf1.position, nalgebra::UnitVector3::new_unchecked(bs1.wi));
+                let mut dummy_rays = 0u64;
+                let radiance_b2 = self.trace_path(
+                    ray_b2,
+                    rng,
+                    &mut dummy_rays,
+                    &mut dummy_shadow,
+                    SamplingStrategy::Mis,
+                );
+                radiance_b2.component_mul(&(bs1.f * (cos1 / bs1.pdf)))
+            } else {
+                Color::black()
+            }
+        } else {
+            Color::black()
+        };
+
+        Some((input, direct_b1 + indirect_b1))
     }
 
     fn handle_environment_hit(
@@ -251,6 +379,7 @@ impl PathTracer {
         bsdf_pdf: f32,
         throughput: &Color,
         accumulated_radiance: &mut Color,
+        strategy: SamplingStrategy,
     ) {
         // Ray escaped: the environment light (background + BRDF-side MIS).
         // Weight mirrors emitter emission: bounce 0 sees the background
@@ -259,8 +388,8 @@ impl PathTracer {
         if let Some(env_idx) = self.config.env {
             let env = &self.config.lights[env_idx];
             let dir = ray.direction.into_inner();
-            let w = match self.config.strategy {
-                SamplingStrategy::BrdfOnly => 1.0,
+            let w = match strategy {
+                SamplingStrategy::BrdfOnly | SamplingStrategy::DirectOnly => 1.0,
                 SamplingStrategy::NeeOnly => {
                     if bounce == 0 {
                         1.0
@@ -268,7 +397,7 @@ impl PathTracer {
                         0.0
                     }
                 }
-                SamplingStrategy::Mis => {
+                SamplingStrategy::Mis | SamplingStrategy::Nirc => {
                     if bounce == 0 {
                         1.0
                     } else {
@@ -324,16 +453,8 @@ impl PathTracer {
             surf.albedo // baseColor tints the surface interface
         };
 
-        let Some(gs) = sample_glass(
-            &n,
-            wo,
-            surf.roughness,
-            surf.ior,
-            &tint,
-            is_exit,
-            thick,
-            rng,
-        ) else {
+        let Some(gs) = sample_glass(&n, wo, surf.roughness, surf.ior, &tint, is_exit, thick, rng)
+        else {
             return false;
         };
 
@@ -366,10 +487,11 @@ impl PathTracer {
         shadow_rays: &mut u64,
         bounce: u32,
         rng: &mut Pcg32,
+        strategy: SamplingStrategy,
     ) -> bool {
         let emission = if surf.emissive != Color::zeros() {
-            let emit_w = match self.config.strategy {
-                SamplingStrategy::BrdfOnly => 1.0,
+            let emit_w = match strategy {
+                SamplingStrategy::BrdfOnly | SamplingStrategy::DirectOnly => 1.0,
                 SamplingStrategy::NeeOnly => {
                     if bounce == 0 {
                         1.0
@@ -377,7 +499,7 @@ impl PathTracer {
                         0.0
                     }
                 }
-                SamplingStrategy::Mis => {
+                SamplingStrategy::Mis | SamplingStrategy::Nirc => {
                     if bounce == 0 {
                         1.0
                     } else {
@@ -397,16 +519,36 @@ impl PathTracer {
             Color::black()
         };
 
-        let direct = self.compute_direct_lighting(
-            &surf.position,
-            &surf.normal,
-            brdf,
-            wo,
-            shadow_rays,
-            rng,
-        );
+        let direct = if strategy == SamplingStrategy::Nirc && bounce == 1 {
+            if let Some(network) = &self.config.nirc_network {
+                let input = crate::nirc::NircMlp::encode_inputs(
+                    &ray.origin,
+                    &ray.direction.into_inner(),
+                    &self.config.bvh.bounds_min,
+                    &self.config.bvh.bounds_max,
+                );
+                let pred = network.forward(input);
+                Color::new(pred[0].max(0.0), pred[1].max(0.0), pred[2].max(0.0))
+            } else {
+                Color::black()
+            }
+        } else {
+            self.compute_direct_lighting(
+                &surf.position,
+                &surf.normal,
+                brdf,
+                wo,
+                shadow_rays,
+                rng,
+                strategy,
+            )
+        };
 
         *accumulated_radiance += throughput.component_mul(&(emission + direct));
+
+        if strategy == SamplingStrategy::Nirc && bounce == 1 {
+            return false;
+        }
 
         let Some(bs) = brdf.sample(&surf.normal, wo, rng) else {
             return false;
@@ -436,7 +578,13 @@ impl PathTracer {
 
         let mut rays = 0;
         let mut shadow_rays = 0;
-        let sample_color = self.trace_path(ray, &mut rng, &mut rays, &mut shadow_rays);
+        let sample_color = self.trace_path(
+            ray,
+            &mut rng,
+            &mut rays,
+            &mut shadow_rays,
+            self.config.strategy,
+        );
 
         pixel.accumulated_radiance += sample_color;
         pixel.samples += 1;

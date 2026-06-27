@@ -181,6 +181,23 @@ impl BvhBuilder {
         );
         accel.commit();
 
+        let mut bounds_min = Point3::new(f32::MAX, f32::MAX, f32::MAX);
+        let mut bounds_max = Point3::new(f32::MIN, f32::MIN, f32::MIN);
+        for p in &self.world_vertices {
+            bounds_min.x = bounds_min.x.min(p.x);
+            bounds_min.y = bounds_min.y.min(p.y);
+            bounds_min.z = bounds_min.z.min(p.z);
+            bounds_max.x = bounds_max.x.max(p.x);
+            bounds_max.y = bounds_max.y.max(p.y);
+            bounds_max.z = bounds_max.z.max(p.z);
+        }
+        
+        // Handle empty scene case
+        if bounds_min.x > bounds_max.x {
+            bounds_min = Point3::new(-1.0, -1.0, -1.0);
+            bounds_max = Point3::new(1.0, 1.0, 1.0);
+        }
+
         let bvh = Bvh {
             accel,
             vertices:      self.world_vertices,
@@ -189,6 +206,8 @@ impl BvhBuilder {
             colors:        self.world_colors,
             tangents:      self.world_tangents,
             triangle_meta: self.flat_meta,
+            bounds_min,
+            bounds_max,
         };
 
         (bvh, self.emitter_meshes)

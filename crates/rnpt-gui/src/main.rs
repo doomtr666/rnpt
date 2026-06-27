@@ -158,7 +158,7 @@ impl RnptGuiApp {
             }
         };
 
-        let strategy = rnpt::SamplingStrategy::Mis;
+        let strategy = rnpt::SamplingStrategy::Nirc;
         let config = rnpt::PathTracerConfig {
             width,
             height,
@@ -168,6 +168,7 @@ impl RnptGuiApp {
             lights,
             env: None,
             strategy,
+            nirc_network: None,
         };
 
         let tracer = Some(rnpt::ParallelTracer::new(config));
@@ -259,6 +260,7 @@ impl RnptGuiApp {
             lights,
             env,
             strategy: self.strategy,
+            nirc_network: None,
         };
 
         // Always recreate tracer to ensure clean memory state and no race conditions
@@ -289,6 +291,10 @@ impl eframe::App for RnptGuiApp {
         // Fetch new pixels from tracer
         let mut pixels_updated = false;
         if let Some(tracer) = &self.tracer {
+            // Run NIRC training pass if enabled
+            let num_pixels = self.local_width * self.local_height;
+            tracer.train_nirc(num_pixels.max(10000) / 20); // 5% budget
+
             tracer.fetch_pixels(&mut self.local_pixels);
 
             self.rays_since_last_fps += tracer.pop_rays_traced();
@@ -547,6 +553,7 @@ impl eframe::App for RnptGuiApp {
                 ui.add_space(4.0);
                 let prev_strategy = self.strategy;
                 ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.strategy, rnpt::SamplingStrategy::Nirc, "NIRC");
                     ui.selectable_value(&mut self.strategy, rnpt::SamplingStrategy::Mis, "MIS");
                     ui.selectable_value(&mut self.strategy, rnpt::SamplingStrategy::NeeOnly, "NEE");
                     ui.selectable_value(
@@ -554,6 +561,7 @@ impl eframe::App for RnptGuiApp {
                         rnpt::SamplingStrategy::BrdfOnly,
                         "BRDF",
                     );
+                    ui.selectable_value(&mut self.strategy, rnpt::SamplingStrategy::DirectOnly, "Direct Only");
                 });
                 if self.strategy != prev_strategy {
                     self.trigger_reset();
