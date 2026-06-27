@@ -291,9 +291,8 @@ impl eframe::App for RnptGuiApp {
         // Fetch new pixels from tracer
         let mut pixels_updated = false;
         if let Some(tracer) = &self.tracer {
-            // Run NIRC training pass if enabled
-            let num_pixels = self.local_width * self.local_height;
-            tracer.train_nirc(num_pixels.max(10000) / 20); // 5% budget
+            // Drain worker-collected training samples and update the NIRC network.
+            tracer.train_nirc();
 
             tracer.fetch_pixels(&mut self.local_pixels);
 

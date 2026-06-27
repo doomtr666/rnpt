@@ -29,28 +29,14 @@ impl NircTrainer {
         }
     }
 
-    /// Exécute une passe d'apprentissage (training) en sélectionnant de nouveaux rayons.
-    /// Pour chaque étape du "budget", un rayon de training est généré dans la scène,
-    /// rebondit via Monte Carlo, et ramène une couleur cible qui sert de vérité terrain.
-    /// Les données sont accumulées dans un batch et envoyées au réseau dès que le batch est plein.
-    pub fn train(&mut self, tracer: &crate::PathTracer, rng: &mut crate::Pcg32, budget: usize) {
-        let mut batch = Vec::with_capacity(self.config.batch_size);
-
-        for _ in 0..budget {
-            if let Some((input, target)) = tracer.trace_training_path(rng) {
-                let target_vec = nalgebra::SVector::<f32, 3>::new(target.x, target.y, target.z);
-                batch.push((input, target_vec));
-
-                if batch.len() >= self.config.batch_size {
-                    self.network.train_batch(&mut *self.optimizer, &batch);
-                    batch.clear();
-                }
-            }
+    /// Trains on pre-collected samples (produced by worker threads inline with rendering).
+    /// Samples are chunked into `batch_size` and each chunk becomes one gradient step.
+    pub fn train_samples(&mut self, samples: &[(nalgebra::SVector<f32, INPUT_DIM>, nalgebra::SVector<f32, 3>)]) {
+        if samples.is_empty() {
+            return;
         }
-
-        // Applique les gradients restants si le batch n'est pas complètement vide
-        if !batch.is_empty() {
-            self.network.train_batch(&mut *self.optimizer, &batch);
+        for chunk in samples.chunks(self.config.batch_size) {
+            self.network.train_batch(&mut *self.optimizer, chunk);
         }
     }
 }

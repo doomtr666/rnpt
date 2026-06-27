@@ -93,6 +93,12 @@ impl PathTracer {
         Self { config, cam2world }
     }
 
+    /// Hot-swap the inference network without recreating the PathTracer.
+    /// Workers call this to pick up NIRC updates without resetting pixel accumulation.
+    pub fn set_nirc_network(&mut self, network: Option<Arc<crate::nirc::NircMlp>>) {
+        self.config.nirc_network = network;
+    }
+
     fn init_pixel_rng(&self, x: u32, y: u32, frame_index: u32) -> Pcg32 {
         // Pack everything into a single 128-bit primitive
         // High 64 bits: Spatial coordinates (X, Y)
@@ -214,6 +220,7 @@ impl PathTracer {
         rays: &mut u64,
         shadow_rays: &mut u64,
         strategy: SamplingStrategy,
+        max_depth: u32,
     ) -> Color {
         let mut accumulated_radiance = Color::black();
         let mut throughput = Color::white(); // Current path attenuation factor
@@ -221,7 +228,7 @@ impl PathTracer {
         // (0 for the camera ray) — needed for the MIS weight on emitter hits.
         let mut bsdf_pdf = 0.0f32;
 
-        for bounce in 0..MAX_BOUNCES {
+        for bounce in 0..max_depth {
             // Closest-hit intersection with the scene.
             *rays += 1;
             let Some(hit) = self.config.bvh.intersect(&ray) else {
@@ -285,91 +292,108 @@ impl PathTracer {
         accumulated_radiance
     }
 
-    /// Traces a single random path to collect a training sample for the NIRC.
-    /// Returns `Some((input, target_radiance))` if a valid path was generated.
-    pub fn trace_training_path(
+    /// Traces a full MIS path from pixel (x, y) and returns one training sample per
+    /// opaque bounce >= 1. Russian roulette provides unbiased termination — no depth cap.
+    ///
+    /// The target at bounce n is the suffix-weighted direct radiance from n onward:
+    ///   target[n] = (Σ_{k≥n} T_k · direct_k) / T_n
+    /// computed by a backward pass after the full path is traced. Emission is excluded
+    /// at every vertex; inference re-adds it with the correct MIS weight.
+    pub fn collect_training_samples_for_pixel(
         &self,
+        x: usize,
+        y: usize,
         rng: &mut Pcg32,
-    ) -> Option<(nalgebra::SVector<f32, { crate::nirc::INPUT_DIM }>, Color)> {
-        // 1. Generate a random primary ray
-        let x = rng.next_f32() * self.config.width as f32;
-        let y = rng.next_f32() * self.config.height as f32;
-        let ray = self.generate_ray(rng, x, y);
+    ) -> Vec<(nalgebra::SVector<f32, { crate::nirc::INPUT_DIM }>, nalgebra::SVector<f32, 3>)> {
+        // ── Forward pass ──────────────────────────────────────────────────────────────
+        // At each opaque bounce n ≥ 1 we record:
+        //   input     = encode(ray.origin = pos_{n-1}, ray.dir = d_{n-1→n})
+        //   throughput = T_n  (cumulative, accounts for BRDF weights + RR survival)
+        //   direct    = NEE at n (emission excluded)
 
-        // 2. Find primary intersection
-        let Some(hit) = self.config.bvh.intersect(&ray) else {
-            return None;
-        };
-        let surf = evaluate_surface(&hit, &ray, &self.config.bvh, &self.config.scene);
-        let wo = -ray.direction.into_inner();
-
-        // 3. Sample outgoing direction
-        let brdf = surf.brdf();
-        let Some(bs) = brdf.sample(&surf.normal, &wo, rng) else {
-            return None;
-        };
-        let cos_theta = surf.normal.dot(&bs.wi).max(0.0);
-        if bs.pdf <= 0.0 || cos_theta <= 0.0 {
-            return None;
+        struct Vertex {
+            input: nalgebra::SVector<f32, { crate::nirc::INPUT_DIM }>,
+            throughput: Color,
+            direct: Color,
         }
 
-        let input = crate::nirc::NircMlp::encode_inputs(
-            &surf.position,
-            &bs.wi,
-            &self.config.bvh.bounds_min,
-            &self.config.bvh.bounds_max,
-        );
+        let mut vertices: Vec<Vertex> = Vec::with_capacity(8);
+        let mut ray = self.generate_ray(rng, x as f32, y as f32);
+        let mut throughput = Color::white();
 
-        // 4. Single BVH traversal to find bounce-1.
-        let secondary_ray = Ray::new(surf.position, nalgebra::UnitVector3::new_unchecked(bs.wi));
-        let Some(hit1) = self.config.bvh.intersect(&secondary_ray) else {
-            // Ray escaped to environment; Nirc is not queried at inference for env hits.
-            return None;
-        };
-        let surf1 = evaluate_surface(&hit1, &secondary_ray, &self.config.bvh, &self.config.scene);
+        for bounce in 0..MAX_BOUNCES {
+            let Some(hit) = self.config.bvh.intersect(&ray) else { break; };
+            let surf = evaluate_surface(&hit, &ray, &self.config.bvh, &self.config.scene);
+            let wo = -ray.direction.into_inner();
 
-        // Skip transmissive b1: Nirc is not queried at inference for dielectric bounces.
-        if surf1.transmission > 0.0 {
-            return None;
-        }
+            // Transmissive: NRC never queried at inference for dielectrics; skip and stop.
+            if surf.transmission > 0.0 {
+                break;
+            }
 
-        let wo1 = -secondary_ray.direction.into_inner();
-        let brdf1 = surf1.brdf();
+            let brdf = surf.brdf();
 
-        // 5. Ground-truth target = NEE at b1 + indirect from b2.
-        //    Emission at b1 is deliberately omitted: inference re-adds it with the correct MIS weight.
-        let mut dummy_shadow = 0u64;
-        let direct_b1 = self.compute_direct_lighting(
-            &surf1.position,
-            &surf1.normal,
-            &brdf1,
-            &wo1,
-            &mut dummy_shadow,
-            rng,
-            SamplingStrategy::Mis,
-        );
-
-        let indirect_b1 = if let Some(bs1) = brdf1.sample(&surf1.normal, &wo1, rng) {
-            let cos1 = surf1.normal.dot(&bs1.wi).max(0.0);
-            if bs1.pdf > 0.0 && cos1 > 0.0 {
-                let ray_b2 = Ray::new(surf1.position, nalgebra::UnitVector3::new_unchecked(bs1.wi));
-                let mut dummy_rays = 0u64;
-                let radiance_b2 = self.trace_path(
-                    ray_b2,
+            // Record training vertex for bounces ≥ 1 (bounce 0 is never queried at inference).
+            if bounce >= 1 {
+                let input = crate::nirc::NircMlp::encode_inputs(
+                    &ray.origin,
+                    &ray.direction.into_inner(),
+                    &self.config.bvh.bounds_min,
+                    &self.config.bvh.bounds_max,
+                );
+                let mut dummy = 0u64;
+                let direct = self.compute_direct_lighting(
+                    &surf.position,
+                    &surf.normal,
+                    &brdf,
+                    &wo,
+                    &mut dummy,
                     rng,
-                    &mut dummy_rays,
-                    &mut dummy_shadow,
                     SamplingStrategy::Mis,
                 );
-                radiance_b2.component_mul(&(bs1.f * (cos1 / bs1.pdf)))
-            } else {
-                Color::black()
+                vertices.push(Vertex { input, throughput, direct });
             }
-        } else {
-            Color::black()
-        };
 
-        Some((input, direct_b1 + indirect_b1))
+            // Sample next direction and advance.
+            let Some(bs) = brdf.sample(&surf.normal, &wo, rng) else { break; };
+            let cos_theta = surf.normal.dot(&bs.wi).max(0.0);
+            if bs.pdf <= 0.0 || cos_theta <= 0.0 { break; }
+
+            throughput = throughput.component_mul(&(bs.f * (cos_theta / bs.pdf)));
+            if russian_roulette(&mut throughput, bounce, rng) { break; }
+
+            ray = Ray::new(surf.position, nalgebra::UnitVector3::new_unchecked(bs.wi));
+        }
+
+        if vertices.is_empty() {
+            return Vec::new();
+        }
+
+        // ── Backward pass ─────────────────────────────────────────────────────────────
+        // running_suffix = Σ_{k≥current} T_k · direct_k  (accumulated from the end)
+        // target[n] = running_suffix / T_n
+        // This is unbiased: no depth truncation, RR compensates path weights.
+
+        let n = vertices.len();
+        let mut samples = Vec::with_capacity(n);
+        let mut running_suffix = Color::black();
+
+        for v in vertices.iter().rev() {
+            running_suffix += v.throughput.component_mul(&v.direct);
+            let t = &v.throughput;
+            let target = Color::new(
+                if t.x > 1e-6 { (running_suffix.x / t.x).max(0.0) } else { 0.0 },
+                if t.y > 1e-6 { (running_suffix.y / t.y).max(0.0) } else { 0.0 },
+                if t.z > 1e-6 { (running_suffix.z / t.z).max(0.0) } else { 0.0 },
+            );
+            samples.push((
+                v.input,
+                nalgebra::SVector::<f32, 3>::new(target.x, target.y, target.z),
+            ));
+        }
+
+        samples.reverse();
+        samples
     }
 
     fn handle_environment_hit(
@@ -584,6 +608,7 @@ impl PathTracer {
             &mut rays,
             &mut shadow_rays,
             self.config.strategy,
+            MAX_BOUNCES,
         );
 
         pixel.accumulated_radiance += sample_color;
