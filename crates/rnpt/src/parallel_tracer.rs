@@ -1,26 +1,20 @@
 use crate::{
-    PathTracer, PathTracerConfig, Pixel,
-    nirc::{NircConfig, NircTrainer, INPUT_DIM},
+    PathTracer, PathTracerConfig, Pixel, SamplingStrategy,
+    evaluate_surface,
+    nirc::{NircConfig, NircMlp, NircRingBuffer, NircTrainer},
 };
-use nalgebra::SVector;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 const TILE_SIZE: usize = 128;
 const BATCH_SIZE: u64 = 256;
-/// One out of every N rendered pixels triggers a full training path (returns multiple samples).
-/// Higher than before because each path yields one sample per bounce (Cornell ≈ 4-6 samples/path).
+/// One out of every N rendered pixels triggers a dedicated MIS training path.
 const TRAIN_PIXEL_STRIDE: usize = 64;
-/// Worker-local sample capacity before flushing to the shared buffer (one short lock).
-const LOCAL_TRAIN_BATCH_CAPACITY: usize = 64;
 /// Workers refresh their cached NIRC network from the shared config this often (in pixels).
 const NIRC_REFRESH_STRIDE: usize = 512;
-/// Hard cap on the shared sample buffer. If workers fill it faster than train_nirc can drain,
-/// we discard the excess to prevent unbounded growth and O(n) training cost per frame.
-const MAX_TRAINING_BUFFER: usize = 4096;
-
-type NircSample = (SVector<f32, INPUT_DIM>, SVector<f32, 3>);
+/// Number of random samples read from the ring buffer per training call.
+const RING_TRAIN_BATCH: usize = 512;
 
 /// A lock-free pixel buffer that multiple threads can write to concurrently.
 /// This is safe because each worker thread writes to a unique disjoint set of pixels.
@@ -52,7 +46,7 @@ pub struct ParallelTracer {
     /// Incremented only when the NIRC network is updated. Workers hot-swap their network
     /// without restarting the render pass or recreating PathTracer.
     nirc_epoch: Arc<AtomicU32>,
-    pixels: Vec<Pixel>, // owned pixel buffer; threads hold raw pointers into this
+    pixels: Vec<Pixel>,      // owned pixel buffer; threads hold raw pointers into this
     threads: Vec<thread::JoinHandle<()>>,
 
     // Performance metrics
@@ -63,8 +57,8 @@ pub struct ParallelTracer {
 
     // NIRC training state
     nirc_trainer: Mutex<NircTrainer>,
-    /// Training samples collected inline by workers; drained by train_nirc.
-    shared_sample_buffer: Arc<Mutex<Vec<NircSample>>>,
+    /// Lock-free ring buffer: workers push training samples, trainer reads random batches.
+    nirc_ring: Arc<NircRingBuffer>,
 }
 
 impl ParallelTracer {
@@ -77,6 +71,8 @@ impl ParallelTracer {
         let buffer_ptr = pixels.as_mut_ptr();
         let shared_buffer = Arc::new(UnsafePixelBuffer::new(buffer_ptr));
 
+        let nirc_ring = Arc::new(NircRingBuffer::new());
+
         let config = Arc::new(Mutex::new(config));
         let epoch = Arc::new(AtomicU32::new(1));
         let nirc_epoch = Arc::new(AtomicU32::new(0));
@@ -84,8 +80,6 @@ impl ParallelTracer {
         let total_real_rays = Arc::new(AtomicU64::new(0));
         let total_shadow_rays = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicBool::new(true));
-        let shared_sample_buffer: Arc<Mutex<Vec<NircSample>>> =
-            Arc::new(Mutex::new(Vec::new()));
 
         let num_threads = thread::available_parallelism()
             .map(|n| n.get())
@@ -94,6 +88,7 @@ impl ParallelTracer {
 
         for thread_idx in 0..num_threads {
             let buffer = shared_buffer.clone();
+            let ring = nirc_ring.clone();
             let config_mutex = config.clone();
             let epoch_atomic = epoch.clone();
             let nirc_epoch_atomic = nirc_epoch.clone();
@@ -101,7 +96,6 @@ impl ParallelTracer {
             let real_rays_atomic = total_real_rays.clone();
             let shadow_rays_atomic = total_shadow_rays.clone();
             let running_atomic = running.clone();
-            let sample_buffer = shared_sample_buffer.clone();
 
             threads.push(
                 thread::Builder::new()
@@ -112,6 +106,7 @@ impl ParallelTracer {
                             thread_idx,
                             num_threads,
                             buffer,
+                            ring,
                             config_mutex,
                             epoch_atomic,
                             nirc_epoch_atomic,
@@ -119,7 +114,6 @@ impl ParallelTracer {
                             real_rays_atomic,
                             shadow_rays_atomic,
                             running_atomic,
-                            sample_buffer,
                         )
                     })
                     .expect("Failed to spawn worker thread"),
@@ -137,56 +131,38 @@ impl ParallelTracer {
             total_shadow_rays,
             running,
             nirc_trainer: Mutex::new(NircTrainer::new(NircConfig::default())),
-            shared_sample_buffer,
+            nirc_ring,
         }
     }
 
-    /// Consumes samples collected by workers, trains the NIRC, then pushes the updated
-    /// network to the shared config via EMA. Signals `nirc_epoch` so workers hot-swap
-    /// the network without restarting their render pass.
-    pub fn train_nirc(&self) {
-        if self.config.lock().unwrap().strategy != crate::SamplingStrategy::Nirc {
-            return;
+    /// Train the NIRC from the ring buffer and publish the updated network to workers.
+    /// Returns the average training loss for this step, or `None` if skipped.
+    pub fn train_nirc(&self) -> Option<f32> {
+        if self.config.lock().unwrap().strategy != SamplingStrategy::Nirc {
+            return None;
         }
 
-        // Drain the shared sample buffer; cap to avoid unbounded growth.
-        let samples = {
-            let mut buf = match self.shared_sample_buffer.try_lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            if buf.is_empty() {
-                return;
-            }
-            let mut v = std::mem::take(&mut *buf);
-            if v.len() > MAX_TRAINING_BUFFER {
-                v.drain(..v.len() - MAX_TRAINING_BUFFER);
-            }
-            v
-        };
+        let samples = self.nirc_ring.read_random_batch(RING_TRAIN_BATCH);
+        if samples.is_empty() {
+            return None;
+        }
 
         let mut trainer = match self.nirc_trainer.try_lock() {
             Ok(guard) => guard,
-            Err(_) => return,
+            Err(_) => return None,
         };
 
-        trainer.train_samples(&samples);
+        let loss = trainer.train_samples(&samples);
 
-        // EMA update: blend the inference network toward the freshly trained weights.
-        let new_active = if let Some(old) = &self.config.lock().unwrap().nirc_network {
-            let mut updated = (**old).clone();
-            updated.ema(&*trainer.network, 0.05);
-            updated
-        } else {
-            (*trainer.network).clone()
-        };
-
+        // Publish the EMA snapshot. `ema_buf` is maintained in-place by `train_samples`;
+        // we only allocate here (one Box per step) to hand off an immutable Arc to workers.
+        let new_arc = Arc::from(trainer.ema_buf.clone_boxed());
         {
-            let mut cfg_lock = self.config.lock().unwrap();
-            cfg_lock.nirc_network = Some(Arc::new(new_active));
+            let mut cfg = self.config.lock().unwrap();
+            cfg.nirc_network = Some(new_arc);
         }
-        // Signal workers to hot-swap the network. Does NOT restart the render pass.
         self.nirc_epoch.fetch_add(1, Ordering::Release);
+        Some(loss)
     }
 
     pub fn update_scene(&mut self, new_config: PathTracerConfig) {
@@ -205,11 +181,14 @@ impl ParallelTracer {
 
     pub fn fetch_pixels(&self, target_buffer: &mut [Pixel]) {
         assert_eq!(target_buffer.len(), self.pixels.len());
-        // Concurrent read from the vector while threads are writing.
-        // This is practically safe here since f32 tearing on X/Y/Z doesn't crash
-        // and visually looks fine.
         target_buffer.copy_from_slice(&self.pixels);
     }
+
+    /// Number of training samples currently in the ring buffer.
+    pub fn ring_filled(&self) -> usize {
+        self.nirc_ring.filled()
+    }
+
 
     pub fn pop_rays_traced(&self) -> u64 {
         self.total_rays.swap(0, Ordering::Relaxed)
@@ -223,10 +202,60 @@ impl ParallelTracer {
         self.total_shadow_rays.swap(0, Ordering::Relaxed)
     }
 
+    /// Render an equirectangular map of what the NIRC network predicts from the
+    /// surface point hit by pixel (px, py). Returns `None` if no network is loaded
+    /// or the primary ray doesn't hit any geometry.
+    pub fn render_nirc_probe(
+        &self,
+        px: f32,
+        py: f32,
+        probe_w: usize,
+        probe_h: usize,
+    ) -> Option<Vec<[f32; 3]>> {
+        let cfg = self.config.lock().ok()?.clone();
+        let network = cfg.nirc_network.as_ref()?.clone();
+        let bounds_min = cfg.bvh.bounds_min;
+        let bounds_max = cfg.bvh.bounds_max;
+
+        let pt = PathTracer::new(cfg.clone());
+        let mut rng = crate::Pcg32::from_seed_128(42);
+        let ray = pt.generate_ray(&mut rng, px, py);
+
+        let hit = cfg.bvh.intersect(&ray)?;
+        let surf = evaluate_surface(&hit, &ray, &cfg.bvh, &cfg.scene);
+        let pos = surf.position;
+        let geo_normal = surf.geo_normal;
+
+        let mut probe = Vec::with_capacity(probe_w * probe_h);
+        for row in 0..probe_h {
+            for col in 0..probe_w {
+                let phi = (col as f32 + 0.5) / probe_w as f32 * std::f32::consts::TAU;
+                let theta = (row as f32 + 0.5) / probe_h as f32 * std::f32::consts::PI;
+                let wi = nalgebra::Vector3::new(
+                    theta.sin() * phi.cos(),
+                    theta.cos(),
+                    theta.sin() * phi.sin(),
+                );
+
+                // Below the geometric horizon the network is never queried at runtime.
+                if wi.dot(geo_normal.as_ref()) <= 0.0 {
+                    probe.push([0.0, 0.0, 0.0]);
+                    continue;
+                }
+
+                let input = NircMlp::encode_inputs(&pos, &wi, &bounds_min, &bounds_max);
+                let pred = network.forward(input);
+                probe.push([pred[0].max(0.0), pred[1].max(0.0), pred[2].max(0.0)]);
+            }
+        }
+        Some(probe)
+    }
+
     fn worker_loop(
         thread_idx: usize,
         num_threads: usize,
         buffer: Arc<UnsafePixelBuffer>,
+        nirc_ring: Arc<NircRingBuffer>,
         config_mutex: Arc<Mutex<PathTracerConfig>>,
         epoch_atomic: Arc<AtomicU32>,
         nirc_epoch_atomic: Arc<AtomicU32>,
@@ -234,7 +263,6 @@ impl ParallelTracer {
         real_rays_atomic: Arc<AtomicU64>,
         shadow_rays_atomic: Arc<AtomicU64>,
         running_atomic: Arc<AtomicBool>,
-        sample_buffer: Arc<Mutex<Vec<NircSample>>>,
     ) {
         let mut local_epoch = 0u32;
         let mut local_nirc_epoch = u32::MAX; // force first refresh
@@ -261,8 +289,6 @@ impl ParallelTracer {
             let mut rays_traced = 0u64;
             let mut real_rays_traced = 0u64;
             let mut shadow_rays_traced = 0u64;
-            let mut local_train: Vec<NircSample> =
-                Vec::with_capacity(LOCAL_TRAIN_BATCH_CAPACITY);
             let mut pixel_count = 0usize;
 
             let blocks_x = (width + TILE_SIZE - 1) / TILE_SIZE;
@@ -323,22 +349,18 @@ impl ParallelTracer {
                             let (r, s) = tracer.sample_pixel(x, y, pixel);
                             real_rays_traced += r;
                             shadow_rays_traced += s;
+
+
                         }
                         rays_traced += 1;
 
-                        // Every TRAIN_PIXEL_STRIDE pixels, trace a full unbiased path and
-                        // collect one training sample per opaque bounce (suffix backward pass).
+                        // Every TRAIN_PIXEL_STRIDE pixels, trace a dedicated MIS path
+                        // and push all bounce samples into the lock-free ring buffer.
                         if pixel_count % TRAIN_PIXEL_STRIDE == 0 {
                             let new_samples = tracer
                                 .collect_training_samples_for_pixel(x, y, &mut train_rng);
-                            local_train.extend(new_samples);
-
-                            if local_train.len() >= LOCAL_TRAIN_BATCH_CAPACITY {
-                                if let Ok(mut buf) = sample_buffer.try_lock() {
-                                    buf.extend(local_train.drain(..));
-                                } else {
-                                    local_train.clear(); // lock busy → discard, don't block
-                                }
+                            for (inp, tgt) in new_samples {
+                                nirc_ring.push(inp, tgt);
                             }
                         }
                     }
@@ -348,13 +370,6 @@ impl ParallelTracer {
                     {
                         break 'pass;
                     }
-                }
-            }
-
-            // Flush remaining samples at end of pass.
-            if !local_train.is_empty() {
-                if let Ok(mut buf) = sample_buffer.try_lock() {
-                    buf.extend(local_train.drain(..));
                 }
             }
 

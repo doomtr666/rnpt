@@ -99,6 +99,11 @@ impl PathTracer {
         self.config.nirc_network = network;
     }
 
+
+    pub fn has_nirc_network(&self) -> bool {
+        self.config.nirc_network.is_some()
+    }
+
     fn init_pixel_rng(&self, x: u32, y: u32, frame_index: u32) -> Pcg32 {
         // Pack everything into a single 128-bit primitive
         // High 64 bits: Spatial coordinates (X, Y)
@@ -295,52 +300,67 @@ impl PathTracer {
     /// Traces a full MIS path from pixel (x, y) and returns one training sample per
     /// opaque bounce >= 1. Russian roulette provides unbiased termination — no depth cap.
     ///
-    /// The target at bounce n is the suffix-weighted direct radiance from n onward:
-    ///   target[n] = (Σ_{k≥n} T_k · direct_k) / T_n
-    /// computed by a backward pass after the full path is traced. Emission is excluded
-    /// at every vertex; inference re-adds it with the correct MIS weight.
+    /// Predicts raw incident radiance L_i(pos_k, wi_k) = L_outgoing(pos_{k+1}).
+    /// The BRDF at pos_k is NOT in the target — it is applied at inference time.
+    /// For each consecutive bounce pair (k, k+1):
+    ///   input  = encode(pos_k, wi_k)            scatter direction toward pos_{k+1}
+    ///   target = emission_{k+1} + direct_{k+1} + Σ_{j>k+1}(T_j/T_{k+1})·(E_j+D_j)
     pub fn collect_training_samples_for_pixel(
         &self,
         x: usize,
         y: usize,
         rng: &mut Pcg32,
     ) -> Vec<(nalgebra::SVector<f32, { crate::nirc::INPUT_DIM }>, nalgebra::SVector<f32, 3>)> {
-        // ── Forward pass ──────────────────────────────────────────────────────────────
-        // At each opaque bounce n ≥ 1 we record:
-        //   input     = encode(ray.origin = pos_{n-1}, ray.dir = d_{n-1→n})
-        //   throughput = T_n  (cumulative, accounts for BRDF weights + RR survival)
-        //   direct    = NEE at n (emission excluded)
-
         struct Vertex {
-            input: nalgebra::SVector<f32, { crate::nirc::INPUT_DIM }>,
+            position: Point3<f32>,
+            wi_scatter: Vector3<f32>, // scatter direction from pos_k toward pos_{k+1}
             throughput: Color,
             direct: Color,
+            emission: Color,
         }
 
         let mut vertices: Vec<Vertex> = Vec::with_capacity(8);
         let mut ray = self.generate_ray(rng, x as f32, y as f32);
         let mut throughput = Color::white();
+        let mut bsdf_pdf = 0.0f32;
+        let mut running_suffix = Color::black();
 
         for bounce in 0..MAX_BOUNCES {
-            let Some(hit) = self.config.bvh.intersect(&ray) else { break; };
+            let Some(hit) = self.config.bvh.intersect(&ray) else {
+                if let Some(env_idx) = self.config.env {
+                    let env_light = &self.config.lights[env_idx];
+                    let dir = ray.direction.into_inner();
+                    if !vertices.is_empty() {
+                        // Push a sky pseudo-vertex so the backward pass emits a training
+                        // pair (pos_k, wi_escape) → env_radiance × MIS_w.  Without this,
+                        // the network never sees escape directions in training and
+                        // extrapolates incorrectly at inference on open scenes (Bistro, etc).
+                        let p_l = env_light.env_pdf(&dir);
+                        let denom = bsdf_pdf + p_l;
+                        let w = if denom > 0.0 { bsdf_pdf / denom } else { 1.0 };
+                        let env_rad = env_light.radiance(&dir);
+                        vertices.push(Vertex {
+                            position: vertices.last().unwrap().position, // placeholder
+                            wi_scatter: Vector3::zeros(),
+                            throughput,
+                            direct: Color::black(),
+                            emission: Color::new(env_rad.x * w, env_rad.y * w, env_rad.z * w),
+                        });
+                    }
+                    // No vertices yet (bounce 0 or 1 miss): no useful pair can be formed.
+                }
+                break;
+            };
             let surf = evaluate_surface(&hit, &ray, &self.config.bvh, &self.config.scene);
             let wo = -ray.direction.into_inner();
 
-            // Transmissive: NRC never queried at inference for dielectrics; skip and stop.
             if surf.transmission > 0.0 {
                 break;
             }
 
             let brdf = surf.brdf();
 
-            // Record training vertex for bounces ≥ 1 (bounce 0 is never queried at inference).
             if bounce >= 1 {
-                let input = crate::nirc::NircMlp::encode_inputs(
-                    &ray.origin,
-                    &ray.direction.into_inner(),
-                    &self.config.bvh.bounds_min,
-                    &self.config.bvh.bounds_max,
-                );
                 let mut dummy = 0u64;
                 let direct = self.compute_direct_lighting(
                     &surf.position,
@@ -351,48 +371,80 @@ impl PathTracer {
                     rng,
                     SamplingStrategy::Mis,
                 );
-                vertices.push(Vertex { input, throughput, direct });
+                let emission = if surf.emissive != Color::zeros() {
+                    let cos_l = surf.geo_normal.dot(&wo).max(0.0);
+                    let p_l = self.config.lights.get(hit.light as usize)
+                        .map_or(0.0, |l| l.area_pdf(hit.hit.t * hit.hit.t, cos_l));
+                    let denom = bsdf_pdf + p_l;
+                    surf.emissive * if denom > 0.0 { bsdf_pdf / denom } else { 1.0 }
+                } else {
+                    Color::black()
+                };
+                // wi_scatter filled after BSDF sample below
+                vertices.push(Vertex {
+                    position: surf.position,
+                    wi_scatter: Vector3::zeros(),
+                    throughput,
+                    direct,
+                    emission,
+                });
             }
 
-            // Sample next direction and advance.
             let Some(bs) = brdf.sample(&surf.normal, &wo, rng) else { break; };
             let cos_theta = surf.normal.dot(&bs.wi).max(0.0);
             if bs.pdf <= 0.0 || cos_theta <= 0.0 { break; }
 
+            if bounce >= 1 {
+                vertices.last_mut().unwrap().wi_scatter = bs.wi;
+            }
+
+            bsdf_pdf = bs.pdf;
             throughput = throughput.component_mul(&(bs.f * (cos_theta / bs.pdf)));
             if russian_roulette(&mut throughput, bounce, rng) { break; }
 
             ray = Ray::new(surf.position, nalgebra::UnitVector3::new_unchecked(bs.wi));
         }
 
-        if vertices.is_empty() {
+        // Need at least 2 vertices to form (pos_k, wi_k) → L_out(pos_{k+1}) pairs.
+        if vertices.len() < 2 {
             return Vec::new();
         }
 
         // ── Backward pass ─────────────────────────────────────────────────────────────
-        // running_suffix = Σ_{k≥current} T_k · direct_k  (accumulated from the end)
-        // target[n] = running_suffix / T_n
-        // This is unbiased: no depth truncation, RR compensates path weights.
+        // Iterate k from deepest (n-1) down to 1. At each k, vertex[k] provides the
+        // training TARGET (L_outgoing at pos_k) and vertex[k-1] provides the INPUT
+        // (pos_{k-1}, wi_{k-1} = scatter direction from k-1 toward k).
+        // running_suffix already holds env-escape; gets extended toward shallower vertices.
 
         let n = vertices.len();
-        let mut samples = Vec::with_capacity(n);
-        let mut running_suffix = Color::black();
+        let mut samples = Vec::with_capacity(n - 1);
 
-        for v in vertices.iter().rev() {
-            running_suffix += v.throughput.component_mul(&v.direct);
-            let t = &v.throughput;
+        for k in (1..n).rev() {
+            let vk = &vertices[k];
+            let t = &vk.throughput;
+            // L_outgoing(pos_k) = emission_k + direct_k + contributions from deeper bounces
             let target = Color::new(
-                if t.x > 1e-6 { (running_suffix.x / t.x).max(0.0) } else { 0.0 },
-                if t.y > 1e-6 { (running_suffix.y / t.y).max(0.0) } else { 0.0 },
-                if t.z > 1e-6 { (running_suffix.z / t.z).max(0.0) } else { 0.0 },
+                (vk.emission.x + vk.direct.x
+                    + if t.x > 1e-6 { running_suffix.x / t.x } else { 0.0 }).max(0.0),
+                (vk.emission.y + vk.direct.y
+                    + if t.y > 1e-6 { running_suffix.y / t.y } else { 0.0 }).max(0.0),
+                (vk.emission.z + vk.direct.z
+                    + if t.z > 1e-6 { running_suffix.z / t.z } else { 0.0 }).max(0.0),
+            );
+            let vk_prev = &vertices[k - 1];
+            let input = crate::nirc::NircMlp::encode_inputs(
+                &vk_prev.position,
+                &vk_prev.wi_scatter,
+                &self.config.bvh.bounds_min,
+                &self.config.bvh.bounds_max,
             );
             samples.push((
-                v.input,
+                input,
                 nalgebra::SVector::<f32, 3>::new(target.x, target.y, target.z),
             ));
+            running_suffix += vk.throughput.component_mul(&(vk.emission + vk.direct));
         }
 
-        samples.reverse();
         samples
     }
 
@@ -543,32 +595,64 @@ impl PathTracer {
             Color::black()
         };
 
-        let direct = if strategy == SamplingStrategy::Nirc && bounce == 1 {
+        // Direct lighting: always use balanced MIS in NIRC mode.
+        // With strategy=Nirc the NEE weight was 1.0 at bounce=0, while
+        // handle_environment_hit and emitter-hit emission both used the BSDF-side
+        // MIS weight.  That made the env/emitter contribution > 1×: the NEE
+        // provided the full integral AND the escape/emitter-hit added a partial
+        // extra.  Forcing Mis here gives the correct balanced w = p_l/(p_l+p_b).
+        let direct = self.compute_direct_lighting(
+            &surf.position,
+            &surf.normal,
+            brdf,
+            wo,
+            shadow_rays,
+            rng,
+            if strategy == SamplingStrategy::Nirc {
+                SamplingStrategy::Mis
+            } else {
+                strategy
+            },
+        );
+
+        // At bounce=1 in NIRC mode: draw N BSDF samples and average N network queries.
+        // Each query estimates L_inc(pos_1, wi_k) = L_out(pos_2); averaging reduces
+        // the per-pixel MC variance by N compared to a single BSDF sample.
+        // Network queries (~43k ops each) are far cheaper than BVH rays.
+        const NIRC_INDIRECT_SAMPLES: usize = 4;
+        let nirc_indirect = if strategy == SamplingStrategy::Nirc && bounce == 1 {
             if let Some(network) = &self.config.nirc_network {
-                let input = crate::nirc::NircMlp::encode_inputs(
-                    &ray.origin,
-                    &ray.direction.into_inner(),
-                    &self.config.bvh.bounds_min,
-                    &self.config.bvh.bounds_max,
-                );
-                let pred = network.forward(input);
-                Color::new(pred[0].max(0.0), pred[1].max(0.0), pred[2].max(0.0))
+                let mut sum = Color::black();
+                let mut n_valid = 0u32;
+                for _ in 0..NIRC_INDIRECT_SAMPLES {
+                    if let Some(bs) = brdf.sample(&surf.normal, wo, rng) {
+                        let cos_i = surf.normal.dot(&bs.wi).max(0.0);
+                        if bs.pdf > 0.0 && cos_i > 0.0 {
+                            let input = crate::nirc::NircMlp::encode_inputs(
+                                &surf.position,
+                                &bs.wi,
+                                &self.config.bvh.bounds_min,
+                                &self.config.bvh.bounds_max,
+                            );
+                            let pred = network.forward(input);
+                            sum += Color::new(
+                                pred[0].max(0.0) * bs.f.x * cos_i / bs.pdf,
+                                pred[1].max(0.0) * bs.f.y * cos_i / bs.pdf,
+                                pred[2].max(0.0) * bs.f.z * cos_i / bs.pdf,
+                            );
+                            n_valid += 1;
+                        }
+                    }
+                }
+                if n_valid > 0 { sum / n_valid as f32 } else { Color::black() }
             } else {
                 Color::black()
             }
         } else {
-            self.compute_direct_lighting(
-                &surf.position,
-                &surf.normal,
-                brdf,
-                wo,
-                shadow_rays,
-                rng,
-                strategy,
-            )
+            Color::black()
         };
 
-        *accumulated_radiance += throughput.component_mul(&(emission + direct));
+        *accumulated_radiance += throughput.component_mul(&(emission + direct + nirc_indirect));
 
         if strategy == SamplingStrategy::Nirc && bounce == 1 {
             return false;
@@ -596,6 +680,10 @@ impl PathTracer {
     /// Trace one sample for pixel (x, y), accumulating into `pixel`. Returns
     /// `(rays, shadow_rays)`: closest-hit rays (primary + bounces) and any-hit
     /// shadow rays. Thread-safe as long as threads own disjoint pixels.
+    ///
+    /// `accumulated_radiance` stores the **running mean** (not the sum).
+    /// In NIRC mode the blending alpha is clamped to EMA_PIXEL_ALPHA so old,
+    /// poorly-predicted samples fade out as the network converges.
     pub fn sample_pixel(&self, x: usize, y: usize, pixel: &mut Pixel) -> (u64, u64) {
         let mut rng = self.init_pixel_rng(x as u32, y as u32, pixel.samples);
         let ray = self.generate_ray(&mut rng, x as f32, y as f32);
@@ -611,7 +699,10 @@ impl PathTracer {
             MAX_BOUNCES,
         );
 
-        pixel.accumulated_radiance += sample_color;
+        let n = pixel.samples;
+        let alpha = 1.0 / (n as f32 + 1.0);
+        pixel.accumulated_radiance =
+            pixel.accumulated_radiance * (1.0 - alpha) + sample_color * alpha;
         pixel.samples += 1;
         (rays, shadow_rays)
     }

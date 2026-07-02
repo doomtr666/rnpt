@@ -60,6 +60,13 @@ struct RnptGuiApp {
 
     // Debug mode
     show_debug: bool,
+
+    frame_count: u64,
+    last_loss: f32,
+    loss_ema: f32,   // smoothed loss for display
+
+    // NIRC directional probe (Ctrl+click)
+    probe_texture: Option<egui::TextureHandle>,
 }
 
 /// Append the environment light (if any) to the unified light list and report
@@ -211,6 +218,47 @@ impl RnptGuiApp {
             bvh_build_ms,
             bvh_triangle_count,
             show_debug: false,
+            frame_count: 0,
+            last_loss: 0.0,
+            loss_ema: 0.0,
+            probe_texture: None,
+        }
+    }
+
+    /// Query the NIRC network from all directions at the surface point hit by (px, py)
+    /// and update `probe_texture` with the resulting equirectangular map.
+    fn update_probe(&mut self, ctx: &egui::Context, px: f32, py: f32) {
+        const W: usize = 256;
+        const H: usize = 128;
+        let Some(tracer) = &self.tracer else { return };
+        let Some(rgb) = tracer.render_nirc_probe(px, py, W, H) else { return };
+
+        let exposure = self.exposure;
+        let tonemapper = self.tonemapper;
+        let raw: Vec<u8> = rgb
+            .iter()
+            .flat_map(|[r, g, b]| {
+                let tonemap = |v: f32| -> u8 {
+                    let v = v * exposure;
+                    let v = match tonemapper {
+                        TonemapOperator::Reinhard => v / (v + 1.0),
+                        TonemapOperator::Aces => {
+                            let (a, b, c, d, e) = (2.51f32, 0.03f32, 2.43f32, 0.59f32, 0.14f32);
+                            (v * (a * v + b)) / (v * (c * v + d) + e)
+                        }
+                    };
+                    (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8
+                };
+                [tonemap(*r), tonemap(*g), tonemap(*b), 255u8]
+            })
+            .collect();
+
+        let img = egui::ColorImage::from_rgba_unmultiplied([W, H], &raw);
+        if let Some(ref mut t) = self.probe_texture {
+            t.set(img, egui::TextureOptions::LINEAR);
+        } else {
+            self.probe_texture =
+                Some(ctx.load_texture("nirc_probe", img, egui::TextureOptions::LINEAR));
         }
     }
 
@@ -269,6 +317,9 @@ impl RnptGuiApp {
         self.local_width = self.resolution[0];
         self.local_height = self.resolution[1];
         self.local_pixels = vec![rnpt::Pixel::default(); self.local_width * self.local_height];
+        self.frame_count = 0;
+        self.last_loss = 0.0;
+        self.loss_ema = 0.0;
 
         self.rays_since_last_fps = 0;
         self.real_rays_since_last_fps = 0;
@@ -288,11 +339,23 @@ impl eframe::App for RnptGuiApp {
             }
         }
 
+        // R key: reset pixel accumulation (discard old samples, start fresh)
+        if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+            self.trigger_reset();
+        }
+
         // Fetch new pixels from tracer
         let mut pixels_updated = false;
         if let Some(tracer) = &self.tracer {
-            // Drain worker-collected training samples and update the NIRC network.
-            tracer.train_nirc();
+            if let Some(loss) = tracer.train_nirc() {
+                self.last_loss = loss;
+                // EMA of loss for a stable display (alpha=0.05 ≈ 20-frame window)
+                self.loss_ema = if self.loss_ema == 0.0 {
+                    loss
+                } else {
+                    self.loss_ema * 0.95 + loss * 0.05
+                };
+            }
 
             tracer.fetch_pixels(&mut self.local_pixels);
 
@@ -300,6 +363,14 @@ impl eframe::App for RnptGuiApp {
             self.real_rays_since_last_fps += tracer.pop_real_rays_traced();
             self.shadow_rays_since_last_fps += tracer.pop_shadow_rays_traced();
             pixels_updated = true;
+
+            self.frame_count += 1;
+            if self.frame_count % 60 == 0 && self.strategy == rnpt::SamplingStrategy::Nirc {
+                eprintln!(
+                    "NIRC  loss={:.4} (ema={:.4})  ring={}",
+                    self.last_loss, self.loss_ema, tracer.ring_filled()
+                );
+            }
 
             let now = Instant::now();
             let elapsed_fps = now.duration_since(self.last_fps_time).as_secs_f64();
@@ -320,7 +391,8 @@ impl eframe::App for RnptGuiApp {
         // If pixels updated, or exposure changed, regenerate the texture
         let exposure_changed = self.exposure != self.last_exposure;
         let tonemapper_changed = self.tonemapper != self.last_tonemapper;
-        if pixels_updated || exposure_changed || tonemapper_changed || self.texture_handle.is_none()
+        let display_changed = pixels_updated;
+        if display_changed || exposure_changed || tonemapper_changed || self.texture_handle.is_none()
         {
             let mut raw_rgba = vec![0u8; self.local_width * self.local_height * 4];
 
@@ -696,6 +768,31 @@ impl eframe::App for RnptGuiApp {
                 };
                 ui.label(format!("Rays/Path (avg): {:.1}", rays_per_path));
 
+                if self.strategy == rnpt::SamplingStrategy::Nirc {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    let ring = self.tracer.as_ref().map_or(0, |t| t.ring_filled());
+                    ui.label(format!("Ring: {} samples", ring));
+                    if self.loss_ema > 0.0 {
+                        ui.label(format!("Loss (ema): {:.5}", self.loss_ema));
+                        ui.label(format!("Loss (raw): {:.5}", self.last_loss));
+                    }
+
+                    ui.add_space(4.0);
+                    ui.collapsing("Sonde directionnelle", |ui| {
+                        if let Some(ref probe_tex) = self.probe_texture {
+                            ui.image(egui::load::SizedTexture::new(
+                                probe_tex.id(),
+                                egui::vec2(256.0, 128.0),
+                            ));
+                            ui.label("← azimuth 0→360°  |  élévation : haut→bas ↓");
+                        } else {
+                            ui.label("Ctrl+clic sur l'image pour placer une sonde");
+                        }
+                    });
+                }
+
                 ui.add_space(6.0);
                 ui.collapsing("Scene Stats", |ui| {
                     if let Some(ref scene) = self.current_scene {
@@ -786,29 +883,46 @@ impl eframe::App for RnptGuiApp {
 
                 ui.put(rect, egui::Image::new(texture));
 
-                // Camera navigation
+                let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+
+                // Camera navigation — disabled while Ctrl is held (Ctrl = probe placement).
                 let response = ui.interact(rect, ui.id().with("nav"), egui::Sense::drag());
-                if response.dragged_by(egui::PointerButton::Primary) {
-                    let d = response.drag_delta();
-                    if d.x != 0.0 || d.y != 0.0 {
-                        nav_orbit = [d.x, d.y];
-                        nav_changed = true;
+                if !ctrl_held {
+                    if response.dragged_by(egui::PointerButton::Primary) {
+                        let d = response.drag_delta();
+                        if d.x != 0.0 || d.y != 0.0 {
+                            nav_orbit = [d.x, d.y];
+                            nav_changed = true;
+                        }
+                    }
+                    if response.dragged_by(egui::PointerButton::Middle)
+                        || response.dragged_by(egui::PointerButton::Secondary)
+                    {
+                        let d = response.drag_delta();
+                        if d.x != 0.0 || d.y != 0.0 {
+                            nav_pan = [d.x, d.y];
+                            nav_changed = true;
+                        }
+                    }
+                    if response.hovered() {
+                        let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                        if scroll.abs() > 0.5 {
+                            nav_scroll = scroll;
+                            nav_changed = true;
+                        }
                     }
                 }
-                if response.dragged_by(egui::PointerButton::Middle)
-                    || response.dragged_by(egui::PointerButton::Secondary)
-                {
-                    let d = response.drag_delta();
-                    if d.x != 0.0 || d.y != 0.0 {
-                        nav_pan = [d.x, d.y];
-                        nav_changed = true;
-                    }
-                }
-                if response.hovered() {
-                    let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
-                    if scroll.abs() > 0.5 {
-                        nav_scroll = scroll;
-                        nav_changed = true;
+
+                // Ctrl+click: place a directional NIRC probe at the clicked surface point.
+                if ctrl_held && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary)) {
+                    if let Some(screen_pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                        if rect.contains(screen_pos) {
+                            let px = (screen_pos.x - rect.min.x) / rect.width()
+                                * self.local_width as f32;
+                            let py = (screen_pos.y - rect.min.y) / rect.height()
+                                * self.local_height as f32;
+                            self.update_probe(ctx, px, py);
+                        }
                     }
                 }
             } else {
@@ -857,11 +971,10 @@ fn tonemap_and_convert(
                 return;
             }
 
-            // Average radiance
-            let scale = 1.0 / pixel.samples as f32;
-            let r_linear = pixel.accumulated_radiance[0] * scale;
-            let g_linear = pixel.accumulated_radiance[1] * scale;
-            let b_linear = pixel.accumulated_radiance[2] * scale;
+            // accumulated_radiance already stores the running mean (no division needed)
+            let r_linear = pixel.accumulated_radiance[0];
+            let g_linear = pixel.accumulated_radiance[1];
+            let b_linear = pixel.accumulated_radiance[2];
 
             // Exposure
             let r_exp = r_linear * exposure;

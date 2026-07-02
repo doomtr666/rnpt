@@ -1,50 +1,79 @@
 use nalgebra::{SMatrix, SVector};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
 
 pub struct NircConfig {
     pub learning_rate: f32,
     pub batch_size: usize,
+    pub ema_alpha: f32,
 }
 
 impl Default for NircConfig {
     fn default() -> Self {
         Self {
-            learning_rate: 1e-3,
+            learning_rate: 3e-4,
             batch_size: 64,
+            ema_alpha: 0.1,
         }
     }
 }
 
 pub struct NircTrainer {
     pub network: Box<NircMlp>,
+    /// EMA-smoothed inference snapshot, updated in-place after each training step.
+    pub ema_buf: Box<NircMlp>,
+    /// Gradient accumulator — allocated once, zeroed at the start of each batch.
+    grads: Box<NircMlpGradients>,
     pub optimizer: Box<AdamOptimizer>,
     pub config: NircConfig,
 }
 
 impl NircTrainer {
     pub fn new(config: NircConfig) -> Self {
+        let network = NircMlp::new_boxed();
+        let ema_buf = network.clone_boxed(); // EMA starts = initial weights (no cold-start bias)
         Self {
-            network: NircMlp::new_boxed(),
+            ema_buf,
+            network,
+            grads: NircMlpGradients::new_boxed(),
             optimizer: AdamOptimizer::new_boxed(config.learning_rate),
             config,
         }
     }
 
-    /// Trains on pre-collected samples (produced by worker threads inline with rendering).
-    /// Samples are chunked into `batch_size` and each chunk becomes one gradient step.
-    pub fn train_samples(&mut self, samples: &[(nalgebra::SVector<f32, INPUT_DIM>, nalgebra::SVector<f32, 3>)]) {
+    /// Trains on pre-collected samples. Returns the average loss over all batches.
+    /// Updates `ema_buf` in-place after training (no allocation).
+    pub fn train_samples(
+        &mut self,
+        samples: &[(nalgebra::SVector<f32, INPUT_DIM>, nalgebra::SVector<f32, 3>)],
+    ) -> f32 {
         if samples.is_empty() {
-            return;
+            return 0.0;
         }
+        let mut total_loss = 0.0f32;
+        let mut num_batches = 0usize;
         for chunk in samples.chunks(self.config.batch_size) {
-            self.network.train_batch(&mut *self.optimizer, chunk);
+            total_loss += self
+                .network
+                .train_batch(&mut *self.optimizer, &mut *self.grads, chunk);
+            num_batches += 1;
+        }
+        self.ema_buf.ema(&self.network, self.config.ema_alpha);
+        if num_batches > 0 {
+            total_loss / num_batches as f32
+        } else {
+            0.0
         }
     }
 }
 
-pub const POS_BINS: usize = 8;
-pub const DIR_BINS: usize = 8;
-pub const INPUT_DIM: usize = (POS_BINS + DIR_BINS) * 3;
-const HIDDEN_DIM: usize = 64;
+pub const POS_BINS: usize = 1;
+/// Number of sinusoidal NeRF frequencies applied to each direction component.
+/// Frequency k has period 2/2^k in [-1,1]; at k=9 the period is ~0.004 in dz
+/// → angular resolution ~3.6° even near the poles of the unit sphere.
+pub const DIR_FREQS: usize = 1;
+pub const INPUT_DIM: usize = POS_BINS * 3 + DIR_FREQS * 2 * 3;
+const HIDDEN_DIM: usize = 16;
 const OUTPUT_DIM: usize = 3;
 
 pub struct NircForwardCache {
@@ -83,6 +112,25 @@ impl NircMlpGradients {
         }
     }
 
+    /// Allocates zeroed gradients on the heap.
+    pub fn new_boxed() -> Box<Self> {
+        unsafe {
+            let layout = std::alloc::Layout::new::<Self>();
+            let ptr = std::alloc::alloc_zeroed(layout) as *mut Self;
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            Box::from_raw(ptr)
+        }
+    }
+
+    /// Zeros all gradient values in-place. Used to reset a pre-allocated buffer.
+    pub fn zero_in_place(&mut self) {
+        unsafe {
+            std::ptr::write_bytes(self as *mut Self as *mut u8, 0, std::mem::size_of::<Self>());
+        }
+    }
+
     pub fn add_gradients(&mut self, other: &Self) {
         self.w1 += other.w1;
         self.b1 += other.b1;
@@ -107,7 +155,7 @@ impl NircMlpGradients {
 }
 
 /// Ad hoc multi level perceptron used in the radiance cache
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct NircMlp {
     w1: SMatrix<f32, HIDDEN_DIM, INPUT_DIM>,
     b1: SVector<f32, HIDDEN_DIM>,
@@ -122,55 +170,77 @@ pub struct NircMlp {
     b4: SVector<f32, OUTPUT_DIM>,
 }
 
-impl Default for NircMlp {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl NircMlp {
+    /// Allocate on the heap and initialize weights (Xavier uniform). No stack intermediate —
+    /// SMatrix<f32,256,256> is 256 KB; constructing it via `Self { w: SMatrix::from_fn(...) }`
+    /// would put that on the caller's stack. Instead we alloc zeroed then write in-place.
     pub fn new_boxed() -> Box<Self> {
-        // Spawn a temporary thread with a large stack to initialize the large SMatrix fields
-        // without overflowing the main thread's stack. Returns a heap-allocated Box.
-        std::thread::Builder::new()
-            .name("NircMlp-Init".into())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| Box::new(Self::new()))
-            .expect("Failed to spawn init thread")
-            .join()
-            .unwrap()
+        unsafe {
+            let layout = std::alloc::Layout::new::<Self>();
+            let ptr = std::alloc::alloc_zeroed(layout) as *mut Self;
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            let b = &mut *ptr;
+
+            let mut rng = crate::Pcg32::from_seed_128(42);
+            let limit_hidden = (6.0f32 / (HIDDEN_DIM + HIDDEN_DIM) as f32).sqrt();
+            let limit_in = (6.0f32 / (HIDDEN_DIM + INPUT_DIM) as f32).sqrt();
+            let limit_out = (6.0f32 / (OUTPUT_DIM + HIDDEN_DIM) as f32).sqrt();
+
+            for v in b.w1.as_mut_slice() {
+                *v = (rng.next_f32() * 2.0 - 1.0) * limit_in;
+            }
+            for v in b.w2.as_mut_slice() {
+                *v = (rng.next_f32() * 2.0 - 1.0) * limit_hidden;
+            }
+            for v in b.w3.as_mut_slice() {
+                *v = (rng.next_f32() * 2.0 - 1.0) * limit_hidden;
+            }
+            for v in b.w4.as_mut_slice() {
+                *v = (rng.next_f32() * 2.0 - 1.0) * limit_out;
+            }
+            // biases remain zero
+
+            Box::from_raw(ptr)
+        }
     }
 
-    pub fn new() -> Self {
-        let mut rng = crate::Pcg32::from_seed_128(42);
-        let mut init_weights = |rows: usize, cols: usize| -> f32 {
-            let limit = (6.0 / (rows as f32 + cols as f32)).sqrt();
-            (rng.next_f32() * 2.0 - 1.0) * limit
-        };
-
-        Self {
-            w1: SMatrix::from_fn(|_, _| init_weights(HIDDEN_DIM, INPUT_DIM)),
-            b1: SVector::zeros(),
-            w2: SMatrix::from_fn(|_, _| init_weights(HIDDEN_DIM, HIDDEN_DIM)),
-            b2: SVector::zeros(),
-            w3: SMatrix::from_fn(|_, _| init_weights(HIDDEN_DIM, HIDDEN_DIM)),
-            b3: SVector::zeros(),
-            w4: SMatrix::from_fn(|_, _| init_weights(OUTPUT_DIM, HIDDEN_DIM)),
-            b4: SVector::zeros(),
+    /// Copy onto the heap without any stack intermediate.
+    /// NircMlp is ~625 KB — memcpy via pointer, never materialised on the stack.
+    pub fn clone_boxed(&self) -> Box<Self> {
+        unsafe {
+            let layout = std::alloc::Layout::new::<Self>();
+            let ptr = std::alloc::alloc(layout) as *mut Self;
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            std::ptr::copy_nonoverlapping(self as *const Self, ptr, 1);
+            Box::from_raw(ptr)
         }
     }
 
     /// Exponential Moving Average update
     pub fn ema(&mut self, other: &Self, alpha: f32) {
         let beta = 1.0 - alpha;
-        self.w1 = self.w1 * beta + other.w1 * alpha;
-        self.b1 = self.b1 * beta + other.b1 * alpha;
-        self.w2 = self.w2 * beta + other.w2 * alpha;
-        self.b2 = self.b2 * beta + other.b2 * alpha;
-        self.w3 = self.w3 * beta + other.w3 * alpha;
-        self.b3 = self.b3 * beta + other.b3 * alpha;
-        self.w4 = self.w4 * beta + other.w4 * alpha;
-        self.b4 = self.b4 * beta + other.b4 * alpha;
+        // Element-wise indexing: zero stack temporaries.
+        // The naive `self.w2 = self.w2 * beta + other.w2 * alpha` creates up to three
+        // 256×256 matrix temporaries (768 KB) on the stack, overflowing the main thread.
+        macro_rules! ema_field {
+            ($dst:expr, $src:expr) => {
+                for i in 0..$dst.len() {
+                    $dst[i] = $dst[i] * beta + $src[i] * alpha;
+                }
+            };
+        }
+        ema_field!(self.w1, other.w1);
+        ema_field!(self.b1, other.b1);
+        ema_field!(self.w2, other.w2);
+        ema_field!(self.b2, other.b2);
+        ema_field!(self.w3, other.w3);
+        ema_field!(self.b3, other.b3);
+        ema_field!(self.w4, other.w4);
+        ema_field!(self.b4, other.b4);
     }
 
     /// Applique le Positional Encoding (Encodage Positionnel) classique NeRF + coordonnées brutes.
@@ -215,46 +285,62 @@ impl NircMlp {
             idx += 3;
         }
 
-        // Normalize direction to [0, 1]
-        let norm_dir = nalgebra::Vector3::new(
-            (dir.x + 1.0) * 0.5,
-            (dir.y + 1.0) * 0.5,
-            (dir.z + 1.0) * 0.5,
-        );
-
-        // Oneblob direction encoding
-        let dir_sigma = 1.0 / (DIR_BINS as f32);
-        let dir_inv_2sigma2 = (DIR_BINS as f32).powi(2) / 2.0;
-
-        for i in 0..DIR_BINS {
-            let c = (i as f32 + 0.5) * dir_sigma;
-            input[idx] = (-(norm_dir.x - c).powi(2) * dir_inv_2sigma2).exp();
-            input[idx + 1] = (-(norm_dir.y - c).powi(2) * dir_inv_2sigma2).exp();
-            input[idx + 2] = (-(norm_dir.z - c).powi(2) * dir_inv_2sigma2).exp();
+        // NeRF sinusoidal direction encoding.
+        // dir components are in [-1, 1] (unit vector). Each frequency k encodes
+        // sin(2^k π d) and cos(2^k π d) for each component, giving 2*3 features per k.
+        // High frequencies (k≥8) resolve sub-degree angular features near any pole.
+        for k in 0..DIR_FREQS {
+            let freq = (1u32 << k) as f32 * std::f32::consts::PI;
+            input[idx] = (freq * dir.x).sin();
+            input[idx + 1] = (freq * dir.y).sin();
+            input[idx + 2] = (freq * dir.z).sin();
+            idx += 3;
+            input[idx] = (freq * dir.x).cos();
+            input[idx + 1] = (freq * dir.y).cos();
+            input[idx + 2] = (freq * dir.z).cos();
             idx += 3;
         }
 
         input
     }
 
-    /// Entraîne le réseau sur un batch donné
+    /// Runs one gradient step on `batch`. `grads` is a pre-allocated buffer (owned by
+    /// `NircTrainer`) — it is zeroed here and reused across calls, so no allocation occurs.
     pub fn train_batch(
         &mut self,
         opt: &mut AdamOptimizer,
+        grads: &mut NircMlpGradients,
         batch: &[(SVector<f32, INPUT_DIM>, SVector<f32, 3>)],
-    ) {
+    ) -> f32 {
         if batch.is_empty() {
-            return;
+            return 0.0;
         }
-        let mut accumulated_grads = NircMlpGradients::zeros();
+        grads.zero_in_place();
+        let mut batch_loss = 0.0f32;
         for (input, target) in batch {
             let (pred, cache) = self.forward_for_training(*input);
             let dl_dy = Self::compute_loss_derivative(&pred, target);
-            let grads = self.backward(&cache, dl_dy);
-            accumulated_grads.add_gradients(&grads);
+            batch_loss += Self::compute_loss(&pred, target);
+            self.backward_into(&cache, dl_dy, grads);
         }
-        accumulated_grads.divide_by(batch.len() as f32);
-        opt.step(self, &accumulated_grads);
+        grads.divide_by(batch.len() as f32);
+        opt.step(self, grads);
+        batch_loss / batch.len() as f32
+    }
+
+    /// Log-space MSE: L = (log(1+pred⁺) - log(1+target))²
+    /// Balanced gradient weight across the full HDR dynamic range:
+    /// gradient ∝ 1/(1+pred), so bright samples (ceiling light) are not ignored.
+    #[inline]
+    pub fn compute_loss(pred: &SVector<f32, OUTPUT_DIM>, target: &SVector<f32, OUTPUT_DIM>) -> f32 {
+        let mut loss = 0.0f32;
+        for i in 0..OUTPUT_DIM {
+            let target_log = (1.0 + target[i]).ln();
+            let pred_log = (1.0 + pred[i].max(0.0)).ln();
+            let err = pred_log - target_log;
+            loss += err * err;
+        }
+        loss / OUTPUT_DIM as f32
     }
 
     /// Activation function: SiLU (Sigmoid Linear Unit)
@@ -262,11 +348,6 @@ impl NircMlp {
     #[inline(always)]
     fn silu(x: f32) -> f32 {
         x / (1.0 + (-x).exp())
-    }
-
-    /// Applies SiLU element-wise to a vector
-    fn apply_silu<const D: usize>(v: &SVector<f32, D>) -> SVector<f32, D> {
-        v.map(Self::silu)
     }
 
     /// Derivative of SiLU
@@ -285,14 +366,33 @@ impl NircMlp {
     }
 
     /// Pure inference forward pass.
-    /// Use this for the 95% of rays that do not contribute to training.
+    /// Uses `gemv` (BLAS matrix-vector product, takes A by reference) so the weight
+    /// matrices are never copied. The `*` operator on SMatrix: Copy would silently
+    /// copy 111–256 KB per layer (626 KB total), causing the VCRUNTIME memcpy hotspot.
+    /// Two 256-f32 accumulators alternate; each is initialised to the layer bias so
+    /// gemv(alpha, W, x, beta=1) folds the bias add into the single kernel call.
     pub fn forward(&self, x: SVector<f32, INPUT_DIM>) -> SVector<f32, OUTPUT_DIM> {
-        let a1 = Self::apply_silu(&(self.w1 * x + self.b1));
-        let a2 = Self::apply_silu(&(self.w2 * a1 + self.b2));
-        let a3 = Self::apply_silu(&(self.w3 * a2 + self.b3));
+        let mut a = self.b1.clone_owned();
+        a.gemv(1.0, &self.w1, &x, 1.0);
+        for v in a.iter_mut() {
+            *v = Self::silu(*v);
+        }
 
-        // Output layer (linear)
-        self.w4 * a3 + self.b4
+        let mut b = self.b2.clone_owned();
+        b.gemv(1.0, &self.w2, &a, 1.0);
+        for v in b.iter_mut() {
+            *v = Self::silu(*v);
+        }
+
+        a.copy_from(&self.b3);
+        a.gemv(1.0, &self.w3, &b, 1.0);
+        for v in a.iter_mut() {
+            *v = Self::silu(*v);
+        }
+
+        let mut out = self.b4.clone_owned();
+        out.gemv(1.0, &self.w4, &a, 1.0);
+        out
     }
 
     /// Training forward pass.
@@ -302,103 +402,91 @@ impl NircMlp {
         &self,
         x: SVector<f32, INPUT_DIM>,
     ) -> (SVector<f32, OUTPUT_DIM>, NircForwardCache) {
-        // Layer 1
-        let z1 = self.w1 * x + self.b1;
-        let a1 = Self::apply_silu(&z1);
+        let mut z1 = self.b1.clone_owned();
+        z1.gemv(1.0, &self.w1, &x, 1.0);
+        let a1 = z1.map(Self::silu);
 
-        // Layer 2
-        let z2 = self.w2 * a1 + self.b2;
-        let a2 = Self::apply_silu(&z2);
+        let mut z2 = self.b2.clone_owned();
+        z2.gemv(1.0, &self.w2, &a1, 1.0);
+        let a2 = z2.map(Self::silu);
 
-        // Layer 3
-        let z3 = self.w3 * a2 + self.b3;
-        let a3 = Self::apply_silu(&z3);
+        let mut z3 = self.b3.clone_owned();
+        z3.gemv(1.0, &self.w3, &a2, 1.0);
+        let a3 = z3.map(Self::silu);
 
-        // Layer 4 (Output) - Linear activation for raw radiance values.
-        let z4 = self.w4 * a3 + self.b4;
+        let mut z4 = self.b4.clone_owned();
+        z4.gemv(1.0, &self.w4, &a3, 1.0);
 
-        let cache = NircForwardCache {
-            x,
-            z1,
-            a1,
-            z2,
-            a2,
-            z3,
-            a3,
-        };
-
-        (z4, cache)
+        (
+            z4,
+            NircForwardCache {
+                x,
+                z1,
+                a1,
+                z2,
+                a2,
+                z3,
+                a3,
+            },
+        )
     }
 
-    /// Backward pass computing the gradients.
-    /// dl_dy is the gradient of the loss with respect to the network's output.
-    pub fn backward(
+    /// Backward pass: accumulates gradients into `grads` (does not allocate).
+    /// Weight gradients use `ger()` (rank-1 update, no temporary matrix).
+    /// Error signals use `gemv_tr` (computes A^T * x without materialising A^T,
+    /// avoiding 256 KB copies of w2/w3 that `wN.transpose() * delta` would incur).
+    pub fn backward_into(
         &self,
         cache: &NircForwardCache,
         dl_dy: SVector<f32, OUTPUT_DIM>,
-    ) -> NircMlpGradients {
-        // Layer 4 (Output)
-        // Since there is no activation function on the output, dL_dz4 == dL_dy
+        grads: &mut NircMlpGradients,
+    ) {
+        // SVector<f32, N>: Copy — each `+= delta` copies the vector, so `delta`
+        // remains valid for the subsequent gemv_tr call.
         let delta4 = dl_dy;
-        let grad_w4 = delta4 * cache.a3.transpose();
-        let grad_b4 = delta4;
+        grads.w4.ger(1.0, &delta4, &cache.a3, 1.0);
+        grads.b4 += delta4;
 
-        // Layer 3
         let sp3 = Self::apply_silu_deriv(&cache.z3);
-        let delta3 = (self.w4.transpose() * delta4).component_mul(&sp3);
-        let grad_w3 = delta3 * cache.a2.transpose();
-        let grad_b3 = delta3;
+        let mut delta3 = SVector::<f32, HIDDEN_DIM>::zeros();
+        delta3.gemv_tr(1.0, &self.w4, &delta4, 0.0);
+        delta3.component_mul_assign(&sp3);
+        grads.w3.ger(1.0, &delta3, &cache.a2, 1.0);
+        grads.b3 += delta3;
 
-        // Layer 2
         let sp2 = Self::apply_silu_deriv(&cache.z2);
-        let delta2 = (self.w3.transpose() * delta3).component_mul(&sp2);
-        let grad_w2 = delta2 * cache.a1.transpose();
-        let grad_b2 = delta2;
+        let mut delta2 = SVector::<f32, HIDDEN_DIM>::zeros();
+        delta2.gemv_tr(1.0, &self.w3, &delta3, 0.0);
+        delta2.component_mul_assign(&sp2);
+        grads.w2.ger(1.0, &delta2, &cache.a1, 1.0);
+        grads.b2 += delta2;
 
-        // Layer 1
         let sp1 = Self::apply_silu_deriv(&cache.z1);
-        let delta1 = (self.w2.transpose() * delta2).component_mul(&sp1);
-        let grad_w1 = delta1 * cache.x.transpose();
-        let grad_b1 = delta1;
-
-        NircMlpGradients {
-            w1: grad_w1,
-            b1: grad_b1,
-            w2: grad_w2,
-            b2: grad_b2,
-            w3: grad_w3,
-            b3: grad_b3,
-            w4: grad_w4,
-            b4: grad_b4,
-        }
+        let mut delta1 = SVector::<f32, HIDDEN_DIM>::zeros();
+        delta1.gemv_tr(1.0, &self.w2, &delta2, 0.0);
+        delta1.component_mul_assign(&sp1);
+        grads.w1.ger(1.0, &delta1, &cache.x, 1.0);
+        grads.b1 += delta1;
     }
 
-    /// Computes the loss derivative dL/dy using a Relative L2 Loss with stop-gradient.
-    /// target: the raw HDR radiance from the path tracer (y).
-    /// pred: the radiance predicted by the active network (\hat{y}).
+    /// Gradient of log-space MSE w.r.t. the network output (linear radiance).
+    /// dL/dpred = (log(1+pred⁺) - log(1+target)) / (1+pred⁺)
+    /// For pred ≤ 0: linear approximation d/dpred(log(1+pred⁺))≈1 avoids gradient kill.
     pub fn compute_loss_derivative(
         pred: &SVector<f32, OUTPUT_DIM>,
         target: &SVector<f32, OUTPUT_DIM>,
     ) -> SVector<f32, OUTPUT_DIM> {
         let mut dl_dy = SVector::<f32, OUTPUT_DIM>::zeros();
-
-        // Epsilon prevents division by zero in completely dark areas.
-        // 1e-2 is the standard empirical value for radiance caching.
-        let epsilon = 1e-2;
-
         for i in 0..OUTPUT_DIM {
-            let diff = pred[i] - target[i];
-
-            // Stop-gradient applied here: we compute the normalizer using the current
-            // prediction, but we do not derive this term. It acts as a static weight
-            // for the current backward pass.
-            let normalizer = pred[i] * pred[i] + epsilon;
-
-            // The mathematical factor of 2.0 is intentionally dropped as it simply
-            // scales the global learning rate.
-            dl_dy[i] = diff / normalizer;
+            let target_log = (1.0 + target[i]).ln();
+            if pred[i] > 0.0 {
+                let pred_log = (1.0 + pred[i]).ln();
+                dl_dy[i] = (pred_log - target_log) / (1.0 + pred[i]);
+            } else {
+                // pred ≤ 0: treat log(1+pred⁺) = 0, d(·)/dpred = 1
+                dl_dy[i] = -target_log;
+            }
         }
-
         dl_dy
     }
 }
@@ -417,27 +505,24 @@ pub struct AdamOptimizer {
 }
 
 impl AdamOptimizer {
+    /// Allocates the optimizer on the heap. `AdamOptimizer` holds two `NircMlpGradients`
+    /// inline (m and v, ~620 KB each → ~1.24 MB total). `alloc_zeroed` avoids constructing
+    /// them on the caller's stack; the scalar fields are written through the pointer.
     pub fn new_boxed(learning_rate: f32) -> Box<Self> {
-        std::thread::Builder::new()
-            .name("Adam-Init".into())
-            .stack_size(32 * 1024 * 1024)
-            .spawn(move || Box::new(Self::new(learning_rate)))
-            .expect("Failed to spawn init thread")
-            .join()
-            .unwrap()
-    }
-
-    /// Creates a new Adam optimizer with default parameters.
-
-    pub fn new(learning_rate: f32) -> Self {
-        Self {
-            m: NircMlpGradients::zeros(),
-            v: NircMlpGradients::zeros(),
-            beta1: 0.9,
-            beta2: 0.999,
-            epsilon: 1e-8,
-            lr: learning_rate,
-            t: 0,
+        unsafe {
+            let layout = std::alloc::Layout::new::<Self>();
+            let ptr = std::alloc::alloc_zeroed(layout) as *mut Self;
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            let b = &mut *ptr;
+            // m and v are zeroed by alloc_zeroed — that is their correct initial state.
+            b.beta1 = 0.9;
+            b.beta2 = 0.999;
+            b.epsilon = 1e-8;
+            b.lr = learning_rate;
+            b.t = 0;
+            Box::from_raw(ptr)
         }
     }
 
@@ -473,5 +558,66 @@ impl AdamOptimizer {
         update_param!(network.b3, self.m.b3, self.v.b3, grads.b3);
         update_param!(network.w4, self.m.w4, self.v.w4, grads.w4);
         update_param!(network.b4, self.m.b4, self.v.b4, grads.b4);
+    }
+}
+
+/// Lock-free circular buffer for NIRC training samples.
+///
+/// Multiple worker threads push concurrently without locks; the trainer thread
+/// reads random batches from it. Occasional torn reads under contention are
+/// acceptable for stochastic gradient training.
+pub const RING_CAPACITY: usize = 1 << 17; // 131 072 entries ≈ 26 MB
+
+pub struct NircRingBuffer {
+    data: Vec<UnsafeCell<(SVector<f32, INPUT_DIM>, SVector<f32, OUTPUT_DIM>)>>,
+    write_idx: AtomicUsize, // monotonically increasing
+}
+
+unsafe impl Send for NircRingBuffer {}
+unsafe impl Sync for NircRingBuffer {}
+
+impl NircRingBuffer {
+    pub fn new() -> Self {
+        Self {
+            data: (0..RING_CAPACITY)
+                .map(|_| UnsafeCell::new((SVector::zeros(), SVector::zeros())))
+                .collect(),
+            write_idx: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn push(&self, input: SVector<f32, INPUT_DIM>, target: SVector<f32, OUTPUT_DIM>) {
+        let idx = self.write_idx.fetch_add(1, AtomicOrd::Relaxed);
+        let slot = idx & (RING_CAPACITY - 1);
+        unsafe {
+            *self.data[slot].get() = (input, target);
+        }
+    }
+
+    /// Number of slots that have been written (capped at RING_CAPACITY).
+    pub fn filled(&self) -> usize {
+        self.write_idx.load(AtomicOrd::Relaxed).min(RING_CAPACITY)
+    }
+
+    /// Read `count` random samples from the filled portion.
+    /// Seeded from the current write position — varies each call.
+    pub fn read_random_batch(
+        &self,
+        count: usize,
+    ) -> Vec<(SVector<f32, INPUT_DIM>, SVector<f32, OUTPUT_DIM>)> {
+        let filled = self.filled();
+        if filled == 0 {
+            return Vec::new();
+        }
+        let seed = self.write_idx.load(AtomicOrd::Relaxed);
+        let mut rng = crate::Pcg32::from_seed(seed as u64, 1);
+        let n = count.min(filled);
+        (0..n)
+            .map(|_| {
+                let slot = ((rng.next_f32() * filled as f32) as usize).min(filled - 1);
+                unsafe { *self.data[slot].get() }
+            })
+            .collect()
     }
 }
