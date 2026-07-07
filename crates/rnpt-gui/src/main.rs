@@ -63,7 +63,8 @@ struct RnptGuiApp {
 
     frame_count: u64,
     last_loss: f32,
-    loss_ema: f32,   // smoothed loss for display
+    loss_ema: f32,  // smoothed loss for display
+    rel_error: f32, // smoothed sparse RelMean (NIRC vs MIS)
 
     // NIRC directional probe (Ctrl+click)
     probe_texture: Option<egui::TextureHandle>,
@@ -103,13 +104,23 @@ fn empty_scene() -> rnpt::Scene {
 /// Returns (bvh, lights, build_ms, triangle_count).
 fn build_bvh_and_lights(
     scene: &rnpt::Scene,
-) -> (std::sync::Arc<rnpt::Bvh>, std::sync::Arc<Vec<rnpt::Light>>, u64, usize) {
+) -> (
+    std::sync::Arc<rnpt::Bvh>,
+    std::sync::Arc<Vec<rnpt::Light>>,
+    u64,
+    usize,
+) {
     let t0 = Instant::now();
     let (bvh, emitters) = rnpt::BvhBuilder::new(scene).build();
     let build_ms = t0.elapsed().as_millis() as u64;
     let tri_count = bvh.triangle_meta.len();
     let lights = rnpt::build_lights(&scene.lights, emitters);
-    (std::sync::Arc::new(bvh), std::sync::Arc::new(lights), build_ms, tri_count)
+    (
+        std::sync::Arc::new(bvh),
+        std::sync::Arc::new(lights),
+        build_ms,
+        tri_count,
+    )
 }
 
 impl RnptGuiApp {
@@ -221,6 +232,7 @@ impl RnptGuiApp {
             frame_count: 0,
             last_loss: 0.0,
             loss_ema: 0.0,
+            rel_error: 0.0,
             probe_texture: None,
         }
     }
@@ -231,7 +243,9 @@ impl RnptGuiApp {
         const W: usize = 256;
         const H: usize = 128;
         let Some(tracer) = &self.tracer else { return };
-        let Some(rgb) = tracer.render_nirc_probe(px, py, W, H) else { return };
+        let Some(rgb) = tracer.render_nirc_probe(px, py, W, H) else {
+            return;
+        };
 
         let exposure = self.exposure;
         let tonemapper = self.tonemapper;
@@ -279,7 +293,13 @@ impl RnptGuiApp {
     fn rebuild_env(&mut self) {
         let rot_rad = self.env_rotation.to_radians();
         self.env = self.env_raw.as_ref().map(|(pixels, w, h)| {
-            std::sync::Arc::new(rnpt::EnvLight::new(pixels.clone(), *w, *h, self.env_intensity, rot_rad))
+            std::sync::Arc::new(rnpt::EnvLight::new(
+                pixels.clone(),
+                *w,
+                *h,
+                self.env_intensity,
+                rot_rad,
+            ))
         });
     }
 
@@ -320,6 +340,7 @@ impl RnptGuiApp {
         self.frame_count = 0;
         self.last_loss = 0.0;
         self.loss_ema = 0.0;
+        self.rel_error = 0.0;
 
         self.rays_since_last_fps = 0;
         self.real_rays_since_last_fps = 0;
@@ -356,6 +377,13 @@ impl eframe::App for RnptGuiApp {
                     self.loss_ema * 0.95 + loss * 0.05
                 };
             }
+            if let Some(rel) = tracer.nirc_rel_error() {
+                self.rel_error = if self.rel_error == 0.0 {
+                    rel
+                } else {
+                    self.rel_error * 0.95 + rel * 0.05
+                };
+            }
 
             tracer.fetch_pixels(&mut self.local_pixels);
 
@@ -365,12 +393,6 @@ impl eframe::App for RnptGuiApp {
             pixels_updated = true;
 
             self.frame_count += 1;
-            if self.frame_count % 60 == 0 && self.strategy == rnpt::SamplingStrategy::Nirc {
-                eprintln!(
-                    "NIRC  loss={:.4} (ema={:.4})  ring={}",
-                    self.last_loss, self.loss_ema, tracer.ring_filled()
-                );
-            }
 
             let now = Instant::now();
             let elapsed_fps = now.duration_since(self.last_fps_time).as_secs_f64();
@@ -392,7 +414,10 @@ impl eframe::App for RnptGuiApp {
         let exposure_changed = self.exposure != self.last_exposure;
         let tonemapper_changed = self.tonemapper != self.last_tonemapper;
         let display_changed = pixels_updated;
-        if display_changed || exposure_changed || tonemapper_changed || self.texture_handle.is_none()
+        if display_changed
+            || exposure_changed
+            || tonemapper_changed
+            || self.texture_handle.is_none()
         {
             let mut raw_rgba = vec![0u8; self.local_width * self.local_height * 4];
 
@@ -505,7 +530,9 @@ impl eframe::App for RnptGuiApp {
                                 }
                             });
                         if self.selected_camera_index != prev {
-                            let cam = self.current_scene.as_ref()
+                            let cam = self
+                                .current_scene
+                                .as_ref()
                                 .and_then(|s| s.cameras.get(self.selected_camera_index))
                                 .cloned();
                             if let Some(cam) = cam {
@@ -632,7 +659,11 @@ impl eframe::App for RnptGuiApp {
                         rnpt::SamplingStrategy::BrdfOnly,
                         "BRDF",
                     );
-                    ui.selectable_value(&mut self.strategy, rnpt::SamplingStrategy::DirectOnly, "Direct Only");
+                    ui.selectable_value(
+                        &mut self.strategy,
+                        rnpt::SamplingStrategy::DirectOnly,
+                        "Direct Only",
+                    );
                 });
                 if self.strategy != prev_strategy {
                     self.trigger_reset();
@@ -671,12 +702,16 @@ impl eframe::App for RnptGuiApp {
                 let mut env_changed = false;
                 ui.add_enabled_ui(self.env.is_some(), |ui| {
                     let prev_i = self.env_intensity;
-                    ui.add(egui::Slider::new(&mut self.env_intensity, 0.0..=10.0).text("Intensity"));
+                    ui.add(
+                        egui::Slider::new(&mut self.env_intensity, 0.0..=10.0).text("Intensity"),
+                    );
                     if (self.env_intensity - prev_i).abs() > f32::EPSILON {
                         env_changed = true;
                     }
                     let prev_r = self.env_rotation;
-                    ui.add(egui::Slider::new(&mut self.env_rotation, 0.0..=360.0).text("Rotation°"));
+                    ui.add(
+                        egui::Slider::new(&mut self.env_rotation, 0.0..=360.0).text("Rotation°"),
+                    );
                     if (self.env_rotation - prev_r).abs() > f32::EPSILON {
                         env_changed = true;
                     }
@@ -778,6 +813,9 @@ impl eframe::App for RnptGuiApp {
                         ui.label(format!("Loss (ema): {:.5}", self.loss_ema));
                         ui.label(format!("Loss (raw): {:.5}", self.last_loss));
                     }
+                    if self.rel_error > 0.0 {
+                        ui.label(format!("RelMean: {:.2}%", self.rel_error * 100.0));
+                    }
 
                     ui.add_space(4.0);
                     ui.collapsing("Sonde directionnelle", |ui| {
@@ -810,7 +848,8 @@ impl eframe::App for RnptGuiApp {
                     if let Some(ref s) = self.scene_load_stats {
                         ui.label(format!("Total import:    {:>6} ms", s.total_ms));
                         ui.label(format!("  gltf parse:   {:>6} ms", s.gltf_parse_ms));
-                        ui.label(format!("  tex decode:   {:>6} ms  ({} tex, {}M px)",
+                        ui.label(format!(
+                            "  tex decode:   {:>6} ms  ({} tex, {}M px)",
                             s.texture_decode_ms,
                             s.texture_count,
                             s.total_texture_pixels / 1_000_000,
@@ -831,23 +870,36 @@ impl eframe::App for RnptGuiApp {
                                 .show(ui, |ui| {
                                     for (i, mat) in scene.materials.iter().enumerate() {
                                         ui.collapsing(format!("Mat {i}"), |ui| {
-                                            ui.label(format!("albedo: [{:.2}, {:.2}, {:.2}]",
-                                                mat.albedo.x, mat.albedo.y, mat.albedo.z));
-                                            ui.label(format!("roughness: {:.3}  metallic: {:.3}",
-                                                mat.roughness, mat.metallic));
-                                            ui.label(format!("transmission: {:.3}  ior: {:.3}",
-                                                mat.transmission, mat.ior));
-                                            ui.label(format!("thickness: {:.3}  att_dist: {:.3}",
-                                                mat.thickness_factor, mat.attenuation_distance));
-                                            ui.label(format!("att_color: [{:.2}, {:.2}, {:.2}]",
+                                            ui.label(format!(
+                                                "albedo: [{:.2}, {:.2}, {:.2}]",
+                                                mat.albedo.x, mat.albedo.y, mat.albedo.z
+                                            ));
+                                            ui.label(format!(
+                                                "roughness: {:.3}  metallic: {:.3}",
+                                                mat.roughness, mat.metallic
+                                            ));
+                                            ui.label(format!(
+                                                "transmission: {:.3}  ior: {:.3}",
+                                                mat.transmission, mat.ior
+                                            ));
+                                            ui.label(format!(
+                                                "thickness: {:.3}  att_dist: {:.3}",
+                                                mat.thickness_factor, mat.attenuation_distance
+                                            ));
+                                            ui.label(format!(
+                                                "att_color: [{:.2}, {:.2}, {:.2}]",
                                                 mat.attenuation_color.x,
                                                 mat.attenuation_color.y,
-                                                mat.attenuation_color.z));
-                                            ui.label(format!("emissive: [{:.2}, {:.2}, {:.2}]",
-                                                mat.emissive.x, mat.emissive.y, mat.emissive.z));
+                                                mat.attenuation_color.z
+                                            ));
+                                            ui.label(format!(
+                                                "emissive: [{:.2}, {:.2}, {:.2}]",
+                                                mat.emissive.x, mat.emissive.y, mat.emissive.z
+                                            ));
                                             ui.label(format!(
                                                 "double_sided: {}  alpha_cut: {:?}",
-                                                mat.double_sided, mat.alpha_cutoff));
+                                                mat.double_sided, mat.alpha_cutoff
+                                            ));
                                         });
                                     }
                                 });
@@ -914,7 +966,9 @@ impl eframe::App for RnptGuiApp {
                 }
 
                 // Ctrl+click: place a directional NIRC probe at the clicked surface point.
-                if ctrl_held && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary)) {
+                if ctrl_held
+                    && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary))
+                {
                     if let Some(screen_pos) = ctx.input(|i| i.pointer.interact_pos()) {
                         if rect.contains(screen_pos) {
                             let px = (screen_pos.x - rect.min.x) / rect.width()
@@ -1044,7 +1098,7 @@ fn orbit_camera(camera: &mut rnpt::Camera, dx: f32, dy: f32) {
         return;
     }
     let theta = (to_cam.y / r).clamp(-1.0, 1.0).acos(); // polar [0, PI]
-    let phi = to_cam.z.atan2(to_cam.x);                  // azimuth [-PI, PI]
+    let phi = to_cam.z.atan2(to_cam.x); // azimuth [-PI, PI]
     let s = 0.005f32;
     let new_phi = phi - dx * s;
     let new_theta = (theta + dy * s).clamp(0.005, PI - 0.005);

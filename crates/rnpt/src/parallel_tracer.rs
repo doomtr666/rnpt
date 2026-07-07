@@ -59,6 +59,12 @@ pub struct ParallelTracer {
     nirc_trainer: Mutex<NircTrainer>,
     /// Lock-free ring buffer: workers push training samples, trainer reads random batches.
     nirc_ring: Arc<NircRingBuffer>,
+
+    // Sparse MIS reference buffer for RelMean estimation.
+    // Holds one Pixel per TRAIN_PIXEL_STRIDE main pixels; each accumulates MIS samples
+    // the same way as the main buffer so variance decreases over time.
+    // Workers own disjoint subsets → same UnsafePixelBuffer safety guarantee.
+    mis_eval_pixels: Vec<Pixel>,
 }
 
 impl ParallelTracer {
@@ -81,6 +87,10 @@ impl ParallelTracer {
         let total_shadow_rays = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicBool::new(true));
 
+        let num_eval_pixels = (num_pixels + TRAIN_PIXEL_STRIDE - 1) / TRAIN_PIXEL_STRIDE;
+        let mut mis_eval_pixels = vec![Pixel::default(); num_eval_pixels];
+        let mis_eval_buf = Arc::new(UnsafePixelBuffer::new(mis_eval_pixels.as_mut_ptr()));
+
         let num_threads = thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8);
@@ -96,6 +106,7 @@ impl ParallelTracer {
             let real_rays_atomic = total_real_rays.clone();
             let shadow_rays_atomic = total_shadow_rays.clone();
             let running_atomic = running.clone();
+            let mis_eval = mis_eval_buf.clone();
 
             threads.push(
                 thread::Builder::new()
@@ -114,6 +125,7 @@ impl ParallelTracer {
                             real_rays_atomic,
                             shadow_rays_atomic,
                             running_atomic,
+                            mis_eval,
                         )
                     })
                     .expect("Failed to spawn worker thread"),
@@ -132,6 +144,7 @@ impl ParallelTracer {
             running,
             nirc_trainer: Mutex::new(NircTrainer::new(NircConfig::default())),
             nirc_ring,
+            mis_eval_pixels,
         }
     }
 
@@ -176,6 +189,11 @@ impl ParallelTracer {
         // For simplicity, we assume `update_scene` is only called if resolution stays the same.
         // If it changes, the GUI should drop and recreate ParallelTracer.
 
+        // Reset the sparse MIS eval buffer so stale reference samples don't pollute RelMean.
+        for px in self.mis_eval_pixels.iter_mut() {
+            *px = Pixel::default();
+        }
+
         self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -200,6 +218,33 @@ impl ParallelTracer {
 
     pub fn pop_shadow_rays_traced(&self) -> u64 {
         self.total_shadow_rays.swap(0, Ordering::Relaxed)
+    }
+
+    /// Mean relative error between the NIRC pixel means and the sparse MIS reference means.
+    /// Both sides accumulate over time so variance decreases as the render progresses.
+    /// Returns `None` if no eval pixel has any MIS samples yet.
+    pub fn nirc_rel_error(&self) -> Option<f32> {
+        let mut sum_err = 0.0f64;
+        let mut sum_ref = 0.0f64;
+        let mut count = 0u32;
+        for (j, mis_px) in self.mis_eval_pixels.iter().enumerate() {
+            if mis_px.samples == 0 {
+                continue;
+            }
+            let nirc_px = &self.pixels[j * TRAIN_PIXEL_STRIDE];
+            if nirc_px.samples == 0 {
+                continue;
+            }
+            for c in 0..3 {
+                sum_err += (nirc_px.accumulated_radiance[c] - mis_px.accumulated_radiance[c]).abs() as f64;
+                sum_ref += mis_px.accumulated_radiance[c] as f64;
+            }
+            count += 1;
+        }
+        if count == 0 || sum_ref == 0.0 {
+            return None;
+        }
+        Some((sum_err / (sum_ref + 0.01 * count as f64)) as f32)
     }
 
     /// Render an equirectangular map of what the NIRC network predicts from the
@@ -263,6 +308,7 @@ impl ParallelTracer {
         real_rays_atomic: Arc<AtomicU64>,
         shadow_rays_atomic: Arc<AtomicU64>,
         running_atomic: Arc<AtomicBool>,
+        mis_eval_buf: Arc<UnsafePixelBuffer>,
     ) {
         let mut local_epoch = 0u32;
         let mut local_nirc_epoch = u32::MAX; // force first refresh
@@ -354,13 +400,21 @@ impl ParallelTracer {
                         }
                         rays_traced += 1;
 
-                        // Every TRAIN_PIXEL_STRIDE pixels, trace a dedicated MIS path
-                        // and push all bounce samples into the lock-free ring buffer.
+                        // Training: random pixel subset (pixel_count stride gives diversity).
                         if pixel_count % TRAIN_PIXEL_STRIDE == 0 {
                             let new_samples = tracer
                                 .collect_training_samples_for_pixel(x, y, &mut train_rng);
                             for (inp, tgt) in new_samples {
                                 nirc_ring.push(inp, tgt);
+                            }
+                        }
+
+                        // Eval: fixed pixel subset aligned to i so mis_eval_pixels[j]
+                        // always accumulates samples for the same pixel as self.pixels[j*STRIDE].
+                        if i % TRAIN_PIXEL_STRIDE == 0 {
+                            let eval_idx = i / TRAIN_PIXEL_STRIDE;
+                            unsafe {
+                                tracer.sample_pixel_mis(x, y, mis_eval_buf.get_mut(eval_idx));
                             }
                         }
                     }

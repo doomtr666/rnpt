@@ -104,6 +104,16 @@ impl PathTracer {
         self.config.nirc_network.is_some()
     }
 
+    /// Accumulate one MIS sample for pixel (x, y) into the provided pixel.
+    /// Used for sparse RelMean estimation: callers maintain a per-eval-pixel
+    /// accumulator so variance decreases over time (same as the main pixel buffer).
+    pub fn sample_pixel_mis(&mut self, x: usize, y: usize, pixel: &mut crate::Pixel) {
+        let saved = self.config.strategy;
+        self.config.strategy = SamplingStrategy::Mis;
+        self.sample_pixel(x, y, pixel);
+        self.config.strategy = saved;
+    }
+
     fn init_pixel_rng(&self, x: u32, y: u32, frame_index: u32) -> Pcg32 {
         // Pack everything into a single 128-bit primitive
         // High 64 bits: Spatial coordinates (X, Y)
