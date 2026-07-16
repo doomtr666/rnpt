@@ -160,12 +160,10 @@ impl BvhBuilder {
     }
 
     pub fn build(self) -> (Bvh, Vec<MeshEmitter>) {
-        // Convert vertex positions to the [f32;3] format required by rnpt-bvh.
         let verts: Vec<[f32; 3]> = self.world_vertices.iter()
             .map(|p| [p.x, p.y, p.z])
             .collect();
 
-        // Build the triangle index list.
         let tris: Vec<[u32; 3]> = self.flat_meta.iter()
             .map(|m| [m.v0, m.v1, m.v2])
             .collect();
@@ -192,7 +190,6 @@ impl BvhBuilder {
             bounds_max.z = bounds_max.z.max(p.z);
         }
         
-        // Handle empty scene case
         if bounds_min.x > bounds_max.x {
             bounds_min = Point3::new(-1.0, -1.0, -1.0);
             bounds_max = Point3::new(1.0, 1.0, 1.0);

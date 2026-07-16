@@ -1,10 +1,10 @@
-# rnpt — Rust Path Tracer
+# rnpt — Rust Neural Path Tracer
 
-A physically-based CPU path tracer written in Rust. The primary goal is to prototype and validate advanced rendering algorithms in a clean, readable codebase before porting them to GPU. It doubles as an educational reference: every major system (BVH, BRDF, MIS, NIRC) is implemented from scratch with correctness and clarity as first-class concerns.
+A hobbyist physically-based CPU path tracer with an integrated neural radiance cache (NIRC), written in Rust. The goal is to prototype and explore advanced rendering algorithms in a clean, readable codebase. Every major system — BVH, BRDF, MIS, and the neural cache itself — is implemented from scratch with correctness and clarity as first-class concerns, and serves as an educational reference for anyone curious about these topics.
 
 ## Goals
 
-- **Algorithm prototyping** — validate rendering research ideas (ReSTIR, neural caches, MIS variants) on CPU where iteration is fast and debugging is straightforward, then port the validated design to GPU (CUDA/WGSL).
+- **Algorithm prototyping** — validate rendering research ideas (ReSTIR, neural caches, MIS variants) on CPU where iteration is fast and debugging is straightforward, then port the validated design to GPU.
 - **Educational reference** — each subsystem is self-contained and documented. The BVH in particular is production-quality and serves as a study case for SIMD-accelerated tree traversal.
 - **Real-world scenes** — glTF 2.0 import with PBR materials, punctual lights, HDRI environments, transmission/IOR/volume extensions. Tested on Cornell Box, Bistro exterior, and others.
 
@@ -33,7 +33,7 @@ The BVH lives in its own crate (`rnpt-bvh`) and can be used independently.
 An online-trained neural cache that replaces indirect path tracing bounces with a network prediction, trading a small bias for significantly higher convergence speed.
 
 - **Architecture**: 4-layer MLP, hidden dim 16, SiLU activations. ~755 parameters, <3 KB — fits entirely in L1 cache.
-- **Encoding**: NeRF sinusoidal + one-blob positional encoding for position and direction (`INPUT_DIM = 9`).
+- **Encoding**: one-blob for position (1 Gaussian per axis, 3 features) + NeRF sinusoidal for direction (sin/cos at one frequency, 6 features) → `INPUT_DIM = 9`.
 - **Training**: Adam optimizer, log-space MSE loss for HDR balance, EMA-smoothed inference snapshot published to workers lock-free.
 - **Sample collection**: Lock-free ring buffer (131 072 entries). Every 64th rendered pixel triggers a dedicated MIS path; all bounce-level radiances are pushed as training targets.
 - **Inference**: `gemv`-based forward pass (no weight matrix copies), alternating activation buffers. Backward pass uses `gemv_tr` to transpose-multiply without materializing the transpose.
@@ -73,7 +73,14 @@ cargo build --release
 cargo run --release -p rnpt-gui
 ```
 
-Requires a recent stable Rust toolchain. AVX2 is used automatically where available via the `wide` crate.
+Requires Rust 1.85 or later (edition 2024). AVX2 is detected and used automatically at runtime via the `wide` crate; no special `RUSTFLAGS` are needed.
+
+## Testing
+
+```bash
+cargo test -p rnpt      # unit tests (BRDF, MIS, NIRC, BVH wrapper)
+cargo test -p rnpt-bvh  # geometric BVH integration tests
+```
 
 ## GUI controls
 
@@ -84,3 +91,7 @@ Requires a recent stable Rust toolchain. AVX2 is used automatically where availa
 | Scroll | Zoom |
 | Ctrl+click | Place NIRC directional probe at surface point |
 | R | Reset render |
+
+## License
+
+GPL-3.0-only — see [LICENSE](LICENSE).

@@ -179,7 +179,6 @@ pub fn import_scene<P: AsRef<Path>>(
     stats.texture_count = textures.len();
     stats.total_texture_pixels = textures.iter().map(|t| (t.width * t.height) as usize).sum();
 
-    // Load Materials
     let t_mesh = Instant::now();
     let mut materials = Vec::new();
     for mat in document.materials() {
@@ -244,7 +243,6 @@ pub fn import_scene<P: AsRef<Path>>(
         });
     }
 
-    // Load Meshes
     // In glTF, a single Mesh can contain multiple Primitives. Since each Primitive
     // can have a different material, we split them into individual rnpt::Mesh instances.
     let mut meshes = Vec::new();
@@ -261,14 +259,12 @@ pub fn import_scene<P: AsRef<Path>>(
 
             let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
 
-            // Read positions
             if let Some(pos_iter) = reader.read_positions() {
                 for pos in pos_iter {
                     vertices.push(Point3::new(pos[0], pos[1], pos[2]));
                 }
             }
 
-            // Read normals
             if let Some(norm_iter) = reader.read_normals() {
                 for norm in norm_iter {
                     normals.push(UnitVector3::new_normalize(Vector3::new(
@@ -277,14 +273,12 @@ pub fn import_scene<P: AsRef<Path>>(
                 }
             }
 
-            // Read UVs
             if let Some(tex_coords) = reader.read_tex_coords(0).map(|v| v.into_f32()) {
                 for uv in tex_coords {
                     uvs.push(Vector2::new(uv[0], uv[1]));
                 }
             }
 
-            // Colors
             if let Some(colors) = reader.read_colors(0) {
                 let colors_f32 = colors.into_rgba_f32();
                 for c in colors_f32 {
@@ -300,7 +294,6 @@ pub fn import_scene<P: AsRef<Path>>(
                 }
             }
 
-            // Read indices
             if let Some(indices_iter) = reader.read_indices() {
                 let indices: Vec<u32> = indices_iter.into_u32().collect();
                 for chunk in indices.chunks_exact(3) {
@@ -325,7 +318,6 @@ pub fn import_scene<P: AsRef<Path>>(
         gltf_mesh_to_rnpt_meshes.push(rnpt_mesh_indices);
     }
 
-    // Load Nodes, Cameras and Lights
     let scene = document
         .default_scene()
         .or_else(|| document.scenes().next())
@@ -408,7 +400,6 @@ pub fn import_scene<P: AsRef<Path>>(
             lights.push(light);
         }
 
-        // Children traversal
         for child in node.children() {
             traverse_node(
                 &child,
@@ -460,7 +451,6 @@ pub fn import_scene<P: AsRef<Path>>(
         });
     }
 
-    // Extract roots
     let roots = scene.nodes().map(|n| n.index() as u32).collect();
 
     stats.mesh_process_ms = t_mesh.elapsed().as_millis() as u64;

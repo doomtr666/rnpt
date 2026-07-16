@@ -51,7 +51,6 @@ pub fn evaluate_surface(hit: &BvhHit, ray: &Ray, bvh: &Bvh, scene: &Scene) -> Su
 
     let position = ray.at(hit.hit.t);
 
-    // Per-vertex color.
     let c0 = bvh.colors[hit.v0 as usize];
     let c1 = bvh.colors[hit.v1 as usize];
     let c2 = bvh.colors[hit.v2 as usize];

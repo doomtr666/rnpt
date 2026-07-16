@@ -1,7 +1,7 @@
 use crate::{
     PathTracer, PathTracerConfig, Pixel, SamplingStrategy,
     evaluate_surface,
-    nirc::{NircConfig, NircMlp, NircRingBuffer, NircTrainer},
+    nirc::{NircConfig, NircRingBuffer, NircTrainer},
 };
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -288,7 +288,7 @@ impl ParallelTracer {
                     continue;
                 }
 
-                let input = NircMlp::encode_inputs(&pos, &wi, &bounds_min, &bounds_max);
+                let input = crate::nirc::encode_inputs(&pos, &wi, &bounds_min, &bounds_max);
                 let pred = network.forward(input);
                 probe.push([pred[0].max(0.0), pred[1].max(0.0), pred[2].max(0.0)]);
             }

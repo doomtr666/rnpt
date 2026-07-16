@@ -17,7 +17,6 @@ impl Pcg32 {
             inc: (init_seq << 1) | 1,
         };
 
-        // Initialize the state by stepping once
         rng.state = rng.state.wrapping_add(init_state);
         rng.next_u32();
         rng

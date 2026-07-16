@@ -19,6 +19,11 @@ pub use emitters::*;
 mod light;
 pub use light::*;
 
+mod microfacet;
+
+mod glass;
+pub use glass::*;
+
 mod brdf;
 pub use brdf::*;
 
@@ -38,3 +43,6 @@ mod nirc;
 pub use nirc::*;
 
 pub use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
+
+#[cfg(test)]
+mod tests;
