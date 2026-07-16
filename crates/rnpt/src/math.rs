@@ -1,41 +1,5 @@
 use nalgebra::{Point3, UnitVector3, Vector3};
 
-#[derive(Debug, Clone, Copy)]
-pub struct AABB {
-    pub min: Point3<f32>,
-    pub max: Point3<f32>,
-}
-
-impl AABB {
-    pub fn invalid() -> Self {
-        Self {
-            min: Point3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
-            max: Point3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
-        }
-    }
-
-    pub fn extend(&mut self, point: Point3<f32>) {
-        self.min.x = self.min.x.min(point.x);
-        self.min.y = self.min.y.min(point.y);
-        self.min.z = self.min.z.min(point.z);
-        self.max.x = self.max.x.max(point.x);
-        self.max.y = self.max.y.max(point.y);
-        self.max.z = self.max.z.max(point.z);
-    }
-
-    pub fn surface_area(&self) -> f32 {
-        let extent = self.max - self.min;
-        if extent.x <= 0.0 || extent.y <= 0.0 || extent.z <= 0.0 {
-            return 0.0;
-        }
-        2.0 * (extent.x * extent.y + extent.y * extent.z + extent.z * extent.x)
-    }
-
-    pub fn center(&self) -> Point3<f32> {
-        Point3::from((self.min.coords + self.max.coords) / 2.0)
-    }
-}
-
 pub struct TriangleHit {
     pub t: f32,
     pub u: f32,
