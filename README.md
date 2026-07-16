@@ -66,6 +66,39 @@ glTF 2.0 (`.glb` / `.gltf`) via the `gltf` crate. Supported extensions:
 
 HDRI environment maps (`.hdr`) loaded via the `image` crate.
 
+## Usage
+
+### Adding scenes and environments
+
+Drop `.glb` or `.gltf` files into the `assets/` directory. Drop `.hdr` files there for HDRI environments. Both are picked up automatically on next launch and selectable from the GUI side panel — no configuration needed.
+
+### Post-processing
+
+The **Post-Processing** panel exposes:
+
+- **Exposure** — linear pre-tonemapping multiplier (0.1 – 10×)
+- **Tonemapper** — Reinhard (per-channel) or ACES (Narkowicz filmic fit), both followed by gamma 2.2
+
+### NIRC directional probe
+
+**Ctrl+click** on any surface point while NIRC is active renders a 256×128 equirectangular map showing the radiance the network predicts for every incoming direction at that point — essentially a neural HDRI captured at the clicked surface.
+
+This makes the network's internal state directly visible: you can see whether it has learned the correct lighting direction, colour bleeding from nearby geometry, or sky contribution. Directions below the geometric horizon are masked to black, matching the hemisphere the network is actually queried over at render time.
+
+The probe updates instantly (no path tracing involved — it is a pure forward pass over the full directional grid) and is displayed in a collapsible panel on the right side of the GUI.
+
+### Rendering strategies
+
+The **Render** panel lets you switch sampling strategy at any time without restarting:
+
+| Strategy | Description |
+|---|---|
+| MIS | Multiple importance sampling (NEE + BRDF), unbiased reference |
+| BRDF | Pure BRDF sampling, no direct light connection |
+| NEE | Next-event estimation only |
+| Direct | Direct illumination only (one bounce) |
+| NIRC | Indirect bounces replaced by the neural cache prediction |
+
 ## Building
 
 ```bash
