@@ -35,17 +35,16 @@ impl AABB {
         self.max.z = self.max.z.max(other.max.z);
     }
 
-    /// Remap a point to [0, 1] based on the AABB extents.
-    pub fn normalize(&self, v: Point3<f32>) -> Point3<f32> {
+    pub fn center(&self) -> Point3<f32> {
+        Point3::from((self.min.coords + self.max.coords) / 2.0)
+    }
+
+    pub fn surface_area(&self) -> f32 {
         let extent = self.max - self.min;
-        let ext_x = if extent.x > 0.0 { extent.x } else { 1.0 };
-        let ext_y = if extent.y > 0.0 { extent.y } else { 1.0 };
-        let ext_z = if extent.z > 0.0 { extent.z } else { 1.0 };
-        Point3::new(
-            (v.x - self.min.x) / ext_x,
-            (v.y - self.min.y) / ext_y,
-            (v.z - self.min.z) / ext_z,
-        )
+        if extent.x <= 0.0 || extent.y <= 0.0 || extent.z <= 0.0 {
+            return 0.0;
+        }
+        2.0 * (extent.x * extent.y + extent.y * extent.z + extent.z * extent.x)
     }
 }
 

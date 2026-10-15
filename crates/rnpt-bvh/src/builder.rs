@@ -6,6 +6,8 @@ use crate::{
     Geometry,
 };
 
+const SAH_BINS: usize = 8;
+
 pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
     let mut vertices: Vec<Point3<f32>> = Vec::new();
     let mut triangles: Vec<FlatTriangle> = Vec::new();
@@ -25,7 +27,7 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
         }
     }
 
-    sort_by_morton_code(&vertices, &mut triangles);
+    cluster_triangles(&vertices, &mut triangles);
 
     // Pad to a multiple of 8 with degenerate triangles that never hit.
     let num_triangles = triangles.len();
@@ -36,10 +38,11 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
         }
     }
 
-    // Chunks first: every 8 consecutive triangles in Morton order become one
-    // SoA chunk; the tree is then built over chunks, not triangles.
+    // Chunks first: every 8 consecutive triangles become one SoA chunk; the
+    // tree is then built over chunks, not triangles.
     let mut soa_chunks = Vec::new();
     let mut chunk_aabbs = Vec::new();
+    let mut chunk_centroids = Vec::new();
     for chunk_start in (0..triangles.len()).step_by(8) {
         let mut soa = FlatTriangles::default();
         let mut chunk_aabb = AABB::invalid();
@@ -72,91 +75,223 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
 
         soa_chunks.push(soa);
         chunk_aabbs.push(chunk_aabb);
+        chunk_centroids.push(chunk_aabb.center());
     }
 
-    let chunk_count = soa_chunks.len() as u32;
-    let mut nodes = vec![BvhNode { aabb: AABB::invalid(), left_first: 0, tri_count: chunk_count }];
-    if chunk_count > 0 {
-        update_node_bounds(0, &mut nodes, &chunk_aabbs);
-        subdivide(0, &mut nodes, &chunk_aabbs);
+    let mut chunk_indices: Vec<usize> = (0..soa_chunks.len()).collect();
+    let mut nodes = vec![BvhNode { aabb: AABB::invalid(), left_first: 0, tri_count: chunk_indices.len() as u32 }];
+    if !chunk_indices.is_empty() {
+        update_node_bounds(0, &mut nodes, &chunk_indices, &chunk_aabbs);
+        subdivide_sah(0, &mut nodes, &mut chunk_indices, &chunk_aabbs, &chunk_centroids);
     }
 
-    BvhInner { nodes, triangles, soa_chunks }
+    // Store chunks (and their triangles) in leaf order.
+    let ordered_chunks = chunk_indices.iter().map(|&idx| soa_chunks[idx]).collect();
+    let ordered_triangles = chunk_indices.iter().flat_map(|&idx| triangles[idx * 8..idx * 8 + 8].iter().copied()).collect();
+
+    BvhInner { nodes, triangles: ordered_triangles, soa_chunks: ordered_chunks }
 }
 
-/// Order triangles along a Z-order curve of their centroids, so that a plain
-/// median split of the array gives spatially coherent children.
-fn sort_by_morton_code(vertices: &[Point3<f32>], triangles: &mut [FlatTriangle]) {
-    let mut world_aabb = AABB::invalid();
-    for &v in vertices {
-        world_aabb.extend(v);
+/// Group triangles into compact clusters of 8: recursive median splits along
+/// the largest centroid extent, with split points on multiples of 8, so that
+/// each chunk holds 8 spatially close triangles.
+fn cluster_triangles(vertices: &[Point3<f32>], triangles: &mut Vec<FlatTriangle>) {
+    let centroids: Vec<Point3<f32>> = triangles
+        .iter()
+        .map(|tri| {
+            Point3::from(
+                (vertices[tri.v0 as usize].coords + vertices[tri.v1 as usize].coords + vertices[tri.v2 as usize].coords)
+                    / 3.0,
+            )
+        })
+        .collect();
+
+    let mut indices: Vec<usize> = (0..triangles.len()).collect();
+    let len = indices.len();
+    split_clusters(&mut indices, &centroids, 0, len);
+
+    let orig = triangles.clone();
+    for (dst, &src) in triangles.iter_mut().zip(&indices) {
+        *dst = orig[src];
+    }
+}
+
+fn split_clusters(indices: &mut [usize], centroids: &[Point3<f32>], start: usize, end: usize) {
+    let count = end - start;
+    if count <= 8 {
+        return;
     }
 
-    triangles.sort_by_cached_key(|tri| {
-        let centroid = Point3::from(
-            (vertices[tri.v0 as usize].coords + vertices[tri.v1 as usize].coords + vertices[tri.v2 as usize].coords)
-                / 3.0,
-        );
-        let c = world_aabb.normalize(centroid);
-        morton_3d(c.x, c.y, c.z)
+    let mut centroid_bounds = AABB::invalid();
+    for &i in &indices[start..end] {
+        centroid_bounds.extend(centroids[i]);
+    }
+
+    let extent = centroid_bounds.max - centroid_bounds.min;
+    let mut axis = 0usize;
+    if extent.y > extent.x {
+        axis = 1;
+    }
+    if extent.z > extent[axis] {
+        axis = 2;
+    }
+
+    let mid = count / 2;
+    let mut split_offset = (mid / 8) * 8;
+    if split_offset == 0 {
+        split_offset = 8.min(count - 1);
+    }
+
+    indices[start..end].select_nth_unstable_by(split_offset, |&a, &b| {
+        centroids[a][axis].partial_cmp(&centroids[b][axis]).unwrap()
     });
+
+    let split_idx = start + split_offset;
+    split_clusters(indices, centroids, start, split_idx);
+    split_clusters(indices, centroids, split_idx, end);
 }
 
-fn update_node_bounds(node_idx: usize, nodes: &mut [BvhNode], chunk_aabbs: &[AABB]) {
+fn update_node_bounds(node_idx: usize, nodes: &mut [BvhNode], chunk_indices: &[usize], chunk_aabbs: &[AABB]) {
     let first = nodes[node_idx].left_first as usize;
     let count = nodes[node_idx].tri_count as usize;
 
     let mut aabb = AABB::invalid();
-    for chunk_aabb in &chunk_aabbs[first..first + count] {
-        aabb.extend_aabb(chunk_aabb);
+    for &chunk_idx in &chunk_indices[first..first + count] {
+        aabb.extend_aabb(&chunk_aabbs[chunk_idx]);
     }
     nodes[node_idx].aabb = aabb;
 }
 
-fn subdivide(node_idx: usize, nodes: &mut Vec<BvhNode>, chunk_aabbs: &[AABB]) {
-    let node = nodes[node_idx];
-    if node.tri_count <= 1 {
+/// Binned SAH over chunks. A chunk costs 1 to intersect whatever it holds:
+/// that is the whole point of testing 8 triangles at once.
+fn subdivide_sah(
+    node_idx: usize,
+    nodes: &mut Vec<BvhNode>,
+    chunk_indices: &mut [usize],
+    chunk_aabbs: &[AABB],
+    chunk_centroids: &[Point3<f32>],
+) {
+    let first = nodes[node_idx].left_first as usize;
+    let count = nodes[node_idx].tri_count as usize;
+
+    if count <= 1 {
         return;
     }
 
-    // Split in the middle: chunks are already in Morton order.
-    let first = node.left_first as usize;
-    let count = node.tri_count as usize;
-    let split_idx = first + count / 2;
+    let mut best_cost = f32::MAX;
+    let mut best_axis = 0usize;
+    let mut best_split_bin = 0usize;
+
+    let mut centroid_bounds = AABB::invalid();
+    for &chunk_idx in &chunk_indices[first..first + count] {
+        centroid_bounds.extend(chunk_centroids[chunk_idx]);
+    }
+
+    let extent = centroid_bounds.max - centroid_bounds.min;
+    if extent.x == 0.0 && extent.y == 0.0 && extent.z == 0.0 {
+        return; // All centroids are identical.
+    }
+
+    for axis in 0..3 {
+        let bounds_min = centroid_bounds.min[axis];
+        let bounds_extent = centroid_bounds.max[axis] - bounds_min;
+        if bounds_extent == 0.0 {
+            continue;
+        }
+
+        #[derive(Clone, Copy)]
+        struct Bin {
+            aabb: AABB,
+            count: usize,
+        }
+        let mut bins = [Bin { aabb: AABB::invalid(), count: 0 }; SAH_BINS];
+
+        for &chunk_idx in &chunk_indices[first..first + count] {
+            let centroid = chunk_centroids[chunk_idx];
+            let bin_idx = ((((centroid[axis] - bounds_min) / bounds_extent) * SAH_BINS as f32) as usize).min(SAH_BINS - 1);
+            bins[bin_idx].aabb.extend_aabb(&chunk_aabbs[chunk_idx]);
+            bins[bin_idx].count += 1;
+        }
+
+        let mut left_aabbs = [AABB::invalid(); SAH_BINS - 1];
+        let mut left_counts = [0usize; SAH_BINS - 1];
+        let mut right_aabbs = [AABB::invalid(); SAH_BINS - 1];
+        let mut right_counts = [0usize; SAH_BINS - 1];
+
+        let mut left_box = AABB::invalid();
+        let mut left_count = 0;
+        for i in 0..SAH_BINS - 1 {
+            left_count += bins[i].count;
+            left_box.extend_aabb(&bins[i].aabb);
+            left_counts[i] = left_count;
+            left_aabbs[i] = left_box;
+        }
+
+        let mut right_box = AABB::invalid();
+        let mut right_count = 0;
+        for i in (1..SAH_BINS).rev() {
+            right_count += bins[i].count;
+            right_box.extend_aabb(&bins[i].aabb);
+            right_counts[i - 1] = right_count;
+            right_aabbs[i - 1] = right_box;
+        }
+
+        let inv_total_area = 1.0 / nodes[node_idx].aabb.surface_area();
+
+        for i in 0..SAH_BINS - 1 {
+            if left_counts[i] > 0 && right_counts[i] > 0 {
+                let cost = 1.0
+                    + (left_aabbs[i].surface_area() * left_counts[i] as f32
+                        + right_aabbs[i].surface_area() * right_counts[i] as f32)
+                        * inv_total_area;
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_axis = axis;
+                    best_split_bin = i;
+                }
+            }
+        }
+    }
+
+    let leaf_cost = count as f32;
+    if best_cost >= leaf_cost {
+        return;
+    }
+
+    let bounds_min = centroid_bounds.min[best_axis];
+    let bounds_extent = centroid_bounds.max[best_axis] - bounds_min;
+
+    let mut left = first;
+    let mut right = first + count - 1;
+    while left <= right {
+        let centroid = chunk_centroids[chunk_indices[left]];
+        let bin_idx = ((((centroid[best_axis] - bounds_min) / bounds_extent) * SAH_BINS as f32) as usize).min(SAH_BINS - 1);
+        if bin_idx <= best_split_bin {
+            left += 1;
+        } else {
+            chunk_indices.swap(left, right);
+            if right == 0 {
+                break;
+            }
+            right -= 1;
+        }
+    }
+
+    let left_count = left - first;
+    if left_count == 0 || left_count == count {
+        return;
+    }
 
     let left_child_idx = nodes.len();
-    nodes.push(BvhNode { aabb: AABB::invalid(), left_first: first as u32, tri_count: (split_idx - first) as u32 });
+    nodes.push(BvhNode { aabb: AABB::invalid(), left_first: first as u32, tri_count: left_count as u32 });
     let right_child_idx = nodes.len();
-    nodes.push(BvhNode {
-        aabb: AABB::invalid(),
-        left_first: split_idx as u32,
-        tri_count: (count - (split_idx - first)) as u32,
-    });
+    nodes.push(BvhNode { aabb: AABB::invalid(), left_first: left as u32, tri_count: (count - left_count) as u32 });
 
     nodes[node_idx].left_first = left_child_idx as u32;
     nodes[node_idx].tri_count = 0;
 
-    update_node_bounds(left_child_idx, nodes, chunk_aabbs);
-    update_node_bounds(right_child_idx, nodes, chunk_aabbs);
-    subdivide(left_child_idx, nodes, chunk_aabbs);
-    subdivide(right_child_idx, nodes, chunk_aabbs);
-}
-
-/// Spread the 21 low bits of `v` so that two zeros sit between each bit.
-#[inline(always)]
-fn expand_bits(mut v: u64) -> u64 {
-    v &= 0x0000_0000_001f_ffff;
-    v = (v | (v << 32)) & 0x001f_0000_0000_ffff;
-    v = (v | (v << 16)) & 0x001f_0000_ff00_00ff;
-    v = (v | (v << 8)) & 0x100f_00f0_0f00_f00f;
-    v = (v | (v << 4)) & 0x10c3_0c30_c30c_30c3;
-    v = (v | (v << 2)) & 0x1249_2492_4924_9249;
-    v
-}
-
-/// 3D Morton code of a point normalized to [0, 1].
-#[inline]
-fn morton_3d(x: f32, y: f32, z: f32) -> u64 {
-    let q = |c: f32| (c.clamp(0.0, 1.0) * 2_097_151.0) as u64;
-    expand_bits(q(x)) | (expand_bits(q(y)) << 1) | (expand_bits(q(z)) << 2)
+    update_node_bounds(left_child_idx, nodes, chunk_indices, chunk_aabbs);
+    update_node_bounds(right_child_idx, nodes, chunk_indices, chunk_aabbs);
+    subdivide_sah(left_child_idx, nodes, chunk_indices, chunk_aabbs, chunk_centroids);
+    subdivide_sah(right_child_idx, nodes, chunk_indices, chunk_aabbs, chunk_centroids);
 }

@@ -88,19 +88,23 @@ impl BvhInner {
             let node = &self.nodes[node_idx];
 
             if node.is_leaf() {
-                let chunk_idx = node.left_first as usize;
-                let chunk = &self.soa_chunks[chunk_idx];
+                let start_chunk = node.left_first as usize;
+                let chunk_count = node.tri_count as usize;
 
-                if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
-                    t_max = simd_hit.hit.t;
-                    let tri = &self.triangles[chunk_idx * 8 + simd_hit.lane];
-                    result = Some(Hit {
-                        t: simd_hit.hit.t,
-                        u: simd_hit.hit.u,
-                        v: simd_hit.hit.v,
-                        prim_id: tri.orig_idx,
-                        geom_id: tri.geom_id,
-                    });
+                for chunk_idx in start_chunk..start_chunk + chunk_count {
+                    let chunk = &self.soa_chunks[chunk_idx];
+
+                    if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
+                        t_max = simd_hit.hit.t;
+                        let tri = &self.triangles[chunk_idx * 8 + simd_hit.lane];
+                        result = Some(Hit {
+                            t: simd_hit.hit.t,
+                            u: simd_hit.hit.u,
+                            v: simd_hit.hit.v,
+                            prim_id: tri.orig_idx,
+                            geom_id: tri.geom_id,
+                        });
+                    }
                 }
             } else if stack_ptr + 1 < MAX_TRAVERSAL_DEPTH {
                 let left_idx = node.left_first as usize;
