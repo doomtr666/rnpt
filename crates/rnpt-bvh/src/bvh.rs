@@ -5,17 +5,6 @@ use crate::Hit;
 
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 
-const CHILD_ORDER: [[u8; 8]; 8] = [
-    [0, 1, 2, 4, 3, 5, 6, 7], // ray_oct 0: (+x,+y,+z)
-    [1, 0, 3, 5, 2, 4, 7, 6], // ray_oct 1: (-x,+y,+z)
-    [2, 0, 3, 6, 1, 4, 7, 5], // ray_oct 2: (+x,-y,+z)
-    [3, 1, 2, 7, 0, 5, 6, 4], // ray_oct 3: (-x,-y,+z)
-    [4, 0, 5, 6, 1, 2, 7, 3], // ray_oct 4: (+x,+y,-z)
-    [5, 1, 4, 7, 0, 3, 6, 2], // ray_oct 5: (-x,+y,-z)
-    [6, 2, 4, 7, 0, 3, 5, 1], // ray_oct 6: (+x,-y,-z)
-    [7, 3, 5, 6, 1, 2, 4, 0], // ray_oct 7: (-x,-y,-z)
-];
-
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
 pub struct FlatTriangles {
@@ -163,10 +152,6 @@ impl BvhInner {
         let mut result: Option<Hit> = None;
         let mut t_max = ray.tmax;
 
-        let oct = (ray.direction.x < 0.0) as usize
-            | ((ray.direction.y < 0.0) as usize) << 1
-            | ((ray.direction.z < 0.0) as usize) << 2;
-
         let mut stack = BvhStack::new();
         stack.push(0, 0.0);
 
@@ -202,17 +187,34 @@ impl BvhInner {
                 }
             } else {
                 let node = self.get_node(encoded_idx);
-                let (bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
+                let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
 
-                for &slot in CHILD_ORDER[oct].iter().rev() {
-                    let slot = slot as usize;
-                    if bitmask & (1u32 << slot) != 0 {
-                        let encoded = node.children[slot];
-                        let t = t_arr[slot];
-                        if encoded != u32::MAX && t < t_max {
-                            stack.push(encoded, t);
-                        }
+                let mut hits = [(0u32, 0.0f32); 8];
+                let mut hit_count = 0;
+
+                while bitmask != 0 {
+                    let lane = bitmask.trailing_zeros() as usize;
+                    bitmask &= bitmask - 1;
+
+                    // Guard against empty slots in case a NaN slips through the mask.
+                    let encoded = node.children[lane];
+                    let t = t_arr[lane];
+                    if encoded != u32::MAX && t < t_max {
+                        hits[hit_count] = (encoded, t);
+                        hit_count += 1;
                     }
+                }
+
+                // Insertion sort, farthest first, so the nearest child is popped first.
+                for i in 1..hit_count {
+                    let mut j = i;
+                    while j > 0 && hits[j - 1].1 < hits[j].1 {
+                        hits.swap(j - 1, j);
+                        j -= 1;
+                    }
+                }
+                for &(encoded, t) in &hits[..hit_count] {
+                    stack.push(encoded, t);
                 }
             }
         }
