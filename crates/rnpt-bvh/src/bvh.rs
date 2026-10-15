@@ -241,6 +241,10 @@ impl BvhInner {
         }
 
         let t_max = ray.tmax;
+        let oct = (ray.direction.x < 0.0) as usize
+            | ((ray.direction.y < 0.0) as usize) << 1
+            | ((ray.direction.z < 0.0) as usize) << 2;
+
         let mut stack = BvhStack::new();
         stack.push(0, 0.0);
 
@@ -259,15 +263,18 @@ impl BvhInner {
                     }
                 }
             } else {
+                // Near-first order from the ray octant: no sort, but likely
+                // occluders come first, so the early exit happens sooner.
                 let node = self.get_node(encoded_idx);
-                let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
+                let (bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
 
-                while bitmask != 0 {
-                    let lane = bitmask.trailing_zeros() as usize;
-                    bitmask &= bitmask - 1;
-                    let encoded = node.children[lane];
-                    if encoded != u32::MAX && t_arr[lane] < t_max {
-                        stack.push(encoded, 0.0);
+                for &slot in CHILD_ORDER[oct].iter().rev() {
+                    let slot = slot as usize;
+                    if bitmask & (1u32 << slot) != 0 {
+                        let encoded = node.children[slot];
+                        if encoded != u32::MAX && t_arr[slot] < t_max {
+                            stack.push(encoded, 0.0);
+                        }
                     }
                 }
             }
