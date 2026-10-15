@@ -15,6 +15,13 @@ const TRAIN_PIXEL_STRIDE: usize = 64;
 const NIRC_REFRESH_STRIDE: usize = 512;
 /// Number of random samples read from the ring buffer per training call.
 const RING_TRAIN_BATCH: usize = 512;
+/// NIRC training is paced by rays, not time: one training step is due every
+/// this many rays traced (closest-hit + shadow, training paths included).
+const RAYS_PER_TRAIN_STEP: u64 = 1 << 18;
+/// Workers wait when rendering gets this many steps ahead of training.
+const MAX_TRAIN_LAG_STEPS: u64 = 2;
+/// Upper bound on training steps run by one `train_nirc` call.
+const MAX_TRAIN_STEPS_PER_CALL: u64 = 32;
 
 /// A lock-free pixel buffer that multiple threads can write to concurrently.
 /// This is safe because each worker thread writes to a unique disjoint set of pixels.
@@ -56,6 +63,10 @@ pub struct ParallelTracer {
     running: Arc<AtomicBool>,
 
     // NIRC training state
+    /// Rays traced since the tracer was created; drives the training schedule.
+    nirc_rays: Arc<AtomicU64>,
+    /// Training steps run so far.
+    nirc_steps: Arc<AtomicU64>,
     nirc_trainer: Mutex<NircTrainer>,
     /// Lock-free ring buffer: workers push training samples, trainer reads random batches.
     nirc_ring: Arc<NircRingBuffer>,
@@ -86,6 +97,8 @@ impl ParallelTracer {
         let total_real_rays = Arc::new(AtomicU64::new(0));
         let total_shadow_rays = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicBool::new(true));
+        let nirc_rays = Arc::new(AtomicU64::new(0));
+        let nirc_steps = Arc::new(AtomicU64::new(0));
 
         let num_eval_pixels = (num_pixels + TRAIN_PIXEL_STRIDE - 1) / TRAIN_PIXEL_STRIDE;
         let mut mis_eval_pixels = vec![Pixel::default(); num_eval_pixels];
@@ -107,6 +120,8 @@ impl ParallelTracer {
             let shadow_rays_atomic = total_shadow_rays.clone();
             let running_atomic = running.clone();
             let mis_eval = mis_eval_buf.clone();
+            let nirc_rays_atomic = nirc_rays.clone();
+            let nirc_steps_atomic = nirc_steps.clone();
 
             threads.push(
                 thread::Builder::new()
@@ -126,6 +141,8 @@ impl ParallelTracer {
                             shadow_rays_atomic,
                             running_atomic,
                             mis_eval,
+                            nirc_rays_atomic,
+                            nirc_steps_atomic,
                         )
                     })
                     .expect("Failed to spawn worker thread"),
@@ -142,6 +159,8 @@ impl ParallelTracer {
             total_real_rays,
             total_shadow_rays,
             running,
+            nirc_rays,
+            nirc_steps,
             nirc_trainer: Mutex::new(NircTrainer::new(NircConfig::default())),
             nirc_ring,
             mis_eval_pixels,
@@ -149,14 +168,15 @@ impl ParallelTracer {
     }
 
     /// Train the NIRC from the ring buffer and publish the updated network to workers.
-    /// Returns the average training loss for this step, or `None` if skipped.
+    ///
+    /// Training is paced by rays, not time: one step is due every
+    /// `RAYS_PER_TRAIN_STEP` rays traced, and workers wait when they get ahead
+    /// (see `worker_loop`). Two renders with the same ray budget therefore train
+    /// the network for the same number of steps, whatever the machine or the
+    /// frame rate. Runs the steps due (at most `MAX_TRAIN_STEPS_PER_CALL`) and
+    /// returns the loss of the last one, or `None` if none ran.
     pub fn train_nirc(&self) -> Option<f32> {
         if self.config.lock().unwrap().strategy != SamplingStrategy::Nirc {
-            return None;
-        }
-
-        let samples = self.nirc_ring.read_random_batch(RING_TRAIN_BATCH);
-        if samples.is_empty() {
             return None;
         }
 
@@ -165,7 +185,20 @@ impl ParallelTracer {
             Err(_) => return None,
         };
 
-        let loss = trainer.train_samples(&samples);
+        let due = self.nirc_rays.load(Ordering::Acquire) / RAYS_PER_TRAIN_STEP;
+        let mut last_loss = None;
+        for _ in 0..MAX_TRAIN_STEPS_PER_CALL {
+            if self.nirc_steps.load(Ordering::Relaxed) >= due {
+                break;
+            }
+            let samples = self.nirc_ring.read_random_batch(RING_TRAIN_BATCH);
+            if !samples.is_empty() {
+                last_loss = Some(trainer.train_samples(&samples));
+            }
+            // Counted even without samples, so workers never wait on an empty ring.
+            self.nirc_steps.fetch_add(1, Ordering::Release);
+        }
+        let loss = last_loss?;
 
         // Publish the EMA snapshot. `ema_buf` is maintained in-place by `train_samples`;
         // we only allocate here (one Box per step) to hand off an immutable Arc to workers.
@@ -309,12 +342,16 @@ impl ParallelTracer {
         shadow_rays_atomic: Arc<AtomicU64>,
         running_atomic: Arc<AtomicBool>,
         mis_eval_buf: Arc<UnsafePixelBuffer>,
+        nirc_rays_atomic: Arc<AtomicU64>,
+        nirc_steps_atomic: Arc<AtomicU64>,
     ) {
         let mut local_epoch = 0u32;
         let mut local_nirc_epoch = u32::MAX; // force first refresh
         let mut path_tracer: Option<PathTracer> = None;
         let mut width = 0;
         let mut height = 0;
+        let mut budget = crate::RenderBudget::default();
+        let mut is_nirc = false;
         let mut train_rng =
             crate::Pcg32::from_seed_128(thread_idx as u128 * 0x9e3779b97f4a7c15);
 
@@ -326,6 +363,8 @@ impl ParallelTracer {
                 let cfg = config_mutex.lock().unwrap().clone();
                 width = cfg.width;
                 height = cfg.height;
+                budget = cfg.budget;
+                is_nirc = cfg.strategy == SamplingStrategy::Nirc;
                 local_nirc_epoch = nirc_epoch_atomic.load(Ordering::Relaxed);
                 path_tracer = Some(PathTracer::new(cfg));
             }
@@ -336,6 +375,7 @@ impl ParallelTracer {
             let mut real_rays_traced = 0u64;
             let mut shadow_rays_traced = 0u64;
             let mut pixel_count = 0usize;
+            let mut did_work = false;
 
             let blocks_x = (width + TILE_SIZE - 1) / TILE_SIZE;
             let blocks_y = (height + TILE_SIZE - 1) / TILE_SIZE;
@@ -364,6 +404,12 @@ impl ParallelTracer {
                     for x in start_x..end_x {
                         let i = y * width + x;
 
+                        // Pixels that spent their budget are done; the others go on.
+                        if budget.is_exhausted(unsafe { buffer.get_mut(i) }) {
+                            continue;
+                        }
+                        did_work = true;
+
                         if rays_traced >= BATCH_SIZE {
                             if epoch_atomic.load(Ordering::Relaxed) != local_epoch
                                 || !running_atomic.load(Ordering::Relaxed)
@@ -373,9 +419,26 @@ impl ParallelTracer {
                             rays_atomic.fetch_add(rays_traced, Ordering::Relaxed);
                             real_rays_atomic.fetch_add(real_rays_traced, Ordering::Relaxed);
                             shadow_rays_atomic.fetch_add(shadow_rays_traced, Ordering::Relaxed);
+                            nirc_rays_atomic
+                                .fetch_add(real_rays_traced + shadow_rays_traced, Ordering::Release);
                             rays_traced = 0;
                             real_rays_traced = 0;
                             shadow_rays_traced = 0;
+
+                            // Pace rendering on training: never get more than
+                            // MAX_TRAIN_LAG_STEPS steps ahead of the trainer.
+                            while is_nirc
+                                && nirc_rays_atomic.load(Ordering::Acquire)
+                                    > (nirc_steps_atomic.load(Ordering::Acquire) + MAX_TRAIN_LAG_STEPS)
+                                        * RAYS_PER_TRAIN_STEP
+                            {
+                                if epoch_atomic.load(Ordering::Relaxed) != local_epoch
+                                    || !running_atomic.load(Ordering::Relaxed)
+                                {
+                                    break 'pass;
+                                }
+                                thread::sleep(std::time::Duration::from_micros(100));
+                            }
                         }
 
                         // Hot-swap NIRC network without restarting the render pass.
@@ -390,28 +453,30 @@ impl ParallelTracer {
                             }
                         }
 
-                        unsafe {
-                            let pixel = buffer.get_mut(i);
-                            let (r, s) = tracer.sample_pixel(x, y, pixel);
-                            real_rays_traced += r;
-                            shadow_rays_traced += s;
-
-
-                        }
+                        let pixel = unsafe { buffer.get_mut(i) };
+                        let (r, s) = tracer.sample_pixel(x, y, pixel);
+                        real_rays_traced += r;
+                        shadow_rays_traced += s;
                         rays_traced += 1;
 
                         // Training: random pixel subset (pixel_count stride gives diversity).
-                        if pixel_count % TRAIN_PIXEL_STRIDE == 0 {
+                        // Its rays are charged to the pixel: they are part of NIRC's cost.
+                        if is_nirc && pixel_count % TRAIN_PIXEL_STRIDE == 0 {
+                            let (mut tr, mut ts) = (0u64, 0u64);
                             let new_samples = tracer
-                                .collect_training_samples_for_pixel(x, y, &mut train_rng);
+                                .collect_training_samples_for_pixel(x, y, &mut train_rng, &mut tr, &mut ts);
                             for (inp, tgt) in new_samples {
                                 nirc_ring.push(inp, tgt);
                             }
+                            pixel.rays += tr + ts;
+                            real_rays_traced += tr;
+                            shadow_rays_traced += ts;
                         }
 
                         // Eval: fixed pixel subset aligned to i so mis_eval_pixels[j]
                         // always accumulates samples for the same pixel as self.pixels[j*STRIDE].
-                        if i % TRAIN_PIXEL_STRIDE == 0 {
+                        // Instrumentation only (RelMean), so not charged to any budget.
+                        if is_nirc && i % TRAIN_PIXEL_STRIDE == 0 {
                             let eval_idx = i / TRAIN_PIXEL_STRIDE;
                             unsafe {
                                 tracer.sample_pixel_mis(x, y, mis_eval_buf.get_mut(eval_idx));
@@ -431,6 +496,12 @@ impl ParallelTracer {
                 rays_atomic.fetch_add(rays_traced, Ordering::Relaxed);
                 real_rays_atomic.fetch_add(real_rays_traced, Ordering::Relaxed);
                 shadow_rays_atomic.fetch_add(shadow_rays_traced, Ordering::Relaxed);
+                nirc_rays_atomic.fetch_add(real_rays_traced + shadow_rays_traced, Ordering::Release);
+            }
+
+            // Every pixel of this worker spent its budget: idle until a reset.
+            if !did_work {
+                thread::sleep(std::time::Duration::from_millis(20));
             }
         }
     }

@@ -14,6 +14,23 @@ pub fn show(app: &mut RnptGuiApp, ui: &mut egui::Ui) {
         total as f64 / app.local_pixels.len() as f64
     };
     ui.label(format!("Samples/Pixel (avg): {:.1}", avg_samples));
+
+    let avg_rays = if app.local_pixels.is_empty() {
+        0.0
+    } else {
+        let total: u64 = app.local_pixels.iter().map(|p| p.rays).sum();
+        total as f64 / app.local_pixels.len() as f64
+    };
+    ui.label(format!("Rays/Pixel (avg): {:.1}", avg_rays));
+    if !app.budget.is_unlimited() && !app.local_pixels.is_empty() {
+        let done = app.local_pixels.iter().filter(|p| app.budget.is_exhausted(p)).count();
+        let pct = 100.0 * done as f64 / app.local_pixels.len() as f64;
+        if done == app.local_pixels.len() {
+            ui.label("Budget: done");
+        } else {
+            ui.label(format!("Budget: {pct:.1}% of pixels done"));
+        }
+    }
     ui.label(format!("Performance: {}", format_paths_per_sec(app.local_rays_per_sec)));
 
     let total_rays = app.local_real_rays_per_sec + app.local_shadow_rays_per_sec;

@@ -36,6 +36,8 @@ pub struct RnptGuiApp {
     pub resize_timeout: Option<Instant>,
 
     pub strategy: rnpt::SamplingStrategy,
+    /// Per-pixel stop condition, for comparisons at equal cost.
+    pub budget: rnpt::RenderBudget,
     pub selected_camera_index: usize,
 
     pub hdr_files: Vec<std::path::PathBuf>,
@@ -175,6 +177,7 @@ impl RnptGuiApp {
             env: None,
             strategy,
             nirc_network: None,
+            budget: rnpt::RenderBudget::default(),
         };
 
         Self {
@@ -204,6 +207,7 @@ impl RnptGuiApp {
             auto_fit: true,
             resize_timeout: None,
             strategy,
+            budget: rnpt::RenderBudget::default(),
             selected_camera_index: 0,
             hdr_files: crate::asset_importer::list_hdris("assets"),
             selected_env: 0,
@@ -249,6 +253,7 @@ impl RnptGuiApp {
             env,
             strategy: self.strategy,
             nirc_network: None,
+            budget: self.budget,
         };
 
         self.tracer = None;

@@ -10,6 +10,9 @@ use std::sync::Arc;
 pub struct Pixel {
     pub accumulated_radiance: Color,
     pub samples: u32,
+    /// Rays spent on this pixel (closest-hit + shadow), including the NIRC
+    /// training paths it triggered. This is what a `RenderBudget` limits.
+    pub rays: u64,
 }
 
 impl Default for Pixel {
@@ -17,7 +20,30 @@ impl Default for Pixel {
         Self {
             accumulated_radiance: Color::black(),
             samples: 0,
+            rays: 0,
         }
+    }
+}
+
+/// Per-pixel stop condition, to compare strategies at equal cost rather than
+/// equal time (which depends on the machine and what else runs on it).
+/// 0 means unlimited. A pixel stops once either limit is reached; the sample
+/// that crosses the ray limit is kept, so a pixel may overshoot by one path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct RenderBudget {
+    pub rays_per_pixel: u64,
+    pub samples_per_pixel: u32,
+}
+
+impl RenderBudget {
+    #[inline(always)]
+    pub fn is_exhausted(&self, pixel: &Pixel) -> bool {
+        (self.rays_per_pixel > 0 && pixel.rays >= self.rays_per_pixel)
+            || (self.samples_per_pixel > 0 && pixel.samples >= self.samples_per_pixel)
+    }
+
+    pub fn is_unlimited(&self) -> bool {
+        self.rays_per_pixel == 0 && self.samples_per_pixel == 0
     }
 }
 
@@ -54,6 +80,7 @@ pub struct PathTracerConfig {
     pub strategy: SamplingStrategy,
     /// Active network for NIRC inference.
     pub nirc_network: Option<Arc<crate::nirc::NircMlp>>,
+    pub budget: RenderBudget,
 }
 
 /// No hard path-length cap: paths terminate via Russian roulette only (PBRT
@@ -362,11 +389,16 @@ impl PathTracer {
     /// For each consecutive bounce pair (k, k+1):
     ///   input  = encode(pos_k, wi_k)            scatter direction toward pos_{k+1}
     ///   target = emission_{k+1} + direct_{k+1} + Σ_{j>k+1}(T_j/T_{k+1})·(E_j+D_j)
+    ///
+    /// Rays traced by this path are added to `rays` / `shadow_rays`: they are
+    /// part of what NIRC costs.
     pub fn collect_training_samples_for_pixel(
         &self,
         x: usize,
         y: usize,
         rng: &mut Pcg32,
+        rays: &mut u64,
+        shadow_rays: &mut u64,
     ) -> Vec<(nalgebra::SVector<f32, { crate::nirc::INPUT_DIM }>, nalgebra::SVector<f32, 3>)> {
         struct Vertex {
             position: Point3<f32>,
@@ -383,6 +415,7 @@ impl PathTracer {
         let mut running_suffix = Color::black();
 
         for bounce in 0..MAX_BOUNCES {
+            *rays += 1;
             let Some(hit) = self.config.bvh.intersect(&ray) else {
                 if let Some(env_idx) = self.config.env {
                     let env_light = &self.config.lights[env_idx];
@@ -418,13 +451,12 @@ impl PathTracer {
             let brdf = surf.brdf();
 
             if bounce >= 1 {
-                let mut dummy = 0u64;
                 let direct = self.compute_direct_lighting(
                     &surf.position,
                     &surf.normal,
                     &brdf,
                     &wo,
-                    &mut dummy,
+                    shadow_rays,
                     rng,
                     SamplingStrategy::Mis,
                 );
@@ -734,6 +766,7 @@ impl PathTracer {
         pixel.accumulated_radiance =
             pixel.accumulated_radiance * (1.0 - alpha) + sample_color * alpha;
         pixel.samples += 1;
+        pixel.rays += rays + shadow_rays;
         (rays, shadow_rays)
     }
 
