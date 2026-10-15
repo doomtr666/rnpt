@@ -387,47 +387,9 @@ fn collapse_to_bvh8(node_idx: usize, bvh2: &[BvhNode], bvh8: &mut Vec<Bvh8Node>)
         }
     }
 
-    let mut min_x = f32::MAX; let mut max_x = f32::NEG_INFINITY;
-    let mut min_y = f32::MAX; let mut max_y = f32::NEG_INFINITY;
-    let mut min_z = f32::MAX; let mut max_z = f32::NEG_INFINITY;
-    for i in 0..n_children {
-        let a = &bvh2[children[i]].aabb;
-        if a.min.x < min_x { min_x = a.min.x } if a.max.x > max_x { max_x = a.max.x }
-        if a.min.y < min_y { min_y = a.min.y } if a.max.y > max_y { max_y = a.max.y }
-        if a.min.z < min_z { min_z = a.min.z } if a.max.z > max_z { max_z = a.max.z }
-    }
-    let cx = (min_x + max_x) * 0.5;
-    let cy = (min_y + max_y) * 0.5;
-    let cz = (min_z + max_z) * 0.5;
-
+    // Children go to slots in the order they were found.
     let mut slot_to_child = [usize::MAX; 8];
-    let mut slot_used = [false; 8];
-    let mut pending = [0usize; 8];
-    let mut n_pending = 0usize;
-
-    for i in 0..n_children {
-        let c_idx = children[i];
-        let a = &bvh2[c_idx].aabb;
-        let pcx = (a.min.x + a.max.x) * 0.5;
-        let pcy = (a.min.y + a.max.y) * 0.5;
-        let pcz = (a.min.z + a.max.z) * 0.5;
-        let oct = ((pcx >= cx) as usize)
-                | (((pcy >= cy) as usize) << 1)
-                | (((pcz >= cz) as usize) << 2);
-        if !slot_used[oct] {
-            slot_used[oct] = true;
-            slot_to_child[oct] = c_idx;
-        } else {
-            pending[n_pending] = c_idx;
-            n_pending += 1;
-        }
-    }
-    for i in 0..n_pending {
-        let mut slot = 0;
-        while slot_used[slot] { slot += 1; }
-        slot_used[slot] = true;
-        slot_to_child[slot] = pending[i];
-    }
+    slot_to_child[..n_children].copy_from_slice(&children[..n_children]);
 
     let mut node8 = Bvh8Node::default();
     for slot in 0..8 {

@@ -5,17 +5,6 @@ use crate::Hit;
 
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 
-const CHILD_ORDER: [[u8; 8]; 8] = [
-    [0, 1, 2, 4, 3, 5, 6, 7], // ray_oct 0: (+x,+y,+z)
-    [1, 0, 3, 5, 2, 4, 7, 6], // ray_oct 1: (-x,+y,+z)
-    [2, 0, 3, 6, 1, 4, 7, 5], // ray_oct 2: (+x,-y,+z)
-    [3, 1, 2, 7, 0, 5, 6, 4], // ray_oct 3: (-x,-y,+z)
-    [4, 0, 5, 6, 1, 2, 7, 3], // ray_oct 4: (+x,+y,-z)
-    [5, 1, 4, 7, 0, 3, 6, 2], // ray_oct 5: (-x,+y,-z)
-    [6, 2, 4, 7, 0, 3, 5, 1], // ray_oct 6: (+x,-y,-z)
-    [7, 3, 5, 6, 1, 2, 4, 0], // ray_oct 7: (-x,-y,-z)
-];
-
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
 pub struct FlatTriangles {
@@ -216,9 +205,7 @@ impl BvhInner {
                     }
                 }
 
-                // Insertion sort, farthest first, so the nearest child is popped
-                // first. The exact order matters here: it decides how early t_max
-                // shrinks, and the octant LUT is too rough an approximation of it.
+                // Insertion sort, farthest first, so the nearest child is popped first.
                 for i in 1..hit_count {
                     let mut j = i;
                     while j > 0 && hits[j - 1].1 < hits[j].1 {
@@ -241,10 +228,6 @@ impl BvhInner {
         }
 
         let t_max = ray.tmax;
-        let oct = (ray.direction.x < 0.0) as usize
-            | ((ray.direction.y < 0.0) as usize) << 1
-            | ((ray.direction.z < 0.0) as usize) << 2;
-
         let mut stack = BvhStack::new();
         stack.push(0, 0.0);
 
@@ -263,18 +246,15 @@ impl BvhInner {
                     }
                 }
             } else {
-                // Near-first order from the ray octant: no sort, but likely
-                // occluders come first, so the early exit happens sooner.
                 let node = self.get_node(encoded_idx);
-                let (bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
+                let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
 
-                for &slot in CHILD_ORDER[oct].iter().rev() {
-                    let slot = slot as usize;
-                    if bitmask & (1u32 << slot) != 0 {
-                        let encoded = node.children[slot];
-                        if encoded != u32::MAX && t_arr[slot] < t_max {
-                            stack.push(encoded, 0.0);
-                        }
+                while bitmask != 0 {
+                    let lane = bitmask.trailing_zeros() as usize;
+                    bitmask &= bitmask - 1;
+                    let encoded = node.children[lane];
+                    if encoded != u32::MAX && t_arr[lane] < t_max {
+                        stack.push(encoded, 0.0);
                     }
                 }
             }
