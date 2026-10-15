@@ -6,7 +6,8 @@ use crate::{
     Geometry,
 };
 
-const SAH_BINS: usize = 8;
+const SAH_BINS: usize = 16;
+const MAX_LEAF_CHUNKS: u32 = 1;
 
 pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
     let mut vertices: Vec<Point3<f32>> = Vec::new();
@@ -118,7 +119,7 @@ fn cluster_triangles(vertices: &[Point3<f32>], triangles: &mut Vec<FlatTriangle>
 
 fn split_clusters(indices: &mut [usize], centroids: &[Point3<f32>], start: usize, end: usize) {
     let count = end - start;
-    if count <= 8 {
+    if count as u32 <= MAX_LEAF_CHUNKS {
         return;
     }
 
@@ -208,7 +209,8 @@ fn subdivide_sah(
 
         for &chunk_idx in &chunk_indices[first..first + count] {
             let centroid = chunk_centroids[chunk_idx];
-            let bin_idx = ((((centroid[axis] - bounds_min) / bounds_extent) * SAH_BINS as f32) as usize).min(SAH_BINS - 1);
+            let t = (centroid[axis] - bounds_min) / bounds_extent;
+            let bin_idx = (SAH_BINS as f32 * t).min(SAH_BINS as f32 - 1.0) as usize;
             bins[bin_idx].aabb.extend_aabb(&chunk_aabbs[chunk_idx]);
             bins[bin_idx].count += 1;
         }
