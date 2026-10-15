@@ -1,6 +1,8 @@
 # rnpt — Rust Neural Path Tracer
 
-A hobbyist physically-based CPU path tracer with an integrated neural radiance cache (NIRC), written in Rust. The goal is to prototype and explore advanced rendering algorithms in a clean, readable codebase. Every major system — BVH, BRDF, MIS, and the neural cache itself — is implemented from scratch with correctness and clarity as first-class concerns, and serves as an educational reference for anyone curious about these topics.
+**rnpt** is a CPU path tracer built as a controlled sandbox for global illumination research. GI is where the hard problems are, and a GPU adds its own layer of complexity on top of them: rnpt keeps the algorithms readable and debuggable, fast enough to iterate on real scenes, so ideas can be validated here before being ported to the GPU. It picks up roughly where the *Ray Tracing in One Weekend* series leaves off: an 8-wide SIMD BVH, MIS with GGX, HDRI importance sampling, and an online-trained neural radiance cache (NIRC).
+
+Every major system — BVH, BRDF, MIS, and the neural cache itself — is implemented from scratch with correctness and clarity as first-class concerns, and serves as an educational reference for anyone curious about these topics.
 
 ## Goals
 
