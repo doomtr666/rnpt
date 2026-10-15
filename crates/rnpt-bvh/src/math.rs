@@ -166,22 +166,20 @@ impl InternalRay {
         let tmax_mask = t.simd_le(f32x8::splat(current_t_max));
 
         let final_mask = det_mask & u_mask & uv_mask & tmin_mask & tmax_mask;
-        let mut bitmask = final_mask.to_bitmask();
-        if bitmask == 0 {
+        if final_mask.to_bitmask() == 0 {
             return None;
         }
 
-        // Closest valid lane, visiting only the lanes set in the mask.
-        let t_arr = t.to_array();
+        // Missed lanes become +inf so they never win: a plain horizontal min,
+        // 8 unconditional comparisons and no bit twiddling.
+        let t_arr = final_mask.blend(t, f32x8::splat(f32::INFINITY)).to_array();
         let mut best_t = current_t_max;
         let mut best_lane = None;
-        while bitmask != 0 {
-            let lane = bitmask.trailing_zeros() as usize;
-            if t_arr[lane] < best_t {
-                best_t = t_arr[lane];
+        for (lane, &ti) in t_arr.iter().enumerate() {
+            if ti < best_t {
+                best_t = ti;
                 best_lane = Some(lane);
             }
-            bitmask &= bitmask - 1;
         }
 
         best_lane.map(|lane| TriangleHitSimd {

@@ -1,10 +1,12 @@
+use std::mem::MaybeUninit;
+
 use crate::math::InternalRay;
 use crate::Hit;
 
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 
 /// Stack entries pointing to a leaf carry its chunk range instead of a node index.
-const LEAF_FLAG: u32 = 0x8000_0000;
+pub const LEAF_FLAG: u32 = 0x8000_0000;
 
 #[derive(Clone, Copy)]
 pub struct FlatTriangle {
@@ -50,10 +52,10 @@ pub struct Bvh8Node {
     pub p_max_x: [f32; 8],
     pub p_max_y: [f32; 8],
     pub p_max_z: [f32; 8],
-    /// Child node index, or first chunk of a leaf child.
-    pub child_indices: [u32; 8],
-    /// Number of chunks of a leaf child, 0 for an internal child.
-    pub chunk_counts: [u32; 8],
+    /// Child references, encoded once at build time: for a leaf,
+    /// `first_chunk | (chunk_count << 24) | LEAF_FLAG`; for an internal node, its
+    /// index. `u32::MAX` marks an empty slot.
+    pub children: [u32; 8],
 }
 
 impl Default for Bvh8Node {
@@ -61,8 +63,7 @@ impl Default for Bvh8Node {
         Self {
             p_min_x: [f32::NAN; 8], p_min_y: [f32::NAN; 8], p_min_z: [f32::NAN; 8],
             p_max_x: [f32::NAN; 8], p_max_y: [f32::NAN; 8], p_max_z: [f32::NAN; 8],
-            child_indices: [u32::MAX; 8],
-            chunk_counts: [0; 8],
+            children: [u32::MAX; 8],
         }
     }
 }
@@ -76,26 +77,28 @@ pub struct BvhInner {
 /// Traversal stack without bounds checks: the traversal never pushes more than
 /// `MAX_TRAVERSAL_DEPTH` entries.
 struct BvhStack {
-    data: [(u32, f32); MAX_TRAVERSAL_DEPTH],
+    // Uninitialized on purpose: every slot is written by `push` before `pop`
+    // reads it, so zeroing it was a dead 512-byte memset per ray.
+    data: [MaybeUninit<(u32, f32)>; MAX_TRAVERSAL_DEPTH],
     ptr: usize,
 }
 
 impl BvhStack {
     #[inline(always)]
     fn new() -> Self {
-        Self { data: [(0, 0.0); MAX_TRAVERSAL_DEPTH], ptr: 0 }
+        Self { data: [const { MaybeUninit::uninit() }; MAX_TRAVERSAL_DEPTH], ptr: 0 }
     }
 
     #[inline(always)]
     fn push(&mut self, node_idx: u32, t: f32) {
-        unsafe { *self.data.get_unchecked_mut(self.ptr) = (node_idx, t) };
+        unsafe { self.data.get_unchecked_mut(self.ptr).write((node_idx, t)) };
         self.ptr += 1;
     }
 
     #[inline(always)]
     fn pop(&mut self) -> (u32, f32) {
         self.ptr -= 1;
-        unsafe { *self.data.get_unchecked(self.ptr) }
+        unsafe { self.data.get_unchecked(self.ptr).assume_init() }
     }
 
     #[inline(always)]
@@ -108,6 +111,18 @@ impl BvhInner {
     #[inline(always)]
     fn get_node(&self, idx: u32) -> &Bvh8Node {
         unsafe { self.nodes.get_unchecked(idx as usize) }
+    }
+
+    // Indices are valid by construction (encoded at build time or derived from
+    // in-range lanes), so the hot path skips bounds checks.
+    #[inline(always)]
+    fn get_chunk(&self, idx: usize) -> &FlatTriangles {
+        unsafe { self.soa_chunks.get_unchecked(idx) }
+    }
+
+    #[inline(always)]
+    fn get_triangle(&self, idx: usize) -> &FlatTriangle {
+        unsafe { self.triangles.get_unchecked(idx) }
     }
 
     pub fn closest_hit(&self, ray: &InternalRay) -> Option<Hit> {
@@ -136,11 +151,11 @@ impl BvhInner {
 
                 for i in 0..chunk_count {
                     let chunk_idx = (start_chunk + i) as usize;
-                    let chunk = &self.soa_chunks[chunk_idx];
+                    let chunk = self.get_chunk(chunk_idx);
 
                     if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
                         t_max = simd_hit.hit.t;
-                        let tri = &self.triangles[chunk_idx * 8 + simd_hit.lane];
+                        let tri = self.get_triangle(chunk_idx * 8 + simd_hit.lane);
                         result = Some(Hit {
                             t: simd_hit.hit.t,
                             u: simd_hit.hit.u,
@@ -161,15 +176,10 @@ impl BvhInner {
                     let lane = bitmask.trailing_zeros() as usize;
                     bitmask &= bitmask - 1;
 
-                    let idx = node.child_indices[lane];
-                    if idx == u32::MAX {
-                        continue; // Empty slot.
-                    }
-
+                    // Guard against empty slots in case a NaN slips through the mask.
+                    let encoded = node.children[lane];
                     let t = t_arr[lane];
-                    if t < t_max {
-                        let count = node.chunk_counts[lane];
-                        let encoded = if count > 0 { idx | (count << 24) | LEAF_FLAG } else { idx };
+                    if encoded != u32::MAX && t < t_max {
                         hits[hit_count] = (encoded, t);
                         hit_count += 1;
                     }

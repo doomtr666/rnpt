@@ -1,13 +1,17 @@
 use nalgebra::Point3;
 
 use crate::{
-    bvh::{Bvh8Node, BvhInner, FlatTriangle, FlatTriangles},
+    bvh::{Bvh8Node, BvhInner, FlatTriangle, FlatTriangles, LEAF_FLAG},
     math::AABB,
     Geometry,
 };
 
 const SAH_BINS: usize = 16;
 const MAX_LEAF_CHUNKS: u32 = 1;
+// SAH cost model: only the ratio matters. A higher traversal cost gives
+// shallower trees with bigger leaves.
+const TRAVERSAL_COST: f32 = 1.0;
+const INTERSECT_COST: f32 = 1.0;
 
 pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
     let mut vertices: Vec<Point3<f32>> = Vec::new();
@@ -153,13 +157,11 @@ fn collapse_to_bvh8(node_idx: usize, bvh2: &[BvhNode], bvh8: &mut Vec<Bvh8Node>)
         node8.p_max_y[i] = child.aabb.max.y;
         node8.p_max_z[i] = child.aabb.max.z;
 
-        if child.is_leaf() {
-            node8.child_indices[i] = child.left_first;
-            node8.chunk_counts[i] = child.chunk_count;
+        node8.children[i] = if child.is_leaf() {
+            child.left_first | (child.chunk_count << 24) | LEAF_FLAG
         } else {
-            node8.child_indices[i] = collapse_to_bvh8(c_idx, bvh2, bvh8);
-            node8.chunk_counts[i] = 0;
-        }
+            collapse_to_bvh8(c_idx, bvh2, bvh8)
+        };
     }
 
     bvh8[bvh8_idx as usize] = node8;
@@ -315,9 +317,10 @@ fn subdivide_sah(
 
         for i in 0..SAH_BINS - 1 {
             if left_counts[i] > 0 && right_counts[i] > 0 {
-                let cost = 1.0
-                    + (left_aabbs[i].surface_area() * left_counts[i] as f32
-                        + right_aabbs[i].surface_area() * right_counts[i] as f32)
+                let cost = TRAVERSAL_COST
+                    + INTERSECT_COST
+                        * (left_aabbs[i].surface_area() * left_counts[i] as f32
+                            + right_aabbs[i].surface_area() * right_counts[i] as f32)
                         * inv_total_area;
                 if cost < best_cost {
                     best_cost = cost;
@@ -328,7 +331,7 @@ fn subdivide_sah(
         }
     }
 
-    let leaf_cost = count as f32;
+    let leaf_cost = count as f32 * INTERSECT_COST;
     if best_cost >= leaf_cost {
         return;
     }
