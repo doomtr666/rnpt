@@ -1,114 +1,30 @@
 use nalgebra::Point3;
 
 use crate::{
-    bvh::{Bvh8Node, BvhInner, FlatTriangle, FlatTriangles, LEAF_FLAG},
+    bvh::{BvhInner, Bvh8Node, FlatTriangles, TriSlot},
     math::AABB,
     Geometry,
 };
 
 const SAH_BINS: usize = 16;
 const MAX_LEAF_CHUNKS: u32 = 1;
-// SAH cost model: only the ratio matters. A higher traversal cost gives
-// shallower trees with bigger leaves.
 const TRAVERSAL_COST: f32 = 1.0;
 const INTERSECT_COST: f32 = 1.0;
 
-pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
-    let mut vertices: Vec<Point3<f32>> = Vec::new();
-    let mut triangles: Vec<FlatTriangle> = Vec::new();
-
-    for (geom_id, geom) in geometries.iter().enumerate() {
-        let vert_offset = vertices.len() as u32;
-        vertices.extend(geom.verts.iter().map(|v| Point3::new(v[0], v[1], v[2])));
-        for (orig_idx, t) in geom.tris.iter().enumerate() {
-            triangles.push(FlatTriangle {
-                v0: t[0] + vert_offset,
-                v1: t[1] + vert_offset,
-                v2: t[2] + vert_offset,
-                orig_idx: orig_idx as u32,
-                geom_id: geom_id as u32,
-                double_sided: geom.double_sided.get(orig_idx).copied().unwrap_or(false),
-            });
-        }
-    }
-
-    cluster_triangles(&vertices, &mut triangles);
-
-    // Pad to a multiple of 8 with degenerate triangles that never hit.
-    let num_triangles = triangles.len();
-    let remainder = num_triangles % 8;
-    if remainder != 0 {
-        for _ in 0..(8 - remainder) {
-            triangles.push(FlatTriangle { v0: 0, v1: 0, v2: 0, orig_idx: u32::MAX, geom_id: u32::MAX, double_sided: false });
-        }
-    }
-
-    // Chunks first: every 8 consecutive triangles become one SoA chunk; the
-    // tree is then built over chunks, not triangles.
-    let mut soa_chunks = Vec::new();
-    let mut chunk_aabbs = Vec::new();
-    let mut chunk_centroids = Vec::new();
-    for chunk_start in (0..triangles.len()).step_by(8) {
-        let mut soa = FlatTriangles::default();
-        let mut chunk_aabb = AABB::invalid();
-
-        for i in 0..8 {
-            let tri = &triangles[chunk_start + i];
-            let v0 = vertices[tri.v0 as usize];
-            let v1 = vertices[tri.v1 as usize];
-            let v2 = vertices[tri.v2 as usize];
-            let e1 = v1 - v0;
-            let e2 = v2 - v0;
-            soa.v0_x[i] = v0.x; soa.v0_y[i] = v0.y; soa.v0_z[i] = v0.z;
-            soa.e1_x[i] = e1.x; soa.e1_y[i] = e1.y; soa.e1_z[i] = e1.z;
-            soa.e2_x[i] = e2.x; soa.e2_y[i] = e2.y; soa.e2_z[i] = e2.z;
-            if tri.double_sided {
-                soa.double_sided_mask |= 1 << i;
-            }
-            // Padding must not grow the bounds.
-            if chunk_start + i < num_triangles {
-                chunk_aabb.extend(v0);
-                chunk_aabb.extend(v1);
-                chunk_aabb.extend(v2);
-            }
-        }
-
-        // Expand slightly to avoid precision issues with flat triangles.
-        let eps = nalgebra::Vector3::new(1e-5, 1e-5, 1e-5);
-        chunk_aabb.min -= eps;
-        chunk_aabb.max += eps;
-
-        soa_chunks.push(soa);
-        chunk_aabbs.push(chunk_aabb);
-        chunk_centroids.push(chunk_aabb.center());
-    }
-
-    // Build a binary SAH tree over chunks, then collapse it into an 8-wide tree.
-    // An empty scene has no nodes at all.
-    let mut chunk_indices: Vec<usize> = (0..soa_chunks.len()).collect();
-    let mut nodes = Vec::new();
-    let mut bvh8_nodes = Vec::new();
-    if !chunk_indices.is_empty() {
-        nodes.push(BvhNode { aabb: AABB::invalid(), left_first: 0, chunk_count: chunk_indices.len() as u32 });
-        update_node_bounds(0, &mut nodes, &chunk_indices, &chunk_aabbs);
-        subdivide_sah(0, &mut nodes, &mut chunk_indices, &chunk_aabbs, &chunk_centroids);
-        collapse_to_bvh8(0, &nodes, &mut bvh8_nodes);
-    }
-
-    // Store chunks (and their triangles) in leaf order.
-    let ordered_chunks = chunk_indices.iter().map(|&idx| soa_chunks[idx]).collect();
-    let ordered_triangles = chunk_indices.iter().flat_map(|&idx| triangles[idx * 8..idx * 8 + 8].iter().copied()).collect();
-
-    BvhInner { nodes: bvh8_nodes, triangles: ordered_triangles, soa_chunks: ordered_chunks }
+#[derive(Clone, Copy)]
+struct BuildTri {
+    v0: u32,
+    v1: u32,
+    v2: u32,
+    orig_idx: u32,
+    geom_id: u32,
+    double_sided: bool,
 }
 
-/// Binary node, only used during the build.
 #[derive(Clone, Copy)]
 struct BvhNode {
     aabb: AABB,
-    /// Internal node: index of the left child. Leaf: index of its first chunk.
     left_first: u32,
-    /// Number of chunks in a leaf, 0 for an internal node.
     chunk_count: u32,
 }
 
@@ -118,76 +34,131 @@ impl BvhNode {
     }
 }
 
-/// Collapse a binary node and its descendants into 8-wide nodes: repeatedly
-/// open the internal child with the largest surface area until there are 8
-/// children or only leaves left.
-fn collapse_to_bvh8(node_idx: usize, bvh2: &[BvhNode], bvh8: &mut Vec<Bvh8Node>) -> u32 {
-    let bvh8_idx = bvh8.len() as u32;
-    bvh8.push(Bvh8Node::default());
+pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
+    let mut world_vertices: Vec<Point3<f32>> = Vec::new();
+    let mut build_tris: Vec<BuildTri> = Vec::new();
 
-    let mut children = vec![node_idx];
-    while children.len() < 8 {
-        let mut best_idx = None;
-        let mut best_area = -1.0;
-        for (i, &c_idx) in children.iter().enumerate() {
-            let node = &bvh2[c_idx];
-            if !node.is_leaf() {
-                let area = node.aabb.surface_area();
-                if area > best_area {
-                    best_area = area;
-                    best_idx = Some(i);
-                }
+    for (geom_id, geom) in geometries.iter().enumerate() {
+        let vert_offset = world_vertices.len() as u32;
+        for &v in &geom.verts {
+            world_vertices.push(Point3::new(v[0], v[1], v[2]));
+        }
+        for (orig_idx, &t) in geom.tris.iter().enumerate() {
+            let double_sided = geom.double_sided.get(orig_idx).copied().unwrap_or(false);
+            build_tris.push(BuildTri {
+                v0: t[0] + vert_offset,
+                v1: t[1] + vert_offset,
+                v2: t[2] + vert_offset,
+                orig_idx: orig_idx as u32,
+                geom_id: geom_id as u32,
+                double_sided,
+            });
+        }
+    }
+
+    cluster_triangles(&world_vertices, &mut build_tris);
+
+    let num_triangles = build_tris.len();
+    let remainder = num_triangles % 8;
+    if remainder != 0 {
+        for _ in 0..(8 - remainder) {
+            build_tris.push(BuildTri { v0: 0, v1: 0, v2: 0, orig_idx: u32::MAX, geom_id: u32::MAX, double_sided: false });
+        }
+    }
+
+    let mut soa_chunks: Vec<FlatTriangles> = Vec::new();
+    let mut chunk_aabbs: Vec<AABB> = Vec::new();
+    let mut chunk_centroids: Vec<Point3<f32>> = Vec::new();
+
+    for chunk_start in (0..build_tris.len()).step_by(8) {
+        let mut soa = FlatTriangles::default();
+        let mut chunk_aabb = AABB::invalid();
+
+        for i in 0..8 {
+            let tri = &build_tris[chunk_start + i];
+            let v0 = world_vertices[tri.v0 as usize];
+            let v1 = world_vertices[tri.v1 as usize];
+            let v2 = world_vertices[tri.v2 as usize];
+            let e1 = v1 - v0;
+            let e2 = v2 - v0;
+
+            soa.v0_x[i] = v0.x; soa.v0_y[i] = v0.y; soa.v0_z[i] = v0.z;
+            soa.e1_x[i] = e1.x; soa.e1_y[i] = e1.y; soa.e1_z[i] = e1.z;
+            soa.e2_x[i] = e2.x; soa.e2_y[i] = e2.y; soa.e2_z[i] = e2.z;
+
+            if chunk_start + i < num_triangles {
+                chunk_aabb.extend(v0);
+                chunk_aabb.extend(v1);
+                chunk_aabb.extend(v2);
             }
         }
 
-        let Some(i) = best_idx else { break };
-        let left = bvh2[children[i]].left_first as usize;
-        children.swap_remove(i);
-        children.push(left);
-        children.push(left + 1);
+        let eps = nalgebra::Vector3::new(1e-5, 1e-5, 1e-5);
+        chunk_aabb.min -= eps;
+        chunk_aabb.max += eps;
+
+        soa_chunks.push(soa);
+        chunk_aabbs.push(chunk_aabb);
+        chunk_centroids.push(chunk_aabb.center());
     }
 
-    let mut node8 = Bvh8Node::default();
-    for (i, &c_idx) in children.iter().enumerate() {
-        let child = &bvh2[c_idx];
-        node8.p_min_x[i] = child.aabb.min.x;
-        node8.p_min_y[i] = child.aabb.min.y;
-        node8.p_min_z[i] = child.aabb.min.z;
-        node8.p_max_x[i] = child.aabb.max.x;
-        node8.p_max_y[i] = child.aabb.max.y;
-        node8.p_max_z[i] = child.aabb.max.z;
+    let mut nodes: Vec<BvhNode> = Vec::new();
+    let mut chunk_indices: Vec<usize> = (0..soa_chunks.len()).collect();
 
-        node8.children[i] = if child.is_leaf() {
-            child.left_first | (child.chunk_count << 24) | LEAF_FLAG
-        } else {
-            collapse_to_bvh8(c_idx, bvh2, bvh8)
-        };
+    nodes.push(BvhNode {
+        aabb: AABB::invalid(),
+        left_first: 0,
+        chunk_count: chunk_indices.len() as u32,
+    });
+
+    if !chunk_indices.is_empty() {
+        update_node_bounds(0, &mut nodes, &chunk_indices, &chunk_aabbs);
+        subdivide_sah(0, &mut nodes, &mut chunk_indices, &chunk_aabbs, &chunk_centroids);
     }
 
-    bvh8[bvh8_idx as usize] = node8;
-    bvh8_idx
+    let mut ordered_soa: Vec<FlatTriangles> = Vec::with_capacity(soa_chunks.len());
+    let mut ordered_slots: Vec<TriSlot> = Vec::with_capacity(build_tris.len());
+    let mut double_sided_masks: Vec<u8> = Vec::with_capacity(soa_chunks.len());
+
+    for &idx in &chunk_indices {
+        ordered_soa.push(soa_chunks[idx]);
+        let mut ds_mask = 0u8;
+        for i in 0..8 {
+            let bt = &build_tris[idx * 8 + i];
+            ordered_slots.push(TriSlot { orig_idx: bt.orig_idx, geom_id: bt.geom_id });
+            if bt.double_sided {
+                ds_mask |= 1 << i;
+            }
+        }
+        double_sided_masks.push(ds_mask);
+    }
+
+    let mut bvh8_nodes: Vec<Bvh8Node> = Vec::new();
+    if !chunk_indices.is_empty() {
+        collapse_to_bvh8(0, &nodes, &mut bvh8_nodes);
+    }
+
+    BvhInner { nodes: bvh8_nodes, tri_slots: ordered_slots, soa_chunks: ordered_soa, double_sided_masks }
 }
 
-/// Group triangles into compact clusters of 8: recursive median splits along
-/// the largest centroid extent, with split points on multiples of 8, so that
-/// each chunk holds 8 spatially close triangles.
-fn cluster_triangles(vertices: &[Point3<f32>], triangles: &mut Vec<FlatTriangle>) {
-    let centroids: Vec<Point3<f32>> = triangles
+fn cluster_triangles(vertices: &[Point3<f32>], tris: &mut Vec<BuildTri>) {
+    let mut indices: Vec<usize> = (0..tris.len()).collect();
+
+    let centroids: Vec<Point3<f32>> = tris
         .iter()
         .map(|tri| {
-            Point3::from(
-                (vertices[tri.v0 as usize].coords + vertices[tri.v1 as usize].coords + vertices[tri.v2 as usize].coords)
-                    / 3.0,
-            )
+            let v0 = vertices[tri.v0 as usize];
+            let v1 = vertices[tri.v1 as usize];
+            let v2 = vertices[tri.v2 as usize];
+            Point3::from((v0.coords + v1.coords + v2.coords) / 3.0)
         })
         .collect();
 
-    let mut indices: Vec<usize> = (0..triangles.len()).collect();
     let len = indices.len();
     split_clusters(&mut indices, &centroids, 0, len);
 
-    let orig = triangles.clone();
-    for (dst, &src) in triangles.iter_mut().zip(&indices) {
+    let orig = tris.clone();
+    for (dst, &src) in tris.iter_mut().zip(indices.iter()) {
         *dst = orig[src];
     }
 }
@@ -199,18 +170,14 @@ fn split_clusters(indices: &mut [usize], centroids: &[Point3<f32>], start: usize
     }
 
     let mut centroid_bounds = AABB::invalid();
-    for &i in &indices[start..end] {
-        centroid_bounds.extend(centroids[i]);
+    for i in start..end {
+        centroid_bounds.extend(centroids[indices[i]]);
     }
 
     let extent = centroid_bounds.max - centroid_bounds.min;
     let mut axis = 0usize;
-    if extent.y > extent.x {
-        axis = 1;
-    }
-    if extent.z > extent[axis] {
-        axis = 2;
-    }
+    if extent.y > extent.x { axis = 1; }
+    if extent.z > extent[axis] { axis = 2; }
 
     let mid = count / 2;
     let mut split_offset = (mid / 8) * 8;
@@ -227,23 +194,25 @@ fn split_clusters(indices: &mut [usize], centroids: &[Point3<f32>], start: usize
     split_clusters(indices, centroids, split_idx, end);
 }
 
-fn update_node_bounds(node_idx: usize, nodes: &mut [BvhNode], chunk_indices: &[usize], chunk_aabbs: &[AABB]) {
+fn update_node_bounds(
+    node_idx: usize,
+    nodes: &mut Vec<BvhNode>,
+    chunk_indices: &[usize],
+    chunk_aabbs: &[AABB],
+) {
     let first = nodes[node_idx].left_first as usize;
     let count = nodes[node_idx].chunk_count as usize;
-
     let mut aabb = AABB::invalid();
-    for &chunk_idx in &chunk_indices[first..first + count] {
-        aabb.extend_aabb(&chunk_aabbs[chunk_idx]);
+    for i in 0..count {
+        aabb.extend_aabb(&chunk_aabbs[chunk_indices[first + i]]);
     }
     nodes[node_idx].aabb = aabb;
 }
 
-/// Binned SAH over chunks. A chunk costs 1 to intersect whatever it holds:
-/// that is the whole point of testing 8 triangles at once.
 fn subdivide_sah(
     node_idx: usize,
     nodes: &mut Vec<BvhNode>,
-    chunk_indices: &mut [usize],
+    chunk_indices: &mut Vec<usize>,
     chunk_aabbs: &[AABB],
     chunk_centroids: &[Point3<f32>],
 ) {
@@ -259,30 +228,27 @@ fn subdivide_sah(
     let mut best_split_bin = 0usize;
 
     let mut centroid_bounds = AABB::invalid();
-    for &chunk_idx in &chunk_indices[first..first + count] {
-        centroid_bounds.extend(chunk_centroids[chunk_idx]);
+    for i in 0..count {
+        centroid_bounds.extend(chunk_centroids[chunk_indices[first + i]]);
     }
 
     let extent = centroid_bounds.max - centroid_bounds.min;
     if extent.x == 0.0 && extent.y == 0.0 && extent.z == 0.0 {
-        return; // All centroids are identical.
+        return;
     }
 
     for axis in 0..3 {
         let bounds_min = centroid_bounds.min[axis];
-        let bounds_extent = centroid_bounds.max[axis] - bounds_min;
-        if bounds_extent == 0.0 {
-            continue;
-        }
+        let bounds_max = centroid_bounds.max[axis];
+        let bounds_extent = bounds_max - bounds_min;
+        if bounds_extent == 0.0 { continue; }
 
         #[derive(Clone, Copy)]
-        struct Bin {
-            aabb: AABB,
-            count: usize,
-        }
+        struct Bin { aabb: AABB, count: usize }
         let mut bins = [Bin { aabb: AABB::invalid(), count: 0 }; SAH_BINS];
 
-        for &chunk_idx in &chunk_indices[first..first + count] {
+        for i in 0..count {
+            let chunk_idx = chunk_indices[first + i];
             let centroid = chunk_centroids[chunk_idx];
             let t = (centroid[axis] - bounds_min) / bounds_extent;
             let bin_idx = (SAH_BINS as f32 * t).min(SAH_BINS as f32 - 1.0) as usize;
@@ -290,8 +256,8 @@ fn subdivide_sah(
             bins[bin_idx].count += 1;
         }
 
-        let mut left_aabbs = [AABB::invalid(); SAH_BINS - 1];
-        let mut left_counts = [0usize; SAH_BINS - 1];
+        let mut left_aabbs  = [AABB::invalid(); SAH_BINS - 1];
+        let mut left_counts  = [0usize; SAH_BINS - 1];
         let mut right_aabbs = [AABB::invalid(); SAH_BINS - 1];
         let mut right_counts = [0usize; SAH_BINS - 1];
 
@@ -322,6 +288,7 @@ fn subdivide_sah(
                         * (left_aabbs[i].surface_area() * left_counts[i] as f32
                             + right_aabbs[i].surface_area() * right_counts[i] as f32)
                         * inv_total_area;
+
                 if cost < best_cost {
                     best_cost = cost;
                     best_axis = axis;
@@ -336,21 +303,24 @@ fn subdivide_sah(
         return;
     }
 
-    let bounds_min = centroid_bounds.min[best_axis];
-    let bounds_extent = centroid_bounds.max[best_axis] - bounds_min;
+    let bounds_min    = centroid_bounds.min[best_axis];
+    let bounds_extent = centroid_bounds.max[best_axis] - centroid_bounds.min[best_axis];
 
-    let mut left = first;
+    let mut left  = first;
     let mut right = first + count - 1;
+
     while left <= right {
-        let centroid = chunk_centroids[chunk_indices[left]];
-        let bin_idx = ((((centroid[best_axis] - bounds_min) / bounds_extent) * SAH_BINS as f32) as usize).min(SAH_BINS - 1);
+        let chunk_idx = chunk_indices[left];
+        let centroid = chunk_centroids[chunk_idx];
+        let mut bin_idx =
+            (((centroid[best_axis] - bounds_min) / bounds_extent) * (SAH_BINS as f32)) as usize;
+        bin_idx = bin_idx.min(SAH_BINS - 1);
+
         if bin_idx <= best_split_bin {
             left += 1;
         } else {
             chunk_indices.swap(left, right);
-            if right == 0 {
-                break;
-            }
+            if right == 0 { break; }
             right -= 1;
         }
     }
@@ -361,9 +331,18 @@ fn subdivide_sah(
     }
 
     let left_child_idx = nodes.len();
-    nodes.push(BvhNode { aabb: AABB::invalid(), left_first: first as u32, chunk_count: left_count as u32 });
+    nodes.push(BvhNode {
+        aabb: AABB::invalid(),
+        left_first: first as u32,
+        chunk_count: left_count as u32,
+    });
+
     let right_child_idx = nodes.len();
-    nodes.push(BvhNode { aabb: AABB::invalid(), left_first: left as u32, chunk_count: (count - left_count) as u32 });
+    nodes.push(BvhNode {
+        aabb: AABB::invalid(),
+        left_first: left as u32,
+        chunk_count: (count - left_count) as u32,
+    });
 
     nodes[node_idx].left_first = left_child_idx as u32;
     nodes[node_idx].chunk_count = 0;
@@ -372,4 +351,64 @@ fn subdivide_sah(
     update_node_bounds(right_child_idx, nodes, chunk_indices, chunk_aabbs);
     subdivide_sah(left_child_idx, nodes, chunk_indices, chunk_aabbs, chunk_centroids);
     subdivide_sah(right_child_idx, nodes, chunk_indices, chunk_aabbs, chunk_centroids);
+}
+
+fn collapse_to_bvh8(node_idx: usize, bvh2: &[BvhNode], bvh8: &mut Vec<Bvh8Node>) -> u32 {
+    let bvh8_idx = bvh8.len() as u32;
+    bvh8.push(Bvh8Node::default());
+
+    let mut children = [0usize; 8];
+    let mut n_children = 1usize;
+    children[0] = node_idx;
+
+    while n_children < 8 {
+        let mut best_idx = None;
+        let mut best_area = -1.0f32;
+        for i in 0..n_children {
+            let node = &bvh2[children[i]];
+            if !node.is_leaf() {
+                let area = node.aabb.surface_area();
+                if area > best_area {
+                    best_area = area;
+                    best_idx = Some(i);
+                }
+            }
+        }
+        if let Some(i) = best_idx {
+            let left = bvh2[children[i]].left_first as usize;
+            children[i] = children[n_children - 1];
+            n_children -= 1;
+            children[n_children] = left;
+            n_children += 1;
+            children[n_children] = left + 1;
+            n_children += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Children go to slots in the order they were found.
+    let mut slot_to_child = [usize::MAX; 8];
+    slot_to_child[..n_children].copy_from_slice(&children[..n_children]);
+
+    let mut node8 = Bvh8Node::default();
+    for slot in 0..8 {
+        let c_idx = slot_to_child[slot];
+        if c_idx == usize::MAX { continue; }
+        let bvh2_node = &bvh2[c_idx];
+        node8.p_min_x[slot] = bvh2_node.aabb.min.x;
+        node8.p_min_y[slot] = bvh2_node.aabb.min.y;
+        node8.p_min_z[slot] = bvh2_node.aabb.min.z;
+        node8.p_max_x[slot] = bvh2_node.aabb.max.x;
+        node8.p_max_y[slot] = bvh2_node.aabb.max.y;
+        node8.p_max_z[slot] = bvh2_node.aabb.max.z;
+        node8.children[slot] = if bvh2_node.is_leaf() {
+            Bvh8Node::encode_leaf(bvh2_node.left_first, bvh2_node.chunk_count)
+        } else {
+            collapse_to_bvh8(c_idx, bvh2, bvh8)
+        };
+    }
+
+    bvh8[bvh8_idx as usize] = node8;
+    bvh8_idx
 }

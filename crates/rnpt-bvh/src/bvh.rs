@@ -5,29 +5,18 @@ use crate::Hit;
 
 const MAX_TRAVERSAL_DEPTH: usize = 64;
 
-/// Stack entries pointing to a leaf carry its chunk range instead of a node index.
-pub const LEAF_FLAG: u32 = 0x8000_0000;
-
-#[derive(Clone, Copy)]
-pub struct FlatTriangle {
-    pub v0: u32,
-    pub v1: u32,
-    pub v2: u32,
-    pub orig_idx: u32,
-    pub geom_id: u32,
-    pub double_sided: bool,
-}
-
-/// 8 consecutive triangles laid out for SIMD, one lane per triangle: chunk `c`
-/// holds triangles `8c..8c+8`. Padding lanes are degenerate and never hit.
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
 pub struct FlatTriangles {
-    pub v0_x: [f32; 8], pub v0_y: [f32; 8], pub v0_z: [f32; 8],
-    pub e1_x: [f32; 8], pub e1_y: [f32; 8], pub e1_z: [f32; 8],
-    pub e2_x: [f32; 8], pub e2_y: [f32; 8], pub e2_z: [f32; 8],
-    /// Bit i set: lane i is double-sided.
-    pub double_sided_mask: u8,
+    pub v0_x: [f32; 8],
+    pub v0_y: [f32; 8],
+    pub v0_z: [f32; 8],
+    pub e1_x: [f32; 8],
+    pub e1_y: [f32; 8],
+    pub e1_z: [f32; 8],
+    pub e2_x: [f32; 8],
+    pub e2_y: [f32; 8],
+    pub e2_z: [f32; 8],
 }
 
 impl Default for FlatTriangles {
@@ -36,13 +25,10 @@ impl Default for FlatTriangles {
             v0_x: [0.0; 8], v0_y: [0.0; 8], v0_z: [0.0; 8],
             e1_x: [0.0; 8], e1_y: [0.0; 8], e1_z: [0.0; 8],
             e2_x: [0.0; 8], e2_y: [0.0; 8], e2_z: [0.0; 8],
-            double_sided_mask: 0,
         }
     }
 }
 
-/// 8-wide node: the bounds of its (up to) 8 children in SoA, tested in one SIMD pass.
-/// Unused slots have NaN bounds and never hit.
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
 pub struct Bvh8Node {
@@ -52,9 +38,6 @@ pub struct Bvh8Node {
     pub p_max_x: [f32; 8],
     pub p_max_y: [f32; 8],
     pub p_max_z: [f32; 8],
-    /// Child references, encoded once at build time: for a leaf,
-    /// `first_chunk | (chunk_count << 24) | LEAF_FLAG`; for an internal node, its
-    /// index. `u32::MAX` marks an empty slot.
     pub children: [u32; 8],
 }
 
@@ -68,17 +51,52 @@ impl Default for Bvh8Node {
     }
 }
 
-pub struct BvhInner {
-    pub nodes: Vec<Bvh8Node>,
-    pub triangles: Vec<FlatTriangle>,
-    pub soa_chunks: Vec<FlatTriangles>,
+impl Bvh8Node {
+    const LEAF_FLAG: u32 = 0x8000_0000;
+    const COUNT_SHIFT: u32 = 24;
+    const COUNT_MASK: u32 = 0x7F;
+    const START_MASK: u32 = 0x00FF_FFFF;
+
+    #[inline(always)]
+    pub(crate) fn encode_leaf(start_chunk: u32, chunk_count: u32) -> u32 {
+        start_chunk | (chunk_count << Self::COUNT_SHIFT) | Self::LEAF_FLAG
+    }
+
+    #[inline(always)]
+    fn is_leaf(encoded: u32) -> bool {
+        encoded & Self::LEAF_FLAG != 0
+    }
+
+    #[inline(always)]
+    fn leaf_start(encoded: u32) -> u32 {
+        encoded & Self::START_MASK
+    }
+
+    #[inline(always)]
+    fn leaf_count(encoded: u32) -> u32 {
+        (encoded >> Self::COUNT_SHIFT) & Self::COUNT_MASK
+    }
 }
 
-/// Traversal stack without bounds checks: the traversal never pushes more than
-/// `MAX_TRAVERSAL_DEPTH` entries.
+/// Per-triangle metadata stored at traversal runtime. Only identity fields,
+/// no geometry (positions live in FlatTriangles SoA).
+#[derive(Clone, Copy)]
+pub struct TriSlot {
+    pub orig_idx: u32,
+    pub geom_id: u32,
+}
+
+pub struct BvhInner {
+    pub nodes: Vec<Bvh8Node>,
+    pub tri_slots: Vec<TriSlot>,
+    pub soa_chunks: Vec<FlatTriangles>,
+    /// One bitmask per SoA chunk (8 triangles per chunk). Bit i = 1 means triangle i
+    /// in that chunk accepts backface hits (no culling). Self-hit avoidance for these
+    /// triangles relies on `tmin = RAY_EPSILON` in the caller, not on det sign.
+    pub double_sided_masks: Vec<u8>,
+}
+
 struct BvhStack {
-    // Uninitialized on purpose: every slot is written by `push` before `pop`
-    // reads it, so zeroing it was a dead 512-byte memset per ray.
     data: [MaybeUninit<(u32, f32)>; MAX_TRAVERSAL_DEPTH],
     ptr: usize,
 }
@@ -86,12 +104,15 @@ struct BvhStack {
 impl BvhStack {
     #[inline(always)]
     fn new() -> Self {
-        Self { data: [const { MaybeUninit::uninit() }; MAX_TRAVERSAL_DEPTH], ptr: 0 }
+        Self {
+            data: [const { MaybeUninit::uninit() }; MAX_TRAVERSAL_DEPTH],
+            ptr: 0,
+        }
     }
 
     #[inline(always)]
     fn push(&mut self, node_idx: u32, t: f32) {
-        unsafe { self.data.get_unchecked_mut(self.ptr).write((node_idx, t)) };
+        unsafe { self.data.get_unchecked_mut(self.ptr).write((node_idx, t)); }
         self.ptr += 1;
     }
 
@@ -113,16 +134,14 @@ impl BvhInner {
         unsafe { self.nodes.get_unchecked(idx as usize) }
     }
 
-    // Indices are valid by construction (encoded at build time or derived from
-    // in-range lanes), so the hot path skips bounds checks.
     #[inline(always)]
-    fn get_chunk(&self, idx: usize) -> &FlatTriangles {
-        unsafe { self.soa_chunks.get_unchecked(idx) }
+    fn get_chunk(&self, idx: u32) -> &FlatTriangles {
+        unsafe { self.soa_chunks.get_unchecked(idx as usize) }
     }
 
     #[inline(always)]
-    fn get_triangle(&self, idx: usize) -> &FlatTriangle {
-        unsafe { self.triangles.get_unchecked(idx) }
+    fn get_slot(&self, idx: u32) -> &TriSlot {
+        unsafe { self.tri_slots.get_unchecked(idx as usize) }
     }
 
     pub fn closest_hit(&self, ray: &InternalRay) -> Option<Hit> {
@@ -133,8 +152,6 @@ impl BvhInner {
         let mut result: Option<Hit> = None;
         let mut t_max = ray.tmax;
 
-        // Each stack entry carries the distance at which the ray enters the node,
-        // so nodes behind the closest hit found so far are skipped when popped.
         let mut stack = BvhStack::new();
         stack.push(0, 0.0);
 
@@ -145,29 +162,32 @@ impl BvhInner {
                 continue;
             }
 
-            if encoded_idx & LEAF_FLAG != 0 {
-                let chunk_count = (encoded_idx >> 24) & 0x7F;
-                let start_chunk = encoded_idx & 0x00FF_FFFF;
+            if Bvh8Node::is_leaf(encoded_idx) {
+                let start_chunk = Bvh8Node::leaf_start(encoded_idx);
+                let chunk_count = Bvh8Node::leaf_count(encoded_idx);
 
                 for i in 0..chunk_count {
-                    let chunk_idx = (start_chunk + i) as usize;
+                    let chunk_idx = start_chunk + i;
                     let chunk = self.get_chunk(chunk_idx);
+                    let ds_mask = self.double_sided_masks.get(chunk_idx as usize).copied().unwrap_or(0);
 
-                    if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
+                    if let Some(simd_hit) = ray.closest_triangle_simd8(chunk, t_max, ds_mask) {
                         t_max = simd_hit.hit.t;
-                        let tri = self.get_triangle(chunk_idx * 8 + simd_hit.lane);
+                        let tri_global_idx = chunk_idx * 8 + simd_hit.lane;
+                        let slot = self.get_slot(tri_global_idx);
+
                         result = Some(Hit {
-                            t: simd_hit.hit.t,
-                            u: simd_hit.hit.u,
-                            v: simd_hit.hit.v,
-                            prim_id: tri.orig_idx,
-                            geom_id: tri.geom_id,
+                            t:       simd_hit.hit.t,
+                            u:       simd_hit.hit.u,
+                            v:       simd_hit.hit.v,
+                            prim_id: slot.orig_idx,
+                            geom_id: slot.geom_id,
                         });
                     }
                 }
             } else {
                 let node = self.get_node(encoded_idx);
-                let (mut bitmask, t_arr) = ray.intersect_bvh8_dist(node, t_max);
+                let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
 
                 let mut hits = [(0u32, 0.0f32); 8];
                 let mut hit_count = 0;
@@ -202,9 +222,6 @@ impl BvhInner {
         result
     }
 
-    /// Any-hit traversal for shadow rays: true as soon as any triangle is hit
-    /// within the ray's range. Cheaper than `closest_hit`: no closest tracking,
-    /// no `t_max` tightening, no child sorting, and it stops at the first hit.
     pub fn any_hit(&self, ray: &InternalRay) -> bool {
         if self.nodes.is_empty() {
             return false;
@@ -217,24 +234,24 @@ impl BvhInner {
         while !stack.is_empty() {
             let (encoded_idx, _) = stack.pop();
 
-            if encoded_idx & LEAF_FLAG != 0 {
-                let chunk_count = (encoded_idx >> 24) & 0x7F;
-                let start_chunk = encoded_idx & 0x00FF_FFFF;
+            if Bvh8Node::is_leaf(encoded_idx) {
+                let start_chunk = Bvh8Node::leaf_start(encoded_idx);
+                let chunk_count = Bvh8Node::leaf_count(encoded_idx);
 
                 for i in 0..chunk_count {
-                    if ray.occluded_simd_8(self.get_chunk((start_chunk + i) as usize), t_max) {
+                    let chunk_idx = start_chunk + i;
+                    let ds_mask = self.double_sided_masks.get(chunk_idx as usize).copied().unwrap_or(0);
+                    if ray.any_triangle_simd8(self.get_chunk(chunk_idx), t_max, ds_mask) {
                         return true;
                     }
                 }
             } else {
-                // Order is irrelevant for any-hit, and t_max never tightens.
                 let node = self.get_node(encoded_idx);
-                let (mut bitmask, t_arr) = ray.intersect_bvh8_dist(node, t_max);
+                let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
 
                 while bitmask != 0 {
                     let lane = bitmask.trailing_zeros() as usize;
                     bitmask &= bitmask - 1;
-
                     let encoded = node.children[lane];
                     if encoded != u32::MAX && t_arr[lane] < t_max {
                         stack.push(encoded, 0.0);
