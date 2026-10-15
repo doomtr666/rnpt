@@ -4,6 +4,8 @@
 
 Every major system — BVH, BRDF, MIS, and the neural cache itself — is implemented from scratch with correctness and clarity as first-class concerns, and serves as an educational reference for anyone curious about these topics.
 
+Developed in collaboration with Claude (Anthropic) as a coding assistant; design, experiments and validation are mine.
+
 ## Goals
 
 - **Algorithm prototyping** — validate rendering research ideas (ReSTIR, neural caches, MIS variants) on CPU where iteration is fast and debugging is straightforward, then port the validated design to GPU.
