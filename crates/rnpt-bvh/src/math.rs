@@ -81,6 +81,55 @@ impl InternalRay {
         Self { origin, direction, inv_direction, tmin, tmax }
     }
 
+    /// Any-hit test on 8 triangles: same masks as `intersect_simd_8` (culling
+    /// included, so shadows match the closest-hit render), but no reduction to
+    /// the closest lane, only "is anything there?".
+    #[inline(always)]
+    pub fn occluded_simd_8(&self, soa: &FlatTriangles, t_max: f32) -> bool {
+        let v0_x = f32x8::from(soa.v0_x);
+        let v0_y = f32x8::from(soa.v0_y);
+        let v0_z = f32x8::from(soa.v0_z);
+        let e1_x = f32x8::from(soa.e1_x);
+        let e1_y = f32x8::from(soa.e1_y);
+        let e1_z = f32x8::from(soa.e1_z);
+        let e2_x = f32x8::from(soa.e2_x);
+        let e2_y = f32x8::from(soa.e2_y);
+        let e2_z = f32x8::from(soa.e2_z);
+
+        let dir_x = f32x8::splat(self.direction.x);
+        let dir_y = f32x8::splat(self.direction.y);
+        let dir_z = f32x8::splat(self.direction.z);
+
+        let h_x = dir_y * e2_z - dir_z * e2_y;
+        let h_y = dir_z * e2_x - dir_x * e2_z;
+        let h_z = dir_x * e2_y - dir_y * e2_x;
+        let det = e1_x * h_x + e1_y * h_y + e1_z * h_z;
+
+        let epsilon = f32x8::splat(1e-7);
+        let ds = double_sided_lanes(soa.double_sided_mask);
+        let det_mask = det.simd_ge(epsilon) | (ds & det.simd_le(-epsilon));
+        let inv_det = f32x8::splat(1.0) / det;
+
+        let s_x = f32x8::splat(self.origin.x) - v0_x;
+        let s_y = f32x8::splat(self.origin.y) - v0_y;
+        let s_z = f32x8::splat(self.origin.z) - v0_z;
+        let u = inv_det * (s_x * h_x + s_y * h_y + s_z * h_z);
+        let u_mask = u.simd_ge(f32x8::ZERO) & u.simd_le(f32x8::splat(1.0));
+
+        let q_x = s_y * e1_z - s_z * e1_y;
+        let q_y = s_z * e1_x - s_x * e1_z;
+        let q_z = s_x * e1_y - s_y * e1_x;
+        let v = inv_det * (dir_x * q_x + dir_y * q_y + dir_z * q_z);
+        let uv_mask = v.simd_ge(f32x8::ZERO) & (u + v).simd_le(f32x8::splat(1.0));
+
+        let t = inv_det * (e2_x * q_x + e2_y * q_y + e2_z * q_z);
+        let tmin_mask = t.simd_ge(f32x8::splat(self.tmin));
+        let tmax_mask = t.simd_le(f32x8::splat(t_max));
+
+        let final_mask = det_mask & u_mask & uv_mask & tmin_mask & tmax_mask;
+        final_mask.to_bitmask() != 0
+    }
+
     /// Slab test on the 8 children of a node at once. Returns the mask of hit
     /// children and the distance at which the ray enters each of them.
     #[inline(always)]

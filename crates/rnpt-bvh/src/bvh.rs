@@ -202,8 +202,47 @@ impl BvhInner {
         result
     }
 
-    /// No dedicated occlusion query yet: any hit is a closest hit.
+    /// Any-hit traversal for shadow rays: true as soon as any triangle is hit
+    /// within the ray's range. Cheaper than `closest_hit`: no closest tracking,
+    /// no `t_max` tightening, no child sorting, and it stops at the first hit.
     pub fn any_hit(&self, ray: &InternalRay) -> bool {
-        self.closest_hit(ray).is_some()
+        if self.nodes.is_empty() {
+            return false;
+        }
+
+        let t_max = ray.tmax;
+        let mut stack = BvhStack::new();
+        stack.push(0, 0.0);
+
+        while !stack.is_empty() {
+            let (encoded_idx, _) = stack.pop();
+
+            if encoded_idx & LEAF_FLAG != 0 {
+                let chunk_count = (encoded_idx >> 24) & 0x7F;
+                let start_chunk = encoded_idx & 0x00FF_FFFF;
+
+                for i in 0..chunk_count {
+                    if ray.occluded_simd_8(self.get_chunk((start_chunk + i) as usize), t_max) {
+                        return true;
+                    }
+                }
+            } else {
+                // Order is irrelevant for any-hit, and t_max never tightens.
+                let node = self.get_node(encoded_idx);
+                let (mut bitmask, t_arr) = ray.intersect_bvh8_dist(node, t_max);
+
+                while bitmask != 0 {
+                    let lane = bitmask.trailing_zeros() as usize;
+                    bitmask &= bitmask - 1;
+
+                    let encoded = node.children[lane];
+                    if encoded != u32::MAX && t_arr[lane] < t_max {
+                        stack.push(encoded, 0.0);
+                    }
+                }
+            }
+        }
+
+        false
     }
 }
