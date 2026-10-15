@@ -1,4 +1,4 @@
-use nalgebra::{Point3, UnitVector3};
+use nalgebra::{Point3, UnitVector3, Vector3};
 use wide::f32x8;
 
 use crate::bvh::FlatTriangles;
@@ -70,57 +70,27 @@ pub fn double_sided_lanes(mask: u8) -> f32x8 {
 pub struct InternalRay {
     pub origin: Point3<f32>,
     pub direction: UnitVector3<f32>,
+    pub inv_direction: Vector3<f32>,
     pub tmin: f32,
     pub tmax: f32,
 }
 
 impl InternalRay {
     pub fn new(origin: Point3<f32>, direction: UnitVector3<f32>, tmin: f32, tmax: f32) -> Self {
-        Self { origin, direction, tmin, tmax }
+        let inv_direction = Vector3::new(1.0 / direction.x, 1.0 / direction.y, 1.0 / direction.z);
+        Self { origin, direction, inv_direction, tmin, tmax }
     }
 
-    /// Slab test (Kay & Kajiya). Returns the distance at which the ray enters the box.
+    /// Slab test, branchless: the reciprocal direction is computed once per ray.
+    /// Returns the distance at which the ray enters the box.
     pub fn intersect_aabb(&self, aabb: &AABB, current_t_max: f32) -> Option<f32> {
-        let mut tmin = self.tmin;
-        let mut tmax = current_t_max;
+        let t0 = (aabb.min - self.origin).component_mul(&self.inv_direction);
+        let t1 = (aabb.max - self.origin).component_mul(&self.inv_direction);
 
-        let inv_d = 1.0 / self.direction.x;
-        let mut t0 = (aabb.min.x - self.origin.x) * inv_d;
-        let mut t1 = (aabb.max.x - self.origin.x) * inv_d;
-        if inv_d < 0.0 {
-            std::mem::swap(&mut t0, &mut t1);
-        }
-        tmin = if t0 > tmin { t0 } else { tmin };
-        tmax = if t1 < tmax { t1 } else { tmax };
-        if tmax < tmin {
-            return None;
-        }
+        let tmin = t0.inf(&t1).max().max(self.tmin);
+        let tmax = t0.sup(&t1).min().min(current_t_max);
 
-        let inv_d = 1.0 / self.direction.y;
-        let mut t0 = (aabb.min.y - self.origin.y) * inv_d;
-        let mut t1 = (aabb.max.y - self.origin.y) * inv_d;
-        if inv_d < 0.0 {
-            std::mem::swap(&mut t0, &mut t1);
-        }
-        tmin = if t0 > tmin { t0 } else { tmin };
-        tmax = if t1 < tmax { t1 } else { tmax };
-        if tmax < tmin {
-            return None;
-        }
-
-        let inv_d = 1.0 / self.direction.z;
-        let mut t0 = (aabb.min.z - self.origin.z) * inv_d;
-        let mut t1 = (aabb.max.z - self.origin.z) * inv_d;
-        if inv_d < 0.0 {
-            std::mem::swap(&mut t0, &mut t1);
-        }
-        tmin = if t0 > tmin { t0 } else { tmin };
-        tmax = if t1 < tmax { t1 } else { tmax };
-        if tmax < tmin {
-            return None;
-        }
-
-        Some(tmin)
+        if tmax < tmin { None } else { Some(tmin) }
     }
 
     /// Möller–Trumbore on 8 triangles at once, one per SIMD lane. Back faces are

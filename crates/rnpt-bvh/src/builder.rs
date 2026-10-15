@@ -80,8 +80,11 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
     }
 
     let mut chunk_indices: Vec<usize> = (0..soa_chunks.len()).collect();
-    let mut nodes = vec![BvhNode { aabb: AABB::invalid(), left_first: 0, tri_count: chunk_indices.len() as u32 }];
+    // An empty scene has no nodes at all: a root without chunks would look like
+    // an internal node to the traversal.
+    let mut nodes = Vec::new();
     if !chunk_indices.is_empty() {
+        nodes.push(BvhNode { aabb: AABB::invalid(), left_first: 0, tri_count: chunk_indices.len() as u32 });
         update_node_bounds(0, &mut nodes, &chunk_indices, &chunk_aabbs);
         subdivide_sah(0, &mut nodes, &mut chunk_indices, &chunk_aabbs, &chunk_centroids);
     }

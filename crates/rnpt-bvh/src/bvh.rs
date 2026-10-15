@@ -58,6 +58,11 @@ pub struct BvhInner {
 }
 
 impl BvhInner {
+    #[inline(always)]
+    fn get_node(&self, idx: u32) -> &BvhNode {
+        unsafe { self.nodes.get_unchecked(idx as usize) }
+    }
+
     pub fn closest_hit(&self, ray: &InternalRay) -> Option<Hit> {
         if self.nodes.is_empty() {
             return None;
@@ -68,7 +73,7 @@ impl BvhInner {
 
         // Each stack entry carries the distance at which the ray enters the node,
         // so nodes behind the closest hit found so far are skipped when popped.
-        let mut stack = [(0usize, 0.0f32); MAX_TRAVERSAL_DEPTH];
+        let mut stack = [(0u32, 0.0f32); MAX_TRAVERSAL_DEPTH];
         let mut stack_ptr = 0;
 
         let Some(root_t) = ray.intersect_aabb(&self.nodes[0].aabb, t_max) else {
@@ -85,7 +90,7 @@ impl BvhInner {
                 continue;
             }
 
-            let node = &self.nodes[node_idx];
+            let node = self.get_node(node_idx);
 
             if node.is_leaf() {
                 let start_chunk = node.left_first as usize;
@@ -107,10 +112,10 @@ impl BvhInner {
                     }
                 }
             } else if stack_ptr + 1 < MAX_TRAVERSAL_DEPTH {
-                let left_idx = node.left_first as usize;
+                let left_idx = node.left_first;
                 let right_idx = left_idx + 1;
-                let t_left = ray.intersect_aabb(&self.nodes[left_idx].aabb, t_max);
-                let t_right = ray.intersect_aabb(&self.nodes[right_idx].aabb, t_max);
+                let t_left = ray.intersect_aabb(&self.get_node(left_idx).aabb, t_max);
+                let t_right = ray.intersect_aabb(&self.get_node(right_idx).aabb, t_max);
 
                 match (t_left, t_right) {
                     (Some(t_left), Some(t_right)) => {
