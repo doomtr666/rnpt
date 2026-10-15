@@ -59,6 +59,10 @@ pub struct RnptGuiApp {
     pub rel_error: f32,
 
     pub probe_texture: Option<egui::TextureHandle>,
+
+    /// Wall-clock time since the last reset, frozen once the budget is reached.
+    pub render_start: Instant,
+    pub render_time: Option<Duration>,
 }
 
 // ── Construction helpers ──────────────────────────────────────────────────────
@@ -224,6 +228,8 @@ impl RnptGuiApp {
             loss_ema: 0.0,
             rel_error: 0.0,
             probe_texture: None,
+            render_start: Instant::now(),
+            render_time: None,
         }
     }
 
@@ -265,6 +271,8 @@ impl RnptGuiApp {
         self.last_loss = 0.0;
         self.loss_ema = 0.0;
         self.rel_error = 0.0;
+        self.render_start = Instant::now();
+        self.render_time = None;
         self.rays_since_last_fps = 0;
         self.real_rays_since_last_fps = 0;
         self.shadow_rays_since_last_fps = 0;
@@ -368,6 +376,12 @@ impl eframe::App for RnptGuiApp {
             }
 
             tracer.fetch_pixels(&mut self.local_pixels);
+            if self.render_time.is_none()
+                && !self.budget.is_unlimited()
+                && self.local_pixels.iter().all(|p| self.budget.is_exhausted(p))
+            {
+                self.render_time = Some(self.render_start.elapsed());
+            }
             self.rays_since_last_fps += tracer.pop_rays_traced();
             self.real_rays_since_last_fps += tracer.pop_real_rays_traced();
             self.shadow_rays_since_last_fps += tracer.pop_shadow_rays_traced();
@@ -424,16 +438,18 @@ impl eframe::App for RnptGuiApp {
             .resizable(true)
             .default_width(260.0)
             .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.heading("RNPT Controls");
-                ui.add_space(10.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(8.0);
+                    ui.heading("RNPT Controls");
+                    ui.add_space(10.0);
 
-                panels::scene::show(self, ui);
-                panels::camera::show(self, ui);
-                panels::render::show(self, ui);
-                panels::environment::show(self, ui);
-                panels::post::show(self, ui);
-                panels::stats::show(self, ui);
+                    panels::scene::show(self, ui);
+                    panels::camera::show(self, ui);
+                    panels::render::show(self, ui);
+                    panels::environment::show(self, ui);
+                    panels::post::show(self, ui);
+                    panels::stats::show(self, ui);
+                });
             });
 
         // ── Central viewport ──────────────────────────────────────────────────

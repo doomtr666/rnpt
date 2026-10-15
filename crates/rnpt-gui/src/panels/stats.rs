@@ -6,6 +6,10 @@ pub fn show(app: &mut RnptGuiApp, ui: &mut egui::Ui) {
     ui.heading("Rendering Stats");
     ui.add_space(4.0);
     ui.label(format!("Resolution: {}x{}", app.local_width, app.local_height));
+    match app.render_time {
+        Some(t) => ui.label(format!("Time: {:.2} s (budget reached)", t.as_secs_f64())),
+        None => ui.label(format!("Time: {:.1} s", app.render_start.elapsed().as_secs_f64())),
+    };
 
     let avg_samples = if app.local_pixels.is_empty() {
         0.0
