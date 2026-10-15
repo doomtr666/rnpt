@@ -43,18 +43,26 @@ impl BvhInner {
         let mut result: Option<Hit> = None;
         let mut t_max = ray.tmax;
 
-        let mut stack = [0usize; MAX_TRAVERSAL_DEPTH];
+        // Each stack entry carries the distance at which the ray enters the node,
+        // so nodes behind the closest hit found so far are skipped when popped.
+        let mut stack = [(0usize, 0.0f32); MAX_TRAVERSAL_DEPTH];
         let mut stack_ptr = 0;
-        stack[stack_ptr] = 0;
+
+        let Some(root_t) = ray.intersect_aabb(&self.nodes[0].aabb, t_max) else {
+            return None;
+        };
+        stack[stack_ptr] = (0, root_t);
         stack_ptr += 1;
 
         while stack_ptr > 0 {
             stack_ptr -= 1;
-            let node = &self.nodes[stack[stack_ptr]];
+            let (node_idx, node_t) = stack[stack_ptr];
 
-            if !node.aabb.intersect(ray, t_max) {
+            if node_t >= t_max {
                 continue;
             }
+
+            let node = &self.nodes[node_idx];
 
             if node.is_leaf() {
                 let first = node.left_first as usize;
@@ -81,10 +89,33 @@ impl BvhInner {
                     }
                 }
             } else if stack_ptr + 1 < MAX_TRAVERSAL_DEPTH {
-                // Push both children, in no particular order.
-                stack[stack_ptr] = node.left_first as usize;
-                stack[stack_ptr + 1] = node.left_first as usize + 1;
-                stack_ptr += 2;
+                let left_idx = node.left_first as usize;
+                let right_idx = left_idx + 1;
+                let t_left = ray.intersect_aabb(&self.nodes[left_idx].aabb, t_max);
+                let t_right = ray.intersect_aabb(&self.nodes[right_idx].aabb, t_max);
+
+                match (t_left, t_right) {
+                    (Some(t_left), Some(t_right)) => {
+                        // Front to back: push the farthest first, so the nearest is popped first.
+                        if t_left < t_right {
+                            stack[stack_ptr] = (right_idx, t_right);
+                            stack[stack_ptr + 1] = (left_idx, t_left);
+                        } else {
+                            stack[stack_ptr] = (left_idx, t_left);
+                            stack[stack_ptr + 1] = (right_idx, t_right);
+                        }
+                        stack_ptr += 2;
+                    }
+                    (Some(t_left), None) => {
+                        stack[stack_ptr] = (left_idx, t_left);
+                        stack_ptr += 1;
+                    }
+                    (None, Some(t_right)) => {
+                        stack[stack_ptr] = (right_idx, t_right);
+                        stack_ptr += 1;
+                    }
+                    (None, None) => {}
+                }
             }
         }
 
