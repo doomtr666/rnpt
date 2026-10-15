@@ -1,5 +1,3 @@
-use nalgebra::Point3;
-
 use crate::math::{InternalRay, AABB};
 use crate::Hit;
 
@@ -15,9 +13,35 @@ pub struct FlatTriangle {
     pub double_sided: bool,
 }
 
+/// The (up to) 8 triangles of a leaf, laid out for SIMD: one lane per triangle.
+/// Unused lanes are zero, i.e. degenerate triangles that never hit.
+#[repr(C, align(32))]
+#[derive(Clone, Copy)]
+pub struct FlatTriangles {
+    pub v0_x: [f32; 8], pub v0_y: [f32; 8], pub v0_z: [f32; 8],
+    pub e1_x: [f32; 8], pub e1_y: [f32; 8], pub e1_z: [f32; 8],
+    pub e2_x: [f32; 8], pub e2_y: [f32; 8], pub e2_z: [f32; 8],
+    pub first_triangle_idx: u32,
+    /// Bit i set: lane i is double-sided.
+    pub double_sided_mask: u8,
+}
+
+impl Default for FlatTriangles {
+    fn default() -> Self {
+        Self {
+            v0_x: [0.0; 8], v0_y: [0.0; 8], v0_z: [0.0; 8],
+            e1_x: [0.0; 8], e1_y: [0.0; 8], e1_z: [0.0; 8],
+            e2_x: [0.0; 8], e2_y: [0.0; 8], e2_z: [0.0; 8],
+            first_triangle_idx: 0,
+            double_sided_mask: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct BvhNode {
     pub aabb: AABB,
+    /// Internal node: index of the left child. Leaf: index of its SoA chunk.
     pub left_first: u32,
     pub tri_count: u32,
 }
@@ -30,8 +54,8 @@ impl BvhNode {
 
 pub struct BvhInner {
     pub nodes: Vec<BvhNode>,
-    pub vertices: Vec<Point3<f32>>,
     pub triangles: Vec<FlatTriangle>,
+    pub soa_chunks: Vec<FlatTriangles>,
 }
 
 impl BvhInner {
@@ -65,28 +89,18 @@ impl BvhInner {
             let node = &self.nodes[node_idx];
 
             if node.is_leaf() {
-                let first = node.left_first as usize;
-                let count = node.tri_count as usize;
+                let chunk = &self.soa_chunks[node.left_first as usize];
 
-                for i in 0..count {
-                    let tri = &self.triangles[first + i];
-                    let v0 = self.vertices[tri.v0 as usize];
-                    let v1 = self.vertices[tri.v1 as usize];
-                    let v2 = self.vertices[tri.v2 as usize];
-
-                    let mut test_ray = ray.clone();
-                    test_ray.tmax = t_max;
-
-                    if let Some(hit) = test_ray.intersect_triangle(&v0, &v1, &v2, tri.double_sided) {
-                        t_max = hit.t;
-                        result = Some(Hit {
-                            t: hit.t,
-                            u: hit.u,
-                            v: hit.v,
-                            prim_id: tri.orig_idx,
-                            geom_id: tri.geom_id,
-                        });
-                    }
+                if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
+                    t_max = simd_hit.hit.t;
+                    let tri = &self.triangles[chunk.first_triangle_idx as usize + simd_hit.lane];
+                    result = Some(Hit {
+                        t: simd_hit.hit.t,
+                        u: simd_hit.hit.u,
+                        v: simd_hit.hit.v,
+                        prim_id: tri.orig_idx,
+                        geom_id: tri.geom_id,
+                    });
                 }
             } else if stack_ptr + 1 < MAX_TRAVERSAL_DEPTH {
                 let left_idx = node.left_first as usize;

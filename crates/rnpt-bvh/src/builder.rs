@@ -1,10 +1,13 @@
 use nalgebra::Point3;
 
 use crate::{
-    bvh::{BvhInner, BvhNode, FlatTriangle},
+    bvh::{BvhInner, BvhNode, FlatTriangle, FlatTriangles},
     math::AABB,
     Geometry,
 };
+
+/// A leaf holds at most one SIMD chunk.
+const MAX_LEAF_TRIANGLES: u32 = 8;
 
 pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
     let mut vertices: Vec<Point3<f32>> = Vec::new();
@@ -34,32 +37,46 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
         subdivide(0, &mut nodes, &vertices, &triangles);
     }
 
-    BvhInner { nodes, vertices, triangles }
+    // Pack each leaf's triangles into one SoA chunk; the leaf now points to it.
+    let mut soa_chunks = Vec::new();
+    for node in nodes.iter_mut().filter(|n| n.is_leaf()) {
+        let first = node.left_first as usize;
+        let mut soa = FlatTriangles { first_triangle_idx: first as u32, ..Default::default() };
+        for i in 0..node.tri_count as usize {
+            let tri = &triangles[first + i];
+            let v0 = vertices[tri.v0 as usize];
+            let e1 = vertices[tri.v1 as usize] - v0;
+            let e2 = vertices[tri.v2 as usize] - v0;
+            soa.v0_x[i] = v0.x; soa.v0_y[i] = v0.y; soa.v0_z[i] = v0.z;
+            soa.e1_x[i] = e1.x; soa.e1_y[i] = e1.y; soa.e1_z[i] = e1.z;
+            soa.e2_x[i] = e2.x; soa.e2_y[i] = e2.y; soa.e2_z[i] = e2.z;
+            if tri.double_sided {
+                soa.double_sided_mask |= 1 << i;
+            }
+        }
+        node.left_first = soa_chunks.len() as u32;
+        soa_chunks.push(soa);
+    }
+
+    BvhInner { nodes, triangles, soa_chunks }
 }
 
 /// Order triangles along a Z-order curve of their centroids, so that a plain
 /// median split of the array gives spatially coherent children.
-fn sort_by_morton_code(vertices: &[Point3<f32>], triangles: &mut Vec<FlatTriangle>) {
+fn sort_by_morton_code(vertices: &[Point3<f32>], triangles: &mut [FlatTriangle]) {
     let mut world_aabb = AABB::invalid();
     for &v in vertices {
         world_aabb.extend(v);
     }
 
-    let mut keyed: Vec<(u64, FlatTriangle)> = triangles
-        .iter()
-        .map(|tri| {
-            let centroid = Point3::from(
-                (vertices[tri.v0 as usize].coords + vertices[tri.v1 as usize].coords + vertices[tri.v2 as usize].coords)
-                    / 3.0,
-            );
-            let c = world_aabb.normalize(centroid);
-            (morton_3d(c.x, c.y, c.z), *tri)
-        })
-        .collect();
-    keyed.sort_by_key(|k| k.0);
-
-    triangles.clear();
-    triangles.extend(keyed.into_iter().map(|k| k.1));
+    triangles.sort_by_cached_key(|tri| {
+        let centroid = Point3::from(
+            (vertices[tri.v0 as usize].coords + vertices[tri.v1 as usize].coords + vertices[tri.v2 as usize].coords)
+                / 3.0,
+        );
+        let c = world_aabb.normalize(centroid);
+        morton_3d(c.x, c.y, c.z)
+    });
 }
 
 fn update_node_bounds(node_idx: usize, nodes: &mut [BvhNode], vertices: &[Point3<f32>], triangles: &[FlatTriangle]) {
@@ -82,7 +99,7 @@ fn update_node_bounds(node_idx: usize, nodes: &mut [BvhNode], vertices: &[Point3
 
 fn subdivide(node_idx: usize, nodes: &mut Vec<BvhNode>, vertices: &[Point3<f32>], triangles: &[FlatTriangle]) {
     let node = nodes[node_idx];
-    if node.tri_count <= 2 {
+    if node.tri_count <= MAX_LEAF_TRIANGLES {
         return;
     }
 
