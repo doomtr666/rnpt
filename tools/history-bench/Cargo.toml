@@ -1,0 +1,6 @@
+[workspace]
+resolver = "3"
+members = ["driver", "common"]
+
+[profile.release]
+debug = true
