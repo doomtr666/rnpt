@@ -1,7 +1,7 @@
 use nalgebra::Point3;
 
 use crate::{
-    bvh::{BvhInner, BvhNode, FlatTriangle, FlatTriangles},
+    bvh::{Bvh8Node, BvhInner, FlatTriangle, FlatTriangles},
     math::AABB,
     Geometry,
 };
@@ -79,21 +79,91 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
         chunk_centroids.push(chunk_aabb.center());
     }
 
+    // Build a binary SAH tree over chunks, then collapse it into an 8-wide tree.
+    // An empty scene has no nodes at all.
     let mut chunk_indices: Vec<usize> = (0..soa_chunks.len()).collect();
-    // An empty scene has no nodes at all: a root without chunks would look like
-    // an internal node to the traversal.
     let mut nodes = Vec::new();
+    let mut bvh8_nodes = Vec::new();
     if !chunk_indices.is_empty() {
-        nodes.push(BvhNode { aabb: AABB::invalid(), left_first: 0, tri_count: chunk_indices.len() as u32 });
+        nodes.push(BvhNode { aabb: AABB::invalid(), left_first: 0, chunk_count: chunk_indices.len() as u32 });
         update_node_bounds(0, &mut nodes, &chunk_indices, &chunk_aabbs);
         subdivide_sah(0, &mut nodes, &mut chunk_indices, &chunk_aabbs, &chunk_centroids);
+        collapse_to_bvh8(0, &nodes, &mut bvh8_nodes);
     }
 
     // Store chunks (and their triangles) in leaf order.
     let ordered_chunks = chunk_indices.iter().map(|&idx| soa_chunks[idx]).collect();
     let ordered_triangles = chunk_indices.iter().flat_map(|&idx| triangles[idx * 8..idx * 8 + 8].iter().copied()).collect();
 
-    BvhInner { nodes, triangles: ordered_triangles, soa_chunks: ordered_chunks }
+    BvhInner { nodes: bvh8_nodes, triangles: ordered_triangles, soa_chunks: ordered_chunks }
+}
+
+/// Binary node, only used during the build.
+#[derive(Clone, Copy)]
+struct BvhNode {
+    aabb: AABB,
+    /// Internal node: index of the left child. Leaf: index of its first chunk.
+    left_first: u32,
+    /// Number of chunks in a leaf, 0 for an internal node.
+    chunk_count: u32,
+}
+
+impl BvhNode {
+    fn is_leaf(&self) -> bool {
+        self.chunk_count > 0
+    }
+}
+
+/// Collapse a binary node and its descendants into 8-wide nodes: repeatedly
+/// open the internal child with the largest surface area until there are 8
+/// children or only leaves left.
+fn collapse_to_bvh8(node_idx: usize, bvh2: &[BvhNode], bvh8: &mut Vec<Bvh8Node>) -> u32 {
+    let bvh8_idx = bvh8.len() as u32;
+    bvh8.push(Bvh8Node::default());
+
+    let mut children = vec![node_idx];
+    while children.len() < 8 {
+        let mut best_idx = None;
+        let mut best_area = -1.0;
+        for (i, &c_idx) in children.iter().enumerate() {
+            let node = &bvh2[c_idx];
+            if !node.is_leaf() {
+                let area = node.aabb.surface_area();
+                if area > best_area {
+                    best_area = area;
+                    best_idx = Some(i);
+                }
+            }
+        }
+
+        let Some(i) = best_idx else { break };
+        let left = bvh2[children[i]].left_first as usize;
+        children.swap_remove(i);
+        children.push(left);
+        children.push(left + 1);
+    }
+
+    let mut node8 = Bvh8Node::default();
+    for (i, &c_idx) in children.iter().enumerate() {
+        let child = &bvh2[c_idx];
+        node8.p_min_x[i] = child.aabb.min.x;
+        node8.p_min_y[i] = child.aabb.min.y;
+        node8.p_min_z[i] = child.aabb.min.z;
+        node8.p_max_x[i] = child.aabb.max.x;
+        node8.p_max_y[i] = child.aabb.max.y;
+        node8.p_max_z[i] = child.aabb.max.z;
+
+        if child.is_leaf() {
+            node8.child_indices[i] = child.left_first;
+            node8.chunk_counts[i] = child.chunk_count;
+        } else {
+            node8.child_indices[i] = collapse_to_bvh8(c_idx, bvh2, bvh8);
+            node8.chunk_counts[i] = 0;
+        }
+    }
+
+    bvh8[bvh8_idx as usize] = node8;
+    bvh8_idx
 }
 
 /// Group triangles into compact clusters of 8: recursive median splits along
@@ -157,7 +227,7 @@ fn split_clusters(indices: &mut [usize], centroids: &[Point3<f32>], start: usize
 
 fn update_node_bounds(node_idx: usize, nodes: &mut [BvhNode], chunk_indices: &[usize], chunk_aabbs: &[AABB]) {
     let first = nodes[node_idx].left_first as usize;
-    let count = nodes[node_idx].tri_count as usize;
+    let count = nodes[node_idx].chunk_count as usize;
 
     let mut aabb = AABB::invalid();
     for &chunk_idx in &chunk_indices[first..first + count] {
@@ -176,7 +246,7 @@ fn subdivide_sah(
     chunk_centroids: &[Point3<f32>],
 ) {
     let first = nodes[node_idx].left_first as usize;
-    let count = nodes[node_idx].tri_count as usize;
+    let count = nodes[node_idx].chunk_count as usize;
 
     if count <= 1 {
         return;
@@ -288,12 +358,12 @@ fn subdivide_sah(
     }
 
     let left_child_idx = nodes.len();
-    nodes.push(BvhNode { aabb: AABB::invalid(), left_first: first as u32, tri_count: left_count as u32 });
+    nodes.push(BvhNode { aabb: AABB::invalid(), left_first: first as u32, chunk_count: left_count as u32 });
     let right_child_idx = nodes.len();
-    nodes.push(BvhNode { aabb: AABB::invalid(), left_first: left as u32, tri_count: (count - left_count) as u32 });
+    nodes.push(BvhNode { aabb: AABB::invalid(), left_first: left as u32, chunk_count: (count - left_count) as u32 });
 
     nodes[node_idx].left_first = left_child_idx as u32;
-    nodes[node_idx].tri_count = 0;
+    nodes[node_idx].chunk_count = 0;
 
     update_node_bounds(left_child_idx, nodes, chunk_indices, chunk_aabbs);
     update_node_bounds(right_child_idx, nodes, chunk_indices, chunk_aabbs);

@@ -1,7 +1,10 @@
-use crate::math::{InternalRay, AABB};
+use crate::math::InternalRay;
 use crate::Hit;
 
 const MAX_TRAVERSAL_DEPTH: usize = 64;
+
+/// Stack entries pointing to a leaf carry its chunk range instead of a node index.
+const LEAF_FLAG: u32 = 0x8000_0000;
 
 #[derive(Clone, Copy)]
 pub struct FlatTriangle {
@@ -36,23 +39,36 @@ impl Default for FlatTriangles {
     }
 }
 
+/// 8-wide node: the bounds of its (up to) 8 children in SoA, tested in one SIMD pass.
+/// Unused slots have NaN bounds and never hit.
+#[repr(C, align(32))]
 #[derive(Clone, Copy)]
-pub struct BvhNode {
-    pub aabb: AABB,
-    /// Internal node: index of the left child. Leaf: index of its first chunk.
-    pub left_first: u32,
-    /// Number of chunks in a leaf, 0 for an internal node.
-    pub tri_count: u32,
+pub struct Bvh8Node {
+    pub p_min_x: [f32; 8],
+    pub p_min_y: [f32; 8],
+    pub p_min_z: [f32; 8],
+    pub p_max_x: [f32; 8],
+    pub p_max_y: [f32; 8],
+    pub p_max_z: [f32; 8],
+    /// Child node index, or first chunk of a leaf child.
+    pub child_indices: [u32; 8],
+    /// Number of chunks of a leaf child, 0 for an internal child.
+    pub chunk_counts: [u32; 8],
 }
 
-impl BvhNode {
-    pub fn is_leaf(&self) -> bool {
-        self.tri_count > 0
+impl Default for Bvh8Node {
+    fn default() -> Self {
+        Self {
+            p_min_x: [f32::NAN; 8], p_min_y: [f32::NAN; 8], p_min_z: [f32::NAN; 8],
+            p_max_x: [f32::NAN; 8], p_max_y: [f32::NAN; 8], p_max_z: [f32::NAN; 8],
+            child_indices: [u32::MAX; 8],
+            chunk_counts: [0; 8],
+        }
     }
 }
 
 pub struct BvhInner {
-    pub nodes: Vec<BvhNode>,
+    pub nodes: Vec<Bvh8Node>,
     pub triangles: Vec<FlatTriangle>,
     pub soa_chunks: Vec<FlatTriangles>,
 }
@@ -86,16 +102,11 @@ impl BvhStack {
     fn is_empty(&self) -> bool {
         self.ptr == 0
     }
-
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.ptr
-    }
 }
 
 impl BvhInner {
     #[inline(always)]
-    fn get_node(&self, idx: u32) -> &BvhNode {
+    fn get_node(&self, idx: u32) -> &Bvh8Node {
         unsafe { self.nodes.get_unchecked(idx as usize) }
     }
 
@@ -110,26 +121,21 @@ impl BvhInner {
         // Each stack entry carries the distance at which the ray enters the node,
         // so nodes behind the closest hit found so far are skipped when popped.
         let mut stack = BvhStack::new();
-
-        let Some(root_t) = ray.intersect_aabb(&self.nodes[0].aabb, t_max) else {
-            return None;
-        };
-        stack.push(0, root_t);
+        stack.push(0, 0.0);
 
         while !stack.is_empty() {
-            let (node_idx, node_t) = stack.pop();
+            let (encoded_idx, node_t) = stack.pop();
 
             if node_t >= t_max {
                 continue;
             }
 
-            let node = self.get_node(node_idx);
+            if encoded_idx & LEAF_FLAG != 0 {
+                let chunk_count = (encoded_idx >> 24) & 0x7F;
+                let start_chunk = encoded_idx & 0x00FF_FFFF;
 
-            if node.is_leaf() {
-                let start_chunk = node.left_first as usize;
-                let chunk_count = node.tri_count as usize;
-
-                for chunk_idx in start_chunk..start_chunk + chunk_count {
+                for i in 0..chunk_count {
+                    let chunk_idx = (start_chunk + i) as usize;
                     let chunk = &self.soa_chunks[chunk_idx];
 
                     if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
@@ -144,26 +150,41 @@ impl BvhInner {
                         });
                     }
                 }
-            } else if stack.len() + 1 < MAX_TRAVERSAL_DEPTH {
-                let left_idx = node.left_first;
-                let right_idx = left_idx + 1;
-                let t_left = ray.intersect_aabb(&self.get_node(left_idx).aabb, t_max);
-                let t_right = ray.intersect_aabb(&self.get_node(right_idx).aabb, t_max);
+            } else {
+                let node = self.get_node(encoded_idx);
+                let (mut bitmask, t_arr) = ray.intersect_bvh8_dist(node, t_max);
 
-                match (t_left, t_right) {
-                    (Some(t_left), Some(t_right)) => {
-                        // Front to back: push the farthest first, so the nearest is popped first.
-                        if t_left < t_right {
-                            stack.push(right_idx, t_right);
-                            stack.push(left_idx, t_left);
-                        } else {
-                            stack.push(left_idx, t_left);
-                            stack.push(right_idx, t_right);
-                        }
+                let mut hits = [(0u32, 0.0f32); 8];
+                let mut hit_count = 0;
+
+                while bitmask != 0 {
+                    let lane = bitmask.trailing_zeros() as usize;
+                    bitmask &= bitmask - 1;
+
+                    let idx = node.child_indices[lane];
+                    if idx == u32::MAX {
+                        continue; // Empty slot.
                     }
-                    (Some(t_left), None) => stack.push(left_idx, t_left),
-                    (None, Some(t_right)) => stack.push(right_idx, t_right),
-                    (None, None) => {}
+
+                    let t = t_arr[lane];
+                    if t < t_max {
+                        let count = node.chunk_counts[lane];
+                        let encoded = if count > 0 { idx | (count << 24) | LEAF_FLAG } else { idx };
+                        hits[hit_count] = (encoded, t);
+                        hit_count += 1;
+                    }
+                }
+
+                // Insertion sort, farthest first, so the nearest child is popped first.
+                for i in 1..hit_count {
+                    let mut j = i;
+                    while j > 0 && hits[j - 1].1 < hits[j].1 {
+                        hits.swap(j - 1, j);
+                        j -= 1;
+                    }
+                }
+                for &(encoded, t) in &hits[..hit_count] {
+                    stack.push(encoded, t);
                 }
             }
         }

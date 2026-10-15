@@ -1,7 +1,7 @@
 use nalgebra::{Point3, UnitVector3, Vector3};
 use wide::f32x8;
 
-use crate::bvh::FlatTriangles;
+use crate::bvh::{Bvh8Node, FlatTriangles};
 
 #[derive(Debug, Clone, Copy)]
 pub struct AABB {
@@ -81,16 +81,41 @@ impl InternalRay {
         Self { origin, direction, inv_direction, tmin, tmax }
     }
 
-    /// Slab test, branchless: the reciprocal direction is computed once per ray.
-    /// Returns the distance at which the ray enters the box.
-    pub fn intersect_aabb(&self, aabb: &AABB, current_t_max: f32) -> Option<f32> {
-        let t0 = (aabb.min - self.origin).component_mul(&self.inv_direction);
-        let t1 = (aabb.max - self.origin).component_mul(&self.inv_direction);
+    /// Slab test on the 8 children of a node at once. Returns the mask of hit
+    /// children and the distance at which the ray enters each of them.
+    #[inline(always)]
+    pub fn intersect_bvh8_dist(&self, node: &Bvh8Node, t_max: f32) -> (u32, [f32; 8]) {
+        let p_min_x = f32x8::from(node.p_min_x);
+        let p_min_y = f32x8::from(node.p_min_y);
+        let p_min_z = f32x8::from(node.p_min_z);
+        let p_max_x = f32x8::from(node.p_max_x);
+        let p_max_y = f32x8::from(node.p_max_y);
+        let p_max_z = f32x8::from(node.p_max_z);
 
-        let tmin = t0.inf(&t1).max().max(self.tmin);
-        let tmax = t0.sup(&t1).min().min(current_t_max);
+        let origin_x = f32x8::splat(self.origin.x);
+        let origin_y = f32x8::splat(self.origin.y);
+        let origin_z = f32x8::splat(self.origin.z);
+        let inv_dir_x = f32x8::splat(self.inv_direction.x);
+        let inv_dir_y = f32x8::splat(self.inv_direction.y);
+        let inv_dir_z = f32x8::splat(self.inv_direction.z);
 
-        if tmax < tmin { None } else { Some(tmin) }
+        let t0_x = (p_min_x - origin_x) * inv_dir_x;
+        let t1_x = (p_max_x - origin_x) * inv_dir_x;
+        let tmin_x = t0_x.fast_min(t1_x);
+        let tmax_x = t0_x.fast_max(t1_x);
+
+        let t0_y = (p_min_y - origin_y) * inv_dir_y;
+        let t1_y = (p_max_y - origin_y) * inv_dir_y;
+        let tmin_y = tmin_x.fast_max(t0_y.fast_min(t1_y));
+        let tmax_y = tmax_x.fast_min(t0_y.fast_max(t1_y));
+
+        let t0_z = (p_min_z - origin_z) * inv_dir_z;
+        let t1_z = (p_max_z - origin_z) * inv_dir_z;
+        let tmin_z = tmin_y.fast_max(t0_z.fast_min(t1_z)).fast_max(f32x8::splat(self.tmin));
+        let tmax_z = tmax_y.fast_min(t0_z.fast_max(t1_z)).fast_min(f32x8::splat(t_max));
+
+        let mask = tmin_z.simd_le(tmax_z);
+        (mask.to_bitmask() as u32, tmin_z.to_array())
     }
 
     /// Möller–Trumbore on 8 triangles at once, one per SIMD lane. Back faces are
