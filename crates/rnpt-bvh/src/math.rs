@@ -26,6 +26,15 @@ impl AABB {
         self.max.z = self.max.z.max(point.z);
     }
 
+    pub fn extend_aabb(&mut self, other: &AABB) {
+        self.min.x = self.min.x.min(other.min.x);
+        self.min.y = self.min.y.min(other.min.y);
+        self.min.z = self.min.z.min(other.min.z);
+        self.max.x = self.max.x.max(other.max.x);
+        self.max.y = self.max.y.max(other.max.y);
+        self.max.z = self.max.z.max(other.max.z);
+    }
+
     /// Remap a point to [0, 1] based on the AABB extents.
     pub fn normalize(&self, v: Point3<f32>) -> Point3<f32> {
         let extent = self.max - self.min;

@@ -13,15 +13,14 @@ pub struct FlatTriangle {
     pub double_sided: bool,
 }
 
-/// The (up to) 8 triangles of a leaf, laid out for SIMD: one lane per triangle.
-/// Unused lanes are zero, i.e. degenerate triangles that never hit.
+/// 8 consecutive triangles laid out for SIMD, one lane per triangle: chunk `c`
+/// holds triangles `8c..8c+8`. Padding lanes are degenerate and never hit.
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
 pub struct FlatTriangles {
     pub v0_x: [f32; 8], pub v0_y: [f32; 8], pub v0_z: [f32; 8],
     pub e1_x: [f32; 8], pub e1_y: [f32; 8], pub e1_z: [f32; 8],
     pub e2_x: [f32; 8], pub e2_y: [f32; 8], pub e2_z: [f32; 8],
-    pub first_triangle_idx: u32,
     /// Bit i set: lane i is double-sided.
     pub double_sided_mask: u8,
 }
@@ -32,7 +31,6 @@ impl Default for FlatTriangles {
             v0_x: [0.0; 8], v0_y: [0.0; 8], v0_z: [0.0; 8],
             e1_x: [0.0; 8], e1_y: [0.0; 8], e1_z: [0.0; 8],
             e2_x: [0.0; 8], e2_y: [0.0; 8], e2_z: [0.0; 8],
-            first_triangle_idx: 0,
             double_sided_mask: 0,
         }
     }
@@ -41,8 +39,9 @@ impl Default for FlatTriangles {
 #[derive(Clone, Copy)]
 pub struct BvhNode {
     pub aabb: AABB,
-    /// Internal node: index of the left child. Leaf: index of its SoA chunk.
+    /// Internal node: index of the left child. Leaf: index of its first chunk.
     pub left_first: u32,
+    /// Number of chunks in a leaf, 0 for an internal node.
     pub tri_count: u32,
 }
 
@@ -89,11 +88,12 @@ impl BvhInner {
             let node = &self.nodes[node_idx];
 
             if node.is_leaf() {
-                let chunk = &self.soa_chunks[node.left_first as usize];
+                let chunk_idx = node.left_first as usize;
+                let chunk = &self.soa_chunks[chunk_idx];
 
                 if let Some(simd_hit) = ray.intersect_simd_8(chunk, t_max) {
                     t_max = simd_hit.hit.t;
-                    let tri = &self.triangles[chunk.first_triangle_idx as usize + simd_hit.lane];
+                    let tri = &self.triangles[chunk_idx * 8 + simd_hit.lane];
                     result = Some(Hit {
                         t: simd_hit.hit.t,
                         u: simd_hit.hit.u,
