@@ -122,8 +122,9 @@ pub(crate) fn build_bvh_and_lights(
 
 impl RnptGuiApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        // Fixed 800x800 by default, so renders compare side by side; auto-fit is opt-in.
         let width = 800;
-        let height = 600;
+        let height = 800;
         let mut camera = rnpt::Camera::default();
 
         let asset_files = crate::asset_importer::list_assets("assets");
@@ -211,7 +212,7 @@ impl RnptGuiApp {
             current_scene,
             current_bvh,
             current_lights,
-            auto_fit: true,
+            auto_fit: false,
             resize_timeout: None,
             strategy,
             budget: rnpt::RenderBudget::default(),
