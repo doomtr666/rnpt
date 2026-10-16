@@ -1,0 +1,14 @@
+[package]
+name = "imgcmp"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["hdr", "png"] }
+
+[workspace]
+
+[profile.release]
+debug = true
