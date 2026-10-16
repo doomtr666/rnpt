@@ -19,11 +19,13 @@ pub fn save_render(app: &RnptGuiApp) -> Result<PathBuf, String> {
     }
 
     std::fs::create_dir_all(RENDER_DIR).map_err(|e| format!("{RENDER_DIR}: {e}"))?;
-    let base = PathBuf::from(RENDER_DIR).join(file_stem(app));
+    // The stem contains dots (e.g. "12.34s"): append extensions, never with_extension.
+    let stem = PathBuf::from(RENDER_DIR).join(file_stem(app)).into_os_string();
+    let with_ext = |ext: &str| { let mut p = stem.clone(); p.push(ext); PathBuf::from(p) };
 
     let mut rgba = vec![0u8; w * h * 4];
     tonemap_and_convert(pixels, app.exposure, app.tonemapper, &mut rgba);
-    let png = base.with_extension("png");
+    let png = with_ext(".png");
     image::save_buffer(&png, &rgba, w as u32, h as u32, image::ExtendedColorType::Rgba8)
         .map_err(|e| format!("{}: {e}", png.display()))?;
 
@@ -34,7 +36,7 @@ pub fn save_render(app: &RnptGuiApp) -> Result<PathBuf, String> {
             image::Rgb(c)
         })
         .collect();
-    let hdr = base.with_extension("hdr");
+    let hdr = with_ext(".hdr");
     let file = std::fs::File::create(&hdr).map_err(|e| format!("{}: {e}", hdr.display()))?;
     image::codecs::hdr::HdrEncoder::new(std::io::BufWriter::new(file))
         .encode(&radiance, w, h)
