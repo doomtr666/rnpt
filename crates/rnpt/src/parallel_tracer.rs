@@ -7,9 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-const TILE_SIZE: usize = 128;
+/// Small tiles dealt round-robin to the threads, so every region of the image
+/// progresses at the same pace (NIRC: no region converges on a younger network).
+const TILE_SIZE: usize = 32;
 const BATCH_SIZE: u64 = 256;
-/// One out of every N rendered pixels triggers a dedicated MIS training path.
+/// On average one out of every N rendered pixels triggers a dedicated MIS training
+/// path; the pixel is drawn at random so the extra rays leave no pattern.
 const TRAIN_PIXEL_STRIDE: usize = 64;
 /// Workers refresh their cached NIRC network from the shared config this often (in pixels).
 const NIRC_REFRESH_STRIDE: usize = 512;
@@ -409,18 +412,8 @@ impl ParallelTracer {
             let blocks_x = (width + TILE_SIZE - 1) / TILE_SIZE;
             let blocks_y = (height + TILE_SIZE - 1) / TILE_SIZE;
             let total_blocks = blocks_x * blocks_y;
-            let base_count = total_blocks / num_threads;
-            let remainder = total_blocks % num_threads;
 
-            let (start_block, end_block) = if thread_idx < remainder {
-                let start = thread_idx * (base_count + 1);
-                (start, start + base_count + 1)
-            } else {
-                let start = remainder * (base_count + 1) + (thread_idx - remainder) * base_count;
-                (start, start + base_count)
-            };
-
-            'pass: for block_idx in start_block..end_block {
+            'pass: for block_idx in (thread_idx..total_blocks).step_by(num_threads) {
                 let bx = block_idx % blocks_x;
                 let by = block_idx / blocks_x;
 
@@ -491,9 +484,9 @@ impl ParallelTracer {
                         shadow_rays_traced += s;
                         rays_traced += 1;
 
-                        // Training: random pixel subset (pixel_count stride gives diversity).
-                        // Its rays are charged to the pixel: they are part of NIRC's cost.
-                        if is_nirc && pixel_count % TRAIN_PIXEL_STRIDE == 0 {
+                        // Training: random pixel subset. Its rays are charged to the pixel:
+                        // they are part of NIRC's cost.
+                        if is_nirc && train_rng.next_u32() % TRAIN_PIXEL_STRIDE as u32 == 0 {
                             let (mut tr, mut ts) = (0u64, 0u64);
                             let new_samples = tracer
                                 .collect_training_samples_for_pixel(x, y, &mut train_rng, &mut tr, &mut ts);
