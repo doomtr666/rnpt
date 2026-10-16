@@ -1,6 +1,6 @@
 //! imgcmp: compare renders against a reference, at equal cost.
 //!
-//!   imgcmp <reference.hdr> <render.hdr>... [--out DIR] [--bias-range R] [--bias-radius N]
+//!   imgcmp <reference.hdr> <render.hdr>... [--out DIR] [--bias-range R] [--bias-sigma S]
 //!
 //! For each render: RelMSE, global bias, efficiency (1 / (RelMSE x cost)), and
 //! two maps written as PNG: the relative error (log scale) and the local bias
@@ -121,34 +121,42 @@ fn error_map(img: &Image, reference: &Image) -> Vec<[u8; 3]> {
         .collect()
 }
 
-/// Signed relative luminance error, box-averaged over (2 radius + 1)^2 pixels
-/// with a summed-area table: noise averages out, systematic bias stays.
-fn bias_map(img: &Image, reference: &Image, radius: u32, range: f32) -> Vec<[u8; 3]> {
+/// Separable Gaussian blur of a w x h scalar field (edges clamped).
+fn gaussian_blur(field: &[f64], w: usize, h: usize, sigma: f64) -> Vec<f64> {
+    let r = (3.0 * sigma).ceil() as isize;
+    let kernel: Vec<f64> = (-r..=r).map(|i| (-(i * i) as f64 / (2.0 * sigma * sigma)).exp()).collect();
+    let norm: f64 = kernel.iter().sum();
+    let pass = |src: &[f64], horizontal: bool| -> Vec<f64> {
+        let mut dst = vec![0.0; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = 0.0;
+                for (k, wk) in kernel.iter().enumerate() {
+                    let o = k as isize - r;
+                    let (sx, sy) = if horizontal {
+                        ((x as isize + o).clamp(0, w as isize - 1) as usize, y)
+                    } else {
+                        (x, (y as isize + o).clamp(0, h as isize - 1) as usize)
+                    };
+                    acc += wk * src[sy * w + sx];
+                }
+                dst[y * w + x] = acc / norm;
+            }
+        }
+        dst
+    };
+    pass(&pass(field, true), false)
+}
+
+/// Signed relative luminance error, averaged with a Gaussian of `sigma` pixels:
+/// noise averages out, systematic bias stays. Gaussian rather than a box, so
+/// the map has no square artifacts (a box turns every outlier into a square).
+fn bias_map(img: &Image, reference: &Image, sigma: f32, range: f32) -> Vec<[u8; 3]> {
     let (w, h) = (img.w as usize, img.h as usize);
-    let mut d_sum = vec![0.0f64; (w + 1) * (h + 1)];
-    let mut r_sum = vec![0.0f64; (w + 1) * (h + 1)];
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            let (lx, lr) = (luminance(img.rgb[i]) as f64, luminance(reference.rgb[i]) as f64);
-            let at = |yy: usize, xx: usize| yy * (w + 1) + xx;
-            d_sum[at(y + 1, x + 1)] = (lx - lr) + d_sum[at(y, x + 1)] + d_sum[at(y + 1, x)] - d_sum[at(y, x)];
-            r_sum[at(y + 1, x + 1)] = lr + r_sum[at(y, x + 1)] + r_sum[at(y + 1, x)] - r_sum[at(y, x)];
-        }
-    }
-    let rad = radius as usize;
-    let mut out = Vec::with_capacity(w * h);
-    for y in 0..h {
-        for x in 0..w {
-            let (x0, y0) = (x.saturating_sub(rad), y.saturating_sub(rad));
-            let (x1, y1) = ((x + rad + 1).min(w), (y + rad + 1).min(h));
-            let area = |s: &[f64]| s[y1 * (w + 1) + x1] - s[y0 * (w + 1) + x1] - s[y1 * (w + 1) + x0] + s[y0 * (w + 1) + x0];
-            let n = ((x1 - x0) * (y1 - y0)) as f64;
-            let rel = area(&d_sum) / (area(&r_sum) + REL_EPS as f64 * n);
-            out.push(diverging(rel as f32 / range));
-        }
-    }
-    out
+    let diff: Vec<f64> = img.rgb.iter().zip(&reference.rgb).map(|(x, r)| (luminance(*x) - luminance(*r)) as f64).collect();
+    let refl: Vec<f64> = reference.rgb.iter().map(|r| luminance(*r) as f64).collect();
+    let (diff, refl) = (gaussian_blur(&diff, w, h, sigma as f64), gaussian_blur(&refl, w, h, sigma as f64));
+    diff.iter().zip(&refl).map(|(d, r)| diverging((d / (r + REL_EPS as f64)) as f32 / range)).collect()
 }
 
 fn main() {
@@ -162,18 +170,18 @@ fn run() -> Result<(), String> {
     let mut paths: Vec<PathBuf> = vec![];
     let mut out_dir: Option<PathBuf> = None;
     let mut bias_range = 0.1f32;
-    let mut bias_radius = 8u32;
+    let mut bias_sigma = 6.0f32;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--out" => out_dir = Some(args.next().ok_or("--out needs a directory")?.into()),
             "--bias-range" => bias_range = args.next().and_then(|v| v.parse().ok()).ok_or("bad --bias-range")?,
-            "--bias-radius" => bias_radius = args.next().and_then(|v| v.parse().ok()).ok_or("bad --bias-radius")?,
+            "--bias-sigma" => bias_sigma = args.next().and_then(|v| v.parse().ok()).ok_or("bad --bias-sigma")?,
             _ => paths.push(a.into()),
         }
     }
     if paths.len() < 2 {
-        return Err("usage: imgcmp <reference.hdr> <render.hdr>... [--out DIR] [--bias-range R] [--bias-radius N]".into());
+        return Err("usage: imgcmp <reference.hdr> <render.hdr>... [--out DIR] [--bias-range R] [--bias-sigma S]".into());
     }
 
     let reference = load(&paths[0])?;
@@ -221,14 +229,13 @@ fn run() -> Result<(), String> {
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let stem = name.strip_suffix(".hdr").unwrap_or(&name);
         save_png(&dir.join(format!("{stem}.relerr.png")), img.w, img.h, &error_map(&img, &reference))?;
-        save_png(&dir.join(format!("{stem}.bias.png")), img.w, img.h, &bias_map(&img, &reference, bias_radius, bias_range))?;
+        save_png(&dir.join(format!("{stem}.bias.png")), img.w, img.h, &bias_map(&img, &reference, bias_sigma, bias_range))?;
     }
 
     println!(
         "\nmaps: <render>.relerr.png = per-pixel RelMSE, log scale 1e-4 (black) .. 1 (white)\n      \
-         <render>.bias.png = local relative bias over {}x{} px, blue -{:.0}% .. white 0 .. red +{:.0}%",
-        2 * bias_radius + 1,
-        2 * bias_radius + 1,
+         <render>.bias.png = local relative bias (Gaussian, sigma {} px), blue -{:.0}% .. white 0 .. red +{:.0}%",
+        bias_sigma,
         bias_range * 100.0,
         bias_range * 100.0
     );
