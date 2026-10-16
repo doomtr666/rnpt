@@ -18,19 +18,17 @@ pub fn show(app: &mut RnptGuiApp, ctx: &egui::Context) -> NavInput {
         let available = ui.available_size();
 
         if let Some(ref texture) = app.texture_handle {
-            let size = texture.size_vec2();
-            let aspect = size.x / size.y;
-            let desired = if available.x / available.y > aspect {
-                egui::vec2(available.y * aspect, available.y)
-            } else {
-                egui::vec2(available.x, available.x / aspect)
-            };
-            let rect = egui::Rect::from_min_size(
-                ui.min_rect().min + (available - desired) * 0.5,
-                desired,
-            );
+            // One render pixel per screen pixel (egui sizes are in points, scaled by the
+            // OS display scaling), shrunk only when the render does not fit: any other
+            // scale, or an origin off the pixel grid, blurs the image.
+            let ppp = ctx.pixels_per_point();
+            let native = texture.size_vec2() / ppp;
+            let scale = (available.x / native.x).min(available.y / native.y).min(1.0);
+            let desired = native * scale;
+            let min = ui.min_rect().min + (available - desired) * 0.5;
+            let min = egui::pos2((min.x * ppp).round() / ppp, (min.y * ppp).round() / ppp);
+            let rect = egui::Rect::from_min_size(min, desired);
 
-            // Scale to the fitted rect: a fixed-size render may be larger than the viewport.
             ui.put(rect, egui::Image::new(texture).fit_to_exact_size(desired));
 
             let ctrl_held = ctx.input(|i| i.modifiers.ctrl);

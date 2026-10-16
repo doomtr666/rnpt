@@ -465,8 +465,10 @@ impl eframe::App for RnptGuiApp {
                 i.viewport().inner_rect.map(|r| [r.width(), r.height()])
             }) {
                 // Subtract the side panel width (approximate — egui reports final layout next frame).
-                let w = (size[0] - 270.0).max(64.0) as usize;
-                let h = size[1].max(64.0) as usize;
+                // Render in physical pixels, not points, so the image is shown 1:1.
+                let ppp = ctx.pixels_per_point();
+                let w = ((size[0] - 270.0) * ppp).max(64.0) as usize;
+                let h = (size[1] * ppp).max(64.0) as usize;
                 if w != self.resolution[0] || h != self.resolution[1] {
                     self.resolution = [w, h];
                     self.resize_timeout =
