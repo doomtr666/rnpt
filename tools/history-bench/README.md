@@ -9,6 +9,7 @@ cd tools/history-bench
 cargo run --release -- run        # prepare inputs, measure what is missing, write the report
 cargo run --release -- report     # rebuild the report from cached results only
 cargo run --release -- list       # commits that would be measured
+cargo run --release -- run --branch bvh-history   # another branch's history, results apart
 ```
 
 Results land in `results/<cpu>/<mode>/`: one JSON file per commit, plus `REPORT.md` and

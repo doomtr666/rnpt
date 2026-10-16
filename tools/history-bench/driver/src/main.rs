@@ -23,6 +23,8 @@ options:
   --scenes a,b   scenes to use (default: all available, without the 10M ones)
   --big          also use the 10M-triangle scenes
   --commits a,b  commits to measure (default: every commit touching the BVH)
+  --branch B     measure the history of branch B instead of the current one;
+                 results go to results/<cpu>/<mode>-<B>
   --mode M       own: each commit's own build config (default)
                  head: today's profile and -C target-cpu=native for all
   --passes N     timed passes per measurement (default 9)
@@ -74,11 +76,21 @@ pub struct Ctx {
     pub rustc: String,
     pub machine: String,
     pub force: bool,
+    /// Branch whose history is measured (default: the current one).
+    pub branch: Option<String>,
 }
 
 impl Ctx {
     pub fn results_dir(&self) -> PathBuf {
-        self.tool_dir.join("results").join(&self.machine).join(self.mode.name())
+        let dir = self.tool_dir.join("results").join(&self.machine);
+        match &self.branch {
+            Some(b) => dir.join(format!("{}-{}", self.mode.name(), b.replace('/', "-"))),
+            None => dir.join(self.mode.name()),
+        }
+    }
+
+    pub fn rev(&self) -> &str {
+        self.branch.as_deref().unwrap_or("HEAD")
     }
 
     /// A cargo invocation isolated from the environment this tool runs in.
@@ -121,8 +133,8 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// Commits in chronological order, optionally restricted to `paths`.
-pub fn commit_log(repo: &Path, paths: &[&str]) -> Result<Vec<CommitInfo>, String> {
-    let mut args = vec!["log", "--reverse", "--date=short", "--format=%H%x09%h%x09%ad%x09%s"];
+pub fn commit_log(repo: &Path, rev: &str, paths: &[&str]) -> Result<Vec<CommitInfo>, String> {
+    let mut args = vec!["log", "--reverse", "--date=short", "--format=%H%x09%h%x09%ad%x09%s", rev];
     if !paths.is_empty() {
         args.push("--");
         args.extend(paths);
@@ -149,9 +161,9 @@ fn has_bvh(repo: &Path, hash: &str) -> bool {
 
 fn select_commits(ctx: &Ctx, wanted: &Option<Vec<String>>) -> Result<Vec<CommitInfo>, String> {
     match wanted {
-        None => Ok(commit_log(&ctx.repo, BVH_PATHS)?.into_iter().filter(|c| has_bvh(&ctx.repo, &c.hash)).collect()),
+        None => Ok(commit_log(&ctx.repo, ctx.rev(), BVH_PATHS)?.into_iter().filter(|c| has_bvh(&ctx.repo, &c.hash)).collect()),
         Some(list) => {
-            let all = commit_log(&ctx.repo, &[])?;
+            let all = commit_log(&ctx.repo, ctx.rev(), &[])?;
             list.iter()
                 .map(|w| {
                     let full = git(&ctx.repo, &["rev-parse", &format!("{w}^{{commit}}")])?.trim().to_string();
@@ -227,6 +239,7 @@ fn real_main() -> Result<(), String> {
         rustc: String::new(),
         machine: slug(&cpu_brand()),
         force: false,
+        branch: None,
     };
     let mut scene_names: Option<Vec<String>> = None;
     let mut commits: Option<Vec<String>> = None;
@@ -240,6 +253,7 @@ fn real_main() -> Result<(), String> {
             "--commits" => commits = Some(list(val()?)),
             "--big" => big = true,
             "--force" => ctx.force = true,
+            "--branch" => ctx.branch = Some(val()?),
             "--mode" => {
                 ctx.mode = match val()?.as_str() {
                     "own" => Mode::Own,

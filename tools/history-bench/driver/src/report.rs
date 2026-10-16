@@ -9,7 +9,7 @@ use crate::{commit_log, Ctx};
 
 pub fn write(ctx: &Ctx) -> Result<(), String> {
     let dir = ctx.results_dir();
-    let order: Vec<String> = commit_log(&ctx.repo, &[])?.into_iter().map(|c| c.hash).collect();
+    let order: Vec<String> = commit_log(&ctx.repo, ctx.rev(), &[])?.into_iter().map(|c| c.hash).collect();
 
     let mut all: Vec<CommitResults> = fs::read_dir(&dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
