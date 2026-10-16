@@ -11,9 +11,6 @@ pub fn show(app: &mut RnptGuiApp, ui: &mut egui::Ui) {
         ui.label(format!("Loss (ema): {:.5}", app.loss_ema));
         ui.label(format!("Loss (raw): {:.5}", app.last_loss));
     }
-    if app.rel_error > 0.0 {
-        ui.label(format!("RelMean: {:.2}%", app.rel_error * 100.0));
-    }
 
     ui.add_space(4.0);
     ui.collapsing("Directional probe", |ui| {

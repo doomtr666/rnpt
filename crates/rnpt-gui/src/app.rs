@@ -56,7 +56,6 @@ pub struct RnptGuiApp {
     pub frame_count: u64,
     pub last_loss: f32,
     pub loss_ema: f32,
-    pub rel_error: f32,
 
     pub probe_texture: Option<egui::TextureHandle>,
 
@@ -196,7 +195,6 @@ impl RnptGuiApp {
             frame_count: 0,
             last_loss: 0.0,
             loss_ema: 0.0,
-            rel_error: 0.0,
             probe_texture: None,
             render_start: Instant::now(),
             render_time: None,
@@ -241,7 +239,6 @@ impl RnptGuiApp {
         self.frame_count = 0;
         self.last_loss = 0.0;
         self.loss_ema = 0.0;
-        self.rel_error = 0.0;
         self.render_start = Instant::now();
         self.render_time = None;
         self.rays_since_last_fps = 0;
@@ -336,13 +333,6 @@ impl eframe::App for RnptGuiApp {
                     loss
                 } else {
                     self.loss_ema * 0.95 + loss * 0.05
-                };
-            }
-            if let Some(rel) = tracer.nirc_rel_error() {
-                self.rel_error = if self.rel_error == 0.0 {
-                    rel
-                } else {
-                    self.rel_error * 0.95 + rel * 0.05
                 };
             }
 
