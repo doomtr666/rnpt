@@ -28,6 +28,7 @@ pub fn current_settings(app: &RnptGuiApp) -> RenderSettings {
         env,
         exposure: app.exposure,
         tonemapper: render_io::tonemapper_name(app.tonemapper).into(),
+        indirect_only: app.indirect_only,
     }
 }
 

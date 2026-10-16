@@ -58,6 +58,7 @@ fn render_with_budget(strategy: SamplingStrategy) -> (Vec<Pixel>, usize) {
         strategy,
         nirc_network: None,
         budget: RenderBudget { rays_per_pixel: BUDGET, samples_per_pixel: 0 },
+        indirect_only: false,
     };
 
     let tracer = ParallelTracer::new(config.clone());

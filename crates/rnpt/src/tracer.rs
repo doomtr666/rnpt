@@ -81,6 +81,9 @@ pub struct PathTracerConfig {
     /// Active network for NIRC inference.
     pub nirc_network: Option<Arc<crate::nirc::NircMlp>>,
     pub budget: RenderBudget,
+    /// Keep only indirect light (2+ diffuse/glossy bounces), to judge how a
+    /// strategy handles it without the direct light dominating the image.
+    pub indirect_only: bool,
 }
 
 /// No hard path-length cap: paths terminate via Russian roulette only (PBRT
@@ -288,18 +291,23 @@ impl PathTracer {
         // Solid-angle pdf of the BRDF bounce that reached the current vertex
         // (0 for the camera ray) — needed for the MIS weight on emitter hits.
         let mut bsdf_pdf = 0.0f32;
+        // Diffuse/glossy bounces so far (glass does not count): light reaching
+        // the camera after 0 or 1 of them is direct, after 2 or more indirect.
+        let mut scatters = 0u32;
 
         for bounce in 0..max_depth {
             *rays += 1;
             let Some(hit) = self.config.bvh.intersect(&ray) else {
-                self.handle_environment_hit(
-                    &ray,
-                    bounce,
-                    bsdf_pdf,
-                    &throughput,
-                    &mut accumulated_radiance,
-                    strategy,
-                );
+                if self.shows(scatters) {
+                    self.handle_environment_hit(
+                        &ray,
+                        bounce,
+                        bsdf_pdf,
+                        &throughput,
+                        &mut accumulated_radiance,
+                        strategy,
+                    );
+                }
                 break;
             };
 
@@ -337,15 +345,22 @@ impl PathTracer {
             // rather than inside handle_opaque_bounce so that function stays
             // strategy-agnostic beyond bounce 0.
             if strategy == SamplingStrategy::Nirc && bounce == 1 {
-                let emission = if surf.emissive != Color::zeros() {
+                // In indirect-only mode the network term is always kept: it is
+                // indirect light, except after glass at bounce 0 (scatters == 0),
+                // where it also carries this vertex's direct light.
+                let emission = if surf.emissive != Color::zeros() && self.shows(scatters) {
                     surf.emissive * self.mis_area_weight(&surf, &hit, &wo, bsdf_pdf)
                 } else {
                     Color::black()
                 };
-                let direct = self.compute_direct_lighting(
-                    &surf.position, &surf.normal, &brdf, &wo,
-                    shadow_rays, rng, SamplingStrategy::Mis,
-                );
+                let direct = if self.shows(scatters + 1) {
+                    self.compute_direct_lighting(
+                        &surf.position, &surf.normal, &brdf, &wo,
+                        shadow_rays, rng, SamplingStrategy::Mis,
+                    )
+                } else {
+                    Color::black()
+                };
                 let nirc = self.sample_nirc_indirect(&surf, &brdf, &wo, rng);
                 accumulated_radiance += throughput.component_mul(&(emission + direct + nirc));
                 break;
@@ -362,14 +377,23 @@ impl PathTracer {
                 &mut ray,
                 shadow_rays,
                 bounce,
+                scatters,
                 rng,
                 strategy,
             ) {
                 break;
             }
+            scatters += 1;
         }
 
         accumulated_radiance
+    }
+
+    /// Whether light that reached the camera after `scatters` diffuse/glossy
+    /// bounces is part of the image (everything, or indirect light only).
+    #[inline(always)]
+    fn shows(&self, scatters: u32) -> bool {
+        !self.config.indirect_only || scatters >= 2
     }
 
     /// Traces a full MIS path from pixel (x, y) and returns one training sample per
@@ -630,10 +654,11 @@ impl PathTracer {
         ray: &mut Ray,
         shadow_rays: &mut u64,
         bounce: u32,
+        scatters: u32,
         rng: &mut Pcg32,
         strategy: SamplingStrategy,
     ) -> bool {
-        let emission = if surf.emissive != Color::zeros() {
+        let emission = if surf.emissive != Color::zeros() && self.shows(scatters) {
             let emit_w = match strategy {
                 SamplingStrategy::BrdfOnly | SamplingStrategy::DirectOnly => 1.0,
                 SamplingStrategy::NeeOnly => {
@@ -659,15 +684,20 @@ impl PathTracer {
         } else {
             strategy
         };
-        let direct = self.compute_direct_lighting(
-            &surf.position,
-            &surf.normal,
-            brdf,
-            wo,
-            shadow_rays,
-            rng,
-            effective_strategy,
-        );
+        // NEE light scatters once more, here, before reaching the camera.
+        let direct = if self.shows(scatters + 1) {
+            self.compute_direct_lighting(
+                &surf.position,
+                &surf.normal,
+                brdf,
+                wo,
+                shadow_rays,
+                rng,
+                effective_strategy,
+            )
+        } else {
+            Color::black()
+        };
 
         *accumulated_radiance += throughput.component_mul(&(emission + direct));
 

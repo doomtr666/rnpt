@@ -15,6 +15,9 @@ pub fn show(app: &mut RnptGuiApp, ui: &mut egui::Ui) {
     if app.strategy != prev {
         app.trigger_reset();
     }
+    if ui.checkbox(&mut app.indirect_only, "Indirect light only").changed() {
+        app.trigger_reset();
+    }
 
     // Stop each pixel after a fixed cost, to compare strategies at equal work
     // rather than equal time. 0 = unlimited.

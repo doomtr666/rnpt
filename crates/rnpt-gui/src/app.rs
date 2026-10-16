@@ -38,6 +38,8 @@ pub struct RnptGuiApp {
     pub strategy: rnpt::SamplingStrategy,
     /// Per-pixel stop condition, for comparisons at equal cost.
     pub budget: rnpt::RenderBudget,
+    /// Show only indirect light (2+ diffuse/glossy bounces).
+    pub indirect_only: bool,
     pub selected_camera_index: usize,
 
     pub hdr_files: Vec<std::path::PathBuf>,
@@ -151,6 +153,7 @@ impl RnptGuiApp {
             strategy,
             nirc_network: None,
             budget: rnpt::RenderBudget::default(),
+            indirect_only: false,
         };
 
         Self {
@@ -181,6 +184,7 @@ impl RnptGuiApp {
             resize_timeout: None,
             strategy,
             budget: rnpt::RenderBudget::default(),
+            indirect_only: false,
             selected_camera_index: 0,
             hdr_files: crate::asset_importer::list_hdris("assets"),
             selected_env: 0,
@@ -229,6 +233,7 @@ impl RnptGuiApp {
             strategy: self.strategy,
             nirc_network: None,
             budget: self.budget,
+            indirect_only: self.indirect_only,
         };
 
         self.tracer = None;

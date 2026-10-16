@@ -3,7 +3,7 @@
 //!   rnpt-render --settings renders/<render>.json [overrides]
 //!   rnpt-render --scene assets/cornell.glb [--env assets/sky.hdr] [overrides]
 //!
-//! Overrides: --strategy S, --rays N, --spp N, --seconds T, --size WxH, --out DIR.
+//! Overrides: --strategy S, --indirect, --rays N, --spp N, --seconds T, --size WxH, --out DIR.
 //! Stops when every pixel spent its budget (--rays / --spp), or after --seconds.
 //! Writes <out>/<name>.png, .hdr and .json like the GUI's "Save image", with
 //! timing details in the .json to tell rendering, training and waiting apart.
@@ -20,6 +20,7 @@ usage: rnpt-render (--settings <render>.json | --scene <file.glb>) [options]
   --scene F           scene to render (first camera of the scene, or default)
   --env F             environment map (.hdr); --env-intensity X, --env-rotation DEG
   --strategy S        nirc, mis, nee, brdf, direct
+  --indirect          keep only indirect light (2+ diffuse/glossy bounces)
   --rays N            budget in rays per pixel
   --spp N             budget in samples per pixel
   --seconds T         stop after T seconds (equal-time comparisons)
@@ -52,6 +53,7 @@ fn settings_from_scene(scene: &str) -> Result<RenderSettings, String> {
         env: None,
         exposure: 1.0,
         tonemapper: "aces".into(),
+        indirect_only: false,
     })
 }
 
@@ -90,6 +92,9 @@ fn run() -> Result<(), String> {
         settings.width = w.parse().map_err(|_| "bad --size")?;
         settings.height = h.parse().map_err(|_| "bad --size")?;
     }
+    if args.iter().any(|a| a == "--indirect") {
+        settings.indirect_only = true;
+    }
     let max_seconds = parsed("--seconds")?;
     let out = PathBuf::from(value("--out").unwrap_or("renders"));
     if settings.rays_per_pixel == 0 && settings.samples_per_pixel == 0 && max_seconds.is_none() {
@@ -97,9 +102,10 @@ fn run() -> Result<(), String> {
     }
 
     eprintln!(
-        "{} | {} | {}x{} | budget {} rays/px, {} spp{}",
+        "{} | {}{} | {}x{} | budget {} rays/px, {} spp{}",
         settings.scene,
         settings.strategy,
+        if settings.indirect_only { " (indirect only)" } else { "" },
         settings.width,
         settings.height,
         settings.rays_per_pixel,

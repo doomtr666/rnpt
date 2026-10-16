@@ -37,6 +37,9 @@ pub struct RenderSettings {
     pub env: Option<EnvSettings>,
     pub exposure: f32,
     pub tonemapper: String,
+    /// Absent from settings saved before the option existed.
+    #[serde(default)]
+    pub indirect_only: bool,
 }
 
 /// What a finished render measured, saved alongside its settings.
@@ -156,6 +159,7 @@ pub fn load_config(settings: &RenderSettings) -> Result<rnpt::PathTracerConfig, 
             rays_per_pixel: settings.rays_per_pixel,
             samples_per_pixel: settings.samples_per_pixel,
         },
+        indirect_only: settings.indirect_only,
     })
 }
 
@@ -184,8 +188,9 @@ pub fn save_render(
 
     let scene = Path::new(&settings.scene).file_stem().map_or("scene".into(), |s| s.to_string_lossy().into_owned());
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let indirect = if settings.indirect_only { "-indirect" } else { "" };
     let stem = format!(
-        "{scene}_{}_{:.0}rpp_{:.1}spp_{:.2}s_{stamp}",
+        "{scene}_{}{indirect}_{:.0}rpp_{:.1}spp_{:.2}s_{stamp}",
         settings.strategy, stats.rays_per_pixel, stats.samples_per_pixel, stats.seconds
     );
     // The stem contains dots (e.g. "12.34s"): append extensions, never with_extension.
