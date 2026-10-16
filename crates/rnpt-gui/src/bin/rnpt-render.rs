@@ -118,31 +118,30 @@ fn run() -> Result<(), String> {
     let tracer = rnpt::ParallelTracer::new(config);
     let mut pixels = vec![rnpt::Pixel::default(); settings.width * settings.height];
     let (mut paths, mut rays) = (0u64, 0u64);
+    let num_pixels = pixels.len() as u64;
     let start = Instant::now();
     let mut last_report = start;
-    loop {
+    // Poll every millisecond so the measured time ends when the render does.
+    let seconds = loop {
         // Drive NIRC training like the GUI's frame loop does (no-op otherwise).
         tracer.train_nirc();
         std::thread::sleep(Duration::from_millis(1));
 
         let now = Instant::now();
-        let timed_out = max_seconds.is_some_and(|s| (now - start).as_secs_f64() >= s);
-        if now - last_report < Duration::from_millis(250) && !timed_out {
-            continue;
+        let elapsed = (now - start).as_secs_f64();
+        let done = !budget.is_unlimited() && tracer.pixels_done() >= num_pixels;
+        if done || max_seconds.is_some_and(|s| elapsed >= s) {
+            break elapsed;
         }
-        last_report = now;
-        tracer.fetch_pixels(&mut pixels);
-        paths += tracer.pop_rays_traced();
-        rays += tracer.pop_real_rays_traced() + tracer.pop_shadow_rays_traced();
-
-        let done = !budget.is_unlimited() && pixels.iter().all(|p| budget.is_exhausted(p));
-        let (rpp, spp) = render_io::pixel_averages(&pixels);
-        eprint!("\r  {:6.1} s  {:8.1} rays/px  {:7.1} spp   ", (now - start).as_secs_f64(), rpp, spp);
-        if done || timed_out {
-            break;
+        if now - last_report >= Duration::from_millis(250) {
+            last_report = now;
+            tracer.fetch_pixels(&mut pixels);
+            paths += tracer.pop_rays_traced();
+            rays += tracer.pop_real_rays_traced() + tracer.pop_shadow_rays_traced();
+            let (rpp, spp) = render_io::pixel_averages(&pixels);
+            eprint!("\r  {elapsed:6.1} s  {rpp:8.1} rays/px  {spp:7.1} spp   ");
         }
-    }
-    let seconds = start.elapsed().as_secs_f64();
+    };
     tracer.fetch_pixels(&mut pixels);
     paths += tracer.pop_rays_traced();
     rays += tracer.pop_real_rays_traced() + tracer.pop_shadow_rays_traced();

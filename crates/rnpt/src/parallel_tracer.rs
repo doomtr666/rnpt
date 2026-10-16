@@ -81,6 +81,8 @@ pub struct ParallelTracer {
     train_ns: AtomicU64,
     pacing_wait_ns: Arc<AtomicU64>,
     num_threads: usize,
+    /// Pixels that have spent their budget.
+    pixels_done: Arc<AtomicU64>,
     nirc_trainer: Mutex<NircTrainer>,
     /// Lock-free ring buffer: workers push training samples, trainer reads random batches.
     nirc_ring: Arc<NircRingBuffer>,
@@ -108,6 +110,7 @@ impl ParallelTracer {
         let nirc_rays = Arc::new(AtomicU64::new(0));
         let nirc_steps = Arc::new(AtomicU64::new(0));
         let pacing_wait_ns = Arc::new(AtomicU64::new(0));
+        let pixels_done = Arc::new(AtomicU64::new(0));
 
         let num_threads = thread::available_parallelism()
             .map(|n| n.get())
@@ -127,6 +130,7 @@ impl ParallelTracer {
             let nirc_rays_atomic = nirc_rays.clone();
             let nirc_steps_atomic = nirc_steps.clone();
             let pacing_wait_atomic = pacing_wait_ns.clone();
+            let pixels_done_atomic = pixels_done.clone();
 
             threads.push(
                 thread::Builder::new()
@@ -148,6 +152,7 @@ impl ParallelTracer {
                             nirc_rays_atomic,
                             nirc_steps_atomic,
                             pacing_wait_atomic,
+                            pixels_done_atomic,
                         )
                     })
                     .expect("Failed to spawn worker thread"),
@@ -169,6 +174,7 @@ impl ParallelTracer {
             train_ns: AtomicU64::new(0),
             pacing_wait_ns,
             num_threads,
+            pixels_done,
             nirc_trainer: Mutex::new(NircTrainer::new(NircConfig::default())),
             nirc_ring,
         }
@@ -244,6 +250,11 @@ impl ParallelTracer {
         self.nirc_ring.filled()
     }
 
+
+    /// Pixels that have spent their budget: cheap to poll, unlike fetching the image.
+    pub fn pixels_done(&self) -> u64 {
+        self.pixels_done.load(Ordering::Relaxed)
+    }
 
     /// Where the time goes, for diagnosing NIRC's cost.
     pub fn timing(&self) -> TracerTiming {
@@ -331,6 +342,7 @@ impl ParallelTracer {
         nirc_rays_atomic: Arc<AtomicU64>,
         nirc_steps_atomic: Arc<AtomicU64>,
         pacing_wait_atomic: Arc<AtomicU64>,
+        pixels_done_atomic: Arc<AtomicU64>,
     ) {
         let mut local_epoch = 0u32;
         let mut local_nirc_epoch = u32::MAX; // force first refresh
@@ -461,6 +473,10 @@ impl ParallelTracer {
                             pixel.rays += tr + ts;
                             real_rays_traced += tr;
                             shadow_rays_traced += ts;
+                        }
+                        // Exhausted pixels are skipped above, so this counts each pixel once.
+                        if budget.is_exhausted(pixel) {
+                            pixels_done_atomic.fetch_add(1, Ordering::Relaxed);
                         }
                     }
 

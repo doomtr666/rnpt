@@ -1,6 +1,6 @@
 //! imgcmp: compare renders against a reference, at equal cost.
 //!
-//!   imgcmp <reference.hdr> <render.hdr>... [--out DIR] [--bias-range R] [--bias-sigma S]
+//!   imgcmp <reference.hdr> <render.hdr>... [--out DIR] [--json FILE] [--bias-range R] [--bias-sigma S]
 //!
 //! For each render: RelMSE, global bias, efficiency (1 / (RelMSE x cost)), and
 //! two maps written as PNG: the relative error (log scale) and the local bias
@@ -169,19 +169,21 @@ fn main() {
 fn run() -> Result<(), String> {
     let mut paths: Vec<PathBuf> = vec![];
     let mut out_dir: Option<PathBuf> = None;
+    let mut json_path: Option<PathBuf> = None;
     let mut bias_range = 0.1f32;
     let mut bias_sigma = 6.0f32;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--out" => out_dir = Some(args.next().ok_or("--out needs a directory")?.into()),
+            "--json" => json_path = Some(args.next().ok_or("--json needs a file")?.into()),
             "--bias-range" => bias_range = args.next().and_then(|v| v.parse().ok()).ok_or("bad --bias-range")?,
             "--bias-sigma" => bias_sigma = args.next().and_then(|v| v.parse().ok()).ok_or("bad --bias-sigma")?,
             _ => paths.push(a.into()),
         }
     }
     if paths.len() < 2 {
-        return Err("usage: imgcmp <reference.hdr> <render.hdr>... [--out DIR] [--bias-range R] [--bias-sigma S]".into());
+        return Err("usage: imgcmp <reference.hdr> <render.hdr>... [--out DIR] [--json FILE] [--bias-range R] [--bias-sigma S]".into());
     }
 
     let reference = load(&paths[0])?;
@@ -192,6 +194,7 @@ fn run() -> Result<(), String> {
     );
 
     let mut base_eff: Option<(Option<f64>, Option<f64>)> = None;
+    let mut rows = vec![];
     for path in &paths[1..] {
         let img = load(path)?;
         if (img.w, img.h) != (reference.w, reference.h) {
@@ -228,8 +231,34 @@ fn run() -> Result<(), String> {
         let dir = out_dir.clone().unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_default());
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let stem = name.strip_suffix(".hdr").unwrap_or(&name);
-        save_png(&dir.join(format!("{stem}.relerr.png")), img.w, img.h, &error_map(&img, &reference))?;
-        save_png(&dir.join(format!("{stem}.bias.png")), img.w, img.h, &bias_map(&img, &reference, bias_sigma, bias_range))?;
+        let relerr_png = dir.join(format!("{stem}.relerr.png"));
+        let bias_png = dir.join(format!("{stem}.bias.png"));
+        save_png(&relerr_png, img.w, img.h, &error_map(&img, &reference))?;
+        save_png(&bias_png, img.w, img.h, &bias_map(&img, &reference, bias_sigma, bias_range))?;
+
+        let ratio = |e: Option<f64>, b: Option<f64>| e.zip(b).map(|(e, b)| e / b);
+        rows.push(serde_json::json!({
+            "render": path,
+            "rays_per_pixel": cost.rpp,
+            "samples_per_pixel": cost.spp,
+            "seconds": cost.seconds,
+            "rel_mse": m.rel_mse,
+            "bias": m.bias,
+            "efficiency_per_ray": ratio(eff_ray, b_ray),
+            "efficiency_per_second": ratio(eff_s, b_s),
+            "relerr_map": relerr_png,
+            "bias_map": bias_png,
+        }));
+    }
+
+    if let Some(path) = json_path {
+        let doc = serde_json::json!({
+            "reference": paths[0],
+            "bias_sigma_px": bias_sigma,
+            "bias_range": bias_range,
+            "renders": rows,
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).map_err(|e| format!("{}: {e}", path.display()))?;
     }
 
     println!(
