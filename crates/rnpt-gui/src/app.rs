@@ -62,8 +62,10 @@ pub struct RnptGuiApp {
     pub probe_texture: Option<egui::TextureHandle>,
     /// Pixel (render coordinates) the probe looks at, set by Ctrl+click.
     pub probe_pixel: Option<(f32, f32)>,
-    /// Direction toward the camera in probe disk coordinates.
-    pub probe_camera: Option<[f32; 2]>,
+    /// Where the surface normal points on the probe ball.
+    pub probe_normal: Option<[f32; 2]>,
+    /// Show the far half of the probe ball.
+    pub probe_back: bool,
     pub probe_steps: u64,
     pub probe_gain: f32,
     pub probe_updated: Instant,
@@ -208,7 +210,8 @@ impl RnptGuiApp {
             loss_ema: 0.0,
             probe_texture: None,
             probe_pixel: None,
-            probe_camera: None,
+            probe_normal: None,
+            probe_back: false,
             probe_steps: 0,
             probe_gain: 1.0,
             probe_updated: Instant::now(),
@@ -296,18 +299,22 @@ impl RnptGuiApp {
     pub(crate) fn update_probe(&mut self, ctx: &egui::Context) {
         const SIZE: usize = 128;
         let (Some(tracer), Some((px, py))) = (&self.tracer, self.probe_pixel) else { return };
-        let Some(probe) = tracer.render_nirc_probe(px, py, SIZE) else { return };
-        self.probe_camera = probe.camera;
+        let Some(probe) = tracer.render_nirc_probe(px, py, SIZE, self.probe_back) else { return };
+        self.probe_normal = probe.normal;
         self.probe_steps = tracer.timing().nirc_steps;
         self.probe_updated = Instant::now();
 
         let exposure = self.exposure * self.probe_gain;
         let tonemapper = self.tonemapper;
         let raw: Vec<u8> = probe
-            .radiance
+            .pixels
             .iter()
             .flat_map(|px| {
-                let Some([r, g, b]) = *px else { return [0u8, 0, 0, 0] };
+                let [r, g, b] = match *px {
+                    rnpt::ProbePixel::Outside => return [0u8, 0, 0, 0],
+                    rnpt::ProbePixel::Below => return [45u8, 45, 45, 255],
+                    rnpt::ProbePixel::Radiance(rgb) => rgb,
+                };
                 let tonemap = |v: f32| -> u8 {
                     let v = v * exposure;
                     let v = match tonemapper {
