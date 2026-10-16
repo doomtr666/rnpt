@@ -63,6 +63,16 @@ pub fn show(app: &mut RnptGuiApp, ctx: &egui::Context) -> NavInput {
                 }
             }
 
+            // Mark the probed pixel.
+            if let Some((px, py)) = app.probe_pixel {
+                let p = rect.min
+                    + egui::vec2(px / app.local_width as f32 * rect.width(), py / app.local_height as f32 * rect.height());
+                let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 200, 0));
+                ui.painter().circle_stroke(p, 6.0, stroke);
+                ui.painter().line_segment([p - egui::vec2(10.0, 0.0), p + egui::vec2(10.0, 0.0)], stroke);
+                ui.painter().line_segment([p - egui::vec2(0.0, 10.0), p + egui::vec2(0.0, 10.0)], stroke);
+            }
+
             // Ctrl+click: place a directional NIRC probe at the clicked surface point.
             if ctrl_held
                 && ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary))
@@ -73,7 +83,8 @@ pub fn show(app: &mut RnptGuiApp, ctx: &egui::Context) -> NavInput {
                             * app.local_width as f32;
                         let py = (screen_pos.y - rect.min.y) / rect.height()
                             * app.local_height as f32;
-                        app.update_probe(ctx, px, py);
+                        app.probe_pixel = Some((px, py));
+                        app.update_probe(ctx);
                     }
                 }
             }

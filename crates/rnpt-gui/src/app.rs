@@ -60,6 +60,13 @@ pub struct RnptGuiApp {
     pub loss_ema: f32,
 
     pub probe_texture: Option<egui::TextureHandle>,
+    /// Pixel (render coordinates) the probe looks at, set by Ctrl+click.
+    pub probe_pixel: Option<(f32, f32)>,
+    /// Direction toward the camera in probe disk coordinates.
+    pub probe_camera: Option<[f32; 2]>,
+    pub probe_steps: u64,
+    pub probe_gain: f32,
+    pub probe_updated: Instant,
 
     /// Wall-clock time since the last reset, frozen once the budget is reached.
     pub render_start: Instant,
@@ -200,6 +207,11 @@ impl RnptGuiApp {
             last_loss: 0.0,
             loss_ema: 0.0,
             probe_texture: None,
+            probe_pixel: None,
+            probe_camera: None,
+            probe_steps: 0,
+            probe_gain: 1.0,
+            probe_updated: Instant::now(),
             render_start: Instant::now(),
             render_time: None,
             last_save: None,
@@ -246,6 +258,7 @@ impl RnptGuiApp {
         self.loss_ema = 0.0;
         self.render_start = Instant::now();
         self.render_time = None;
+        self.probe_texture = None;
         self.rays_since_last_fps = 0;
         self.real_rays_since_last_fps = 0;
         self.shadow_rays_since_last_fps = 0;
@@ -278,17 +291,23 @@ impl RnptGuiApp {
         });
     }
 
-    pub(crate) fn update_probe(&mut self, ctx: &egui::Context, px: f32, py: f32) {
-        const W: usize = 256;
-        const H: usize = 128;
-        let Some(tracer) = &self.tracer else { return };
-        let Some(rgb) = tracer.render_nirc_probe(px, py, W, H) else { return };
+    /// Recompute the NIRC probe at `probe_pixel` from the current network. Called
+    /// on Ctrl+click and then a few times per second, to watch the network learn.
+    pub(crate) fn update_probe(&mut self, ctx: &egui::Context) {
+        const SIZE: usize = 128;
+        let (Some(tracer), Some((px, py))) = (&self.tracer, self.probe_pixel) else { return };
+        let Some(probe) = tracer.render_nirc_probe(px, py, SIZE) else { return };
+        self.probe_camera = probe.camera;
+        self.probe_steps = tracer.timing().nirc_steps;
+        self.probe_updated = Instant::now();
 
-        let exposure = self.exposure;
+        let exposure = self.exposure * self.probe_gain;
         let tonemapper = self.tonemapper;
-        let raw: Vec<u8> = rgb
+        let raw: Vec<u8> = probe
+            .radiance
             .iter()
-            .flat_map(|[r, g, b]| {
+            .flat_map(|px| {
+                let Some([r, g, b]) = *px else { return [0u8, 0, 0, 0] };
                 let tonemap = |v: f32| -> u8 {
                     let v = v * exposure;
                     let v = match tonemapper {
@@ -300,11 +319,11 @@ impl RnptGuiApp {
                     };
                     (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8
                 };
-                [tonemap(*r), tonemap(*g), tonemap(*b), 255u8]
+                [tonemap(r), tonemap(g), tonemap(b), 255u8]
             })
             .collect();
 
-        let img = egui::ColorImage::from_rgba_unmultiplied([W, H], &raw);
+        let img = egui::ColorImage::from_rgba_unmultiplied([SIZE, SIZE], &raw);
         if let Some(ref mut t) = self.probe_texture {
             t.set(img, egui::TextureOptions::LINEAR);
         } else {
@@ -364,6 +383,11 @@ impl eframe::App for RnptGuiApp {
                 self.shadow_rays_since_last_fps = 0;
                 self.last_fps_time = now;
             }
+        }
+
+        // Live probe: follow the network as it trains.
+        if self.probe_pixel.is_some() && self.probe_updated.elapsed() >= Duration::from_millis(200) {
+            self.update_probe(ctx);
         }
 
         ctx.request_repaint();

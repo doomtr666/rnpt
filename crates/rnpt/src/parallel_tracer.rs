@@ -46,6 +46,15 @@ impl UnsafePixelBuffer {
     }
 }
 
+/// See `ParallelTracer::render_nirc_probe`.
+pub struct NircProbe {
+    pub size: usize,
+    /// Row-major, top row first; `None` outside the disk.
+    pub radiance: Vec<Option<[f32; 3]>>,
+    /// Direction toward the camera, in disk coordinates ([-1, 1], y up).
+    pub camera: Option<[f32; 2]>,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TracerTiming {
     pub threads: usize,
@@ -278,53 +287,63 @@ impl ParallelTracer {
         self.total_shadow_rays.swap(0, Ordering::Relaxed)
     }
 
-    /// Render an equirectangular map of what the NIRC network predicts from the
-    /// surface point hit by pixel (px, py). Returns `None` if no network is loaded
-    /// or the primary ray doesn't hit any geometry.
-    pub fn render_nirc_probe(
-        &self,
-        px: f32,
-        py: f32,
-        probe_w: usize,
-        probe_h: usize,
-    ) -> Option<Vec<[f32; 3]>> {
+    /// What the NIRC network predicts at the surface point seen through pixel
+    /// (px, py): the incident radiance over the hemisphere around the shading
+    /// normal, as a `size` x `size` equal-area disk (center = normal, rim =
+    /// horizon, top = world up). `None` if no network yet or no surface hit.
+    pub fn render_nirc_probe(&self, px: f32, py: f32, size: usize) -> Option<NircProbe> {
         let cfg = self.config.lock().ok()?.clone();
         let network = cfg.nirc_network.as_ref()?.clone();
-        let bounds_min = cfg.bvh.bounds_min;
-        let bounds_max = cfg.bvh.bounds_max;
+        let (bounds_min, bounds_max) = (cfg.bvh.bounds_min, cfg.bvh.bounds_max);
 
         let pt = PathTracer::new(cfg.clone());
         let mut rng = crate::Pcg32::from_seed_128(42);
         let ray = pt.generate_ray(&mut rng, px, py);
-
         let hit = cfg.bvh.intersect(&ray)?;
         let surf = evaluate_surface(&hit, &ray, &cfg.bvh, &cfg.scene);
-        let pos = surf.position;
-        let geo_normal = surf.geo_normal;
+        let n = surf.normal.into_inner();
 
-        let mut probe = Vec::with_capacity(probe_w * probe_h);
-        for row in 0..probe_h {
-            for col in 0..probe_w {
-                let phi = (col as f32 + 0.5) / probe_w as f32 * std::f32::consts::TAU;
-                let theta = (row as f32 + 0.5) / probe_h as f32 * std::f32::consts::PI;
-                let wi = nalgebra::Vector3::new(
-                    theta.sin() * phi.cos(),
-                    theta.cos(),
-                    theta.sin() * phi.sin(),
-                );
+        // Disk frame: `up` is world up projected on the surface, `right` completes it.
+        let world_up = nalgebra::Vector3::new(0.0f32, 1.0, 0.0);
+        let mut up = world_up - n * n.dot(&world_up);
+        if up.norm() < 1e-3 {
+            up = nalgebra::Vector3::new(1.0, 0.0, 0.0) - n * n.x;
+        }
+        let up = up.normalize();
+        let right = up.cross(&n);
 
-                // Below the geometric horizon the network is never queried at runtime.
-                if wi.dot(geo_normal.as_ref()) <= 0.0 {
-                    probe.push([0.0, 0.0, 0.0]);
+        // Lambert equal-area mapping: r^2 = 1 - cos(theta), so equal disk areas
+        // cover equal solid angles.
+        let mut radiance = Vec::with_capacity(size * size);
+        for j in 0..size {
+            for i in 0..size {
+                let u = (i as f32 + 0.5) / size as f32 * 2.0 - 1.0;
+                let v = 1.0 - (j as f32 + 0.5) / size as f32 * 2.0;
+                let r2 = u * u + v * v;
+                if r2 > 1.0 {
+                    radiance.push(None);
                     continue;
                 }
-
-                let input = crate::nirc::encode_inputs(&pos, &wi, &bounds_min, &bounds_max);
+                let cos_t = 1.0 - r2;
+                let scale = if r2 > 0.0 { (1.0 - cos_t * cos_t).max(0.0).sqrt() / r2.sqrt() } else { 0.0 };
+                let wi = (n * cos_t + (right * u + up * v) * scale).normalize();
+                let input = crate::nirc::encode_inputs(&surf.position, &wi, &bounds_min, &bounds_max);
                 let pred = network.forward(input);
-                probe.push([pred[0].max(0.0), pred[1].max(0.0), pred[2].max(0.0)]);
+                radiance.push(Some([pred[0].max(0.0), pred[1].max(0.0), pred[2].max(0.0)]));
             }
         }
-        Some(probe)
+
+        // Where the camera is, in disk coordinates (it is above the surface).
+        let wo = -ray.direction.into_inner();
+        let cos_o = wo.dot(&n);
+        let camera = (cos_o > 0.0).then(|| {
+            let p = wo - n * cos_o;
+            let r = (1.0 - cos_o).max(0.0).sqrt();
+            let len = p.norm().max(1e-6);
+            [p.dot(&right) / len * r, p.dot(&up) / len * r]
+        });
+
+        Some(NircProbe { size, radiance, camera })
     }
 
     fn worker_loop(
