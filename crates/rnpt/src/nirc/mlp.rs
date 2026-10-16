@@ -83,7 +83,9 @@ pub struct NircMlp {
 }
 
 impl NircMlp {
-    /// Allocate on the heap and initialize weights (Xavier uniform).
+    /// Allocate on the heap and initialize weights: He uniform for the layers
+    /// followed by a ReLU (keeps the signal's variance from shrinking layer
+    /// after layer), Xavier uniform for the linear output layer.
     /// Avoids large stack temporaries — SMatrix<f32,256,256> would be 256 KB on the stack.
     pub fn new_boxed() -> Box<Self> {
         unsafe {
@@ -93,8 +95,8 @@ impl NircMlp {
             let b = &mut *ptr;
 
             let mut rng = crate::Pcg32::from_seed_128(42);
-            let limit_in     = (6.0f32 / (HIDDEN_DIM + INPUT_DIM) as f32).sqrt();
-            let limit_hidden = (6.0f32 / (HIDDEN_DIM + HIDDEN_DIM) as f32).sqrt();
+            let limit_in     = (6.0f32 / INPUT_DIM as f32).sqrt();
+            let limit_hidden = (6.0f32 / HIDDEN_DIM as f32).sqrt();
             let limit_out    = (6.0f32 / (OUTPUT_DIM + HIDDEN_DIM) as f32).sqrt();
 
             for v in b.w1.as_mut_slice() { *v = (rng.next_f32() * 2.0 - 1.0) * limit_in; }
@@ -134,19 +136,16 @@ impl NircMlp {
 
     // ── Activation ───────────────────────────────────────────────────────────
 
+    /// ReLU: the simplest activation there is, and free to compute.
     #[inline(always)]
-    fn silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
+    fn relu(x: f32) -> f32 { x.max(0.0) }
 
     #[inline(always)]
-    fn silu_deriv(x: f32) -> f32 {
-        let sig = 1.0 / (1.0 + (-x).exp());
-        let f = x * sig;
-        f + sig * (1.0 - f)
-    }
+    fn relu_deriv(x: f32) -> f32 { if x > 0.0 { 1.0 } else { 0.0 } }
 
     #[inline(always)]
-    fn apply_silu_deriv<const D: usize>(v: &SVector<f32, D>) -> SVector<f32, D> {
-        v.map(Self::silu_deriv)
+    fn apply_relu_deriv<const D: usize>(v: &SVector<f32, D>) -> SVector<f32, D> {
+        v.map(Self::relu_deriv)
     }
 
     // ── Forward passes ───────────────────────────────────────────────────────
@@ -155,15 +154,15 @@ impl NircMlp {
     pub fn forward(&self, x: SVector<f32, INPUT_DIM>) -> SVector<f32, OUTPUT_DIM> {
         let mut a = self.b1.clone_owned();
         a.gemv(1.0, &self.w1, &x, 1.0);
-        for v in a.iter_mut() { *v = Self::silu(*v); }
+        for v in a.iter_mut() { *v = Self::relu(*v); }
 
         let mut b = self.b2.clone_owned();
         b.gemv(1.0, &self.w2, &a, 1.0);
-        for v in b.iter_mut() { *v = Self::silu(*v); }
+        for v in b.iter_mut() { *v = Self::relu(*v); }
 
         a.copy_from(&self.b3);
         a.gemv(1.0, &self.w3, &b, 1.0);
-        for v in a.iter_mut() { *v = Self::silu(*v); }
+        for v in a.iter_mut() { *v = Self::relu(*v); }
 
         let mut out = self.b4.clone_owned();
         out.gemv(1.0, &self.w4, &a, 1.0);
@@ -177,15 +176,15 @@ impl NircMlp {
     ) -> (SVector<f32, OUTPUT_DIM>, NircForwardCache) {
         let mut z1 = self.b1.clone_owned();
         z1.gemv(1.0, &self.w1, &x, 1.0);
-        let a1 = z1.map(Self::silu);
+        let a1 = z1.map(Self::relu);
 
         let mut z2 = self.b2.clone_owned();
         z2.gemv(1.0, &self.w2, &a1, 1.0);
-        let a2 = z2.map(Self::silu);
+        let a2 = z2.map(Self::relu);
 
         let mut z3 = self.b3.clone_owned();
         z3.gemv(1.0, &self.w3, &a2, 1.0);
-        let a3 = z3.map(Self::silu);
+        let a3 = z3.map(Self::relu);
 
         let mut z4 = self.b4.clone_owned();
         z4.gemv(1.0, &self.w4, &a3, 1.0);
@@ -207,21 +206,21 @@ impl NircMlp {
         grads.w4.ger(1.0, &delta4, &cache.a3, 1.0);
         grads.b4 += delta4;
 
-        let sp3 = Self::apply_silu_deriv(&cache.z3);
+        let sp3 = Self::apply_relu_deriv(&cache.z3);
         let mut delta3 = SVector::<f32, HIDDEN_DIM>::zeros();
         delta3.gemv_tr(1.0, &self.w4, &delta4, 0.0);
         delta3.component_mul_assign(&sp3);
         grads.w3.ger(1.0, &delta3, &cache.a2, 1.0);
         grads.b3 += delta3;
 
-        let sp2 = Self::apply_silu_deriv(&cache.z2);
+        let sp2 = Self::apply_relu_deriv(&cache.z2);
         let mut delta2 = SVector::<f32, HIDDEN_DIM>::zeros();
         delta2.gemv_tr(1.0, &self.w3, &delta3, 0.0);
         delta2.component_mul_assign(&sp2);
         grads.w2.ger(1.0, &delta2, &cache.a1, 1.0);
         grads.b2 += delta2;
 
-        let sp1 = Self::apply_silu_deriv(&cache.z1);
+        let sp1 = Self::apply_relu_deriv(&cache.z1);
         let mut delta1 = SVector::<f32, HIDDEN_DIM>::zeros();
         delta1.gemv_tr(1.0, &self.w2, &delta2, 0.0);
         delta1.component_mul_assign(&sp1);

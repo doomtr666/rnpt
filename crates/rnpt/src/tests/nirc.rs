@@ -202,7 +202,7 @@ fn trainer_loss_decreases_on_repeated_training() {
 // ── Micro-benchmark (cargo test --release -p rnpt nirc_inference_cost -- --ignored --nocapture) ──
 
 /// Cost of one NIRC query: encoding, network forward, and the scalar `exp`
-/// behind every SiLU activation (48 per forward).
+/// that a smooth activation such as SiLU would add (48 per forward).
 #[test]
 #[ignore]
 fn nirc_inference_cost() {
