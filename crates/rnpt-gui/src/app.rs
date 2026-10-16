@@ -70,20 +70,7 @@ pub struct RnptGuiApp {
 
 // ── Construction helpers ──────────────────────────────────────────────────────
 
-pub(crate) fn with_env(
-    lights: &std::sync::Arc<Vec<rnpt::Light>>,
-    env: &Option<std::sync::Arc<rnpt::EnvLight>>,
-) -> (std::sync::Arc<Vec<rnpt::Light>>, Option<usize>) {
-    match env {
-        Some(e) => {
-            let mut v = (**lights).clone();
-            v.push(rnpt::Light::Environment(e.clone()));
-            let idx = v.len() - 1;
-            (std::sync::Arc::new(v), Some(idx))
-        }
-        None => (lights.clone(), None),
-    }
-}
+pub(crate) use rnpt_gui::render_io::{build_bvh_and_lights, with_env};
 
 fn empty_scene() -> rnpt::Scene {
     rnpt::Scene {
@@ -95,27 +82,6 @@ fn empty_scene() -> rnpt::Scene {
         roots: Vec::new(),
         cameras: vec![rnpt::Camera::default()],
     }
-}
-
-pub(crate) fn build_bvh_and_lights(
-    scene: &rnpt::Scene,
-) -> (
-    std::sync::Arc<rnpt::Bvh>,
-    std::sync::Arc<Vec<rnpt::Light>>,
-    u64,
-    usize,
-) {
-    let t0 = Instant::now();
-    let (bvh, emitters) = rnpt::BvhBuilder::new(scene).build();
-    let build_ms = t0.elapsed().as_millis() as u64;
-    let tri_count = bvh.triangle_meta.len();
-    let lights = rnpt::build_lights(&scene.lights, emitters);
-    (
-        std::sync::Arc::new(bvh),
-        std::sync::Arc::new(lights),
-        build_ms,
-        tri_count,
-    )
 }
 
 // ── RnptGuiApp impl ───────────────────────────────────────────────────────────

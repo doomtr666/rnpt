@@ -2873,6 +2873,8 @@ dependencies = [
  "nalgebra",
  "rayon",
  "rnpt",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

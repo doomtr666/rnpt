@@ -46,6 +46,16 @@ impl UnsafePixelBuffer {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TracerTiming {
+    pub threads: usize,
+    pub nirc_steps: u64,
+    /// Time spent in `train_nirc` (on the caller's thread).
+    pub train_s: f64,
+    /// Time workers spent waiting for training, summed over workers.
+    pub pacing_wait_s: f64,
+}
+
 pub struct ParallelTracer {
     config: Arc<Mutex<PathTracerConfig>>,
     /// Incremented on full scene changes (camera, geometry). Workers restart their pass.
@@ -67,6 +77,10 @@ pub struct ParallelTracer {
     nirc_rays: Arc<AtomicU64>,
     /// Training steps run so far.
     nirc_steps: Arc<AtomicU64>,
+    /// Time spent training, and summed over workers waiting for training (ns).
+    train_ns: AtomicU64,
+    pacing_wait_ns: Arc<AtomicU64>,
+    num_threads: usize,
     nirc_trainer: Mutex<NircTrainer>,
     /// Lock-free ring buffer: workers push training samples, trainer reads random batches.
     nirc_ring: Arc<NircRingBuffer>,
@@ -99,6 +113,7 @@ impl ParallelTracer {
         let running = Arc::new(AtomicBool::new(true));
         let nirc_rays = Arc::new(AtomicU64::new(0));
         let nirc_steps = Arc::new(AtomicU64::new(0));
+        let pacing_wait_ns = Arc::new(AtomicU64::new(0));
 
         let num_eval_pixels = (num_pixels + TRAIN_PIXEL_STRIDE - 1) / TRAIN_PIXEL_STRIDE;
         let mut mis_eval_pixels = vec![Pixel::default(); num_eval_pixels];
@@ -122,6 +137,7 @@ impl ParallelTracer {
             let mis_eval = mis_eval_buf.clone();
             let nirc_rays_atomic = nirc_rays.clone();
             let nirc_steps_atomic = nirc_steps.clone();
+            let pacing_wait_atomic = pacing_wait_ns.clone();
 
             threads.push(
                 thread::Builder::new()
@@ -143,6 +159,7 @@ impl ParallelTracer {
                             mis_eval,
                             nirc_rays_atomic,
                             nirc_steps_atomic,
+                            pacing_wait_atomic,
                         )
                     })
                     .expect("Failed to spawn worker thread"),
@@ -161,6 +178,9 @@ impl ParallelTracer {
             running,
             nirc_rays,
             nirc_steps,
+            train_ns: AtomicU64::new(0),
+            pacing_wait_ns,
+            num_threads,
             nirc_trainer: Mutex::new(NircTrainer::new(NircConfig::default())),
             nirc_ring,
             mis_eval_pixels,
@@ -185,6 +205,7 @@ impl ParallelTracer {
             Err(_) => return None,
         };
 
+        let t0 = std::time::Instant::now();
         let due = self.nirc_rays.load(Ordering::Acquire) / RAYS_PER_TRAIN_STEP;
         let mut last_loss = None;
         for _ in 0..MAX_TRAIN_STEPS_PER_CALL {
@@ -198,6 +219,7 @@ impl ParallelTracer {
             // Counted even without samples, so workers never wait on an empty ring.
             self.nirc_steps.fetch_add(1, Ordering::Release);
         }
+        self.train_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let loss = last_loss?;
 
         // Publish the EMA snapshot. `ema_buf` is maintained in-place by `train_samples`;
@@ -240,6 +262,16 @@ impl ParallelTracer {
         self.nirc_ring.filled()
     }
 
+
+    /// Where the time goes, for diagnosing NIRC's cost.
+    pub fn timing(&self) -> TracerTiming {
+        TracerTiming {
+            threads: self.num_threads,
+            nirc_steps: self.nirc_steps.load(Ordering::Relaxed),
+            train_s: self.train_ns.load(Ordering::Relaxed) as f64 * 1e-9,
+            pacing_wait_s: self.pacing_wait_ns.load(Ordering::Relaxed) as f64 * 1e-9,
+        }
+    }
 
     pub fn pop_rays_traced(&self) -> u64 {
         self.total_rays.swap(0, Ordering::Relaxed)
@@ -344,6 +376,7 @@ impl ParallelTracer {
         mis_eval_buf: Arc<UnsafePixelBuffer>,
         nirc_rays_atomic: Arc<AtomicU64>,
         nirc_steps_atomic: Arc<AtomicU64>,
+        pacing_wait_atomic: Arc<AtomicU64>,
     ) {
         let mut local_epoch = 0u32;
         let mut local_nirc_epoch = u32::MAX; // force first refresh
@@ -437,7 +470,10 @@ impl ParallelTracer {
                                 {
                                     break 'pass;
                                 }
+                                let t0 = std::time::Instant::now();
                                 thread::sleep(std::time::Duration::from_micros(100));
+                                pacing_wait_atomic
+                                    .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             }
                         }
 

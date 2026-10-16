@@ -1,9 +1,9 @@
 mod app;
-mod asset_importer;
 mod camera_nav;
 mod export;
 mod panels;
-mod tonemap;
+// Shared with the headless renderer; re-exported so `crate::...` paths keep working.
+pub(crate) use rnpt_gui::{asset_importer, tonemap};
 mod viewport;
 
 use eframe::egui;

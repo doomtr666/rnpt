@@ -198,3 +198,46 @@ fn trainer_loss_decreases_on_repeated_training() {
     }
     assert!(loss_after < loss_before, "loss did not decrease: {loss_before} → {loss_after}");
 }
+
+// ── Micro-benchmark (cargo test --release -p rnpt nirc_inference_cost -- --ignored --nocapture) ──
+
+/// Cost of one NIRC query: encoding, network forward, and the scalar `exp`
+/// behind every SiLU activation (48 per forward).
+#[test]
+#[ignore]
+fn nirc_inference_cost() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    const N: usize = 2_000_000;
+    let net = NircMlp::new_boxed();
+    let (bmin, bmax) = make_bounds();
+    let mut rng = Pcg32::from_seed(7, 1);
+    let inputs: Vec<(Point3<f32>, Vector3<f32>)> = (0..1024)
+        .map(|_| {
+            let p = Point3::new(rng.next_f32() * 8.0 - 4.0, rng.next_f32() * 5.0 - 1.5, rng.next_f32() * 8.0 - 4.0);
+            let d = Vector3::new(rng.next_f32() - 0.5, rng.next_f32() - 0.5, rng.next_f32() - 0.5).normalize();
+            (p, d)
+        })
+        .collect();
+    let encoded: Vec<SVector<f32, INPUT_DIM>> = inputs.iter().map(|(p, d)| encode_inputs(p, d, &bmin, &bmax)).collect();
+
+    let time = |name: &str, f: &dyn Fn(usize) -> f32| {
+        let t = Instant::now();
+        let mut acc = 0.0f32;
+        for i in 0..N {
+            acc += f(i);
+        }
+        black_box(acc);
+        println!("{name:<12} {:6.1} ns/call", t.elapsed().as_nanos() as f64 / N as f64);
+    };
+    time("encode", &|i| {
+        let (p, d) = &inputs[i & 1023];
+        encode_inputs(black_box(p), black_box(d), &bmin, &bmax)[0]
+    });
+    time("forward", &|i| net.forward(black_box(encoded[i & 1023]))[0]);
+    time("48 x exp", &|i| {
+        let x = black_box(i as f32 * 1e-6);
+        (0..48).map(|k| (-(x + k as f32 * 0.01)).exp()).sum()
+    });
+}
