@@ -25,7 +25,11 @@ usage: rnpt-compare --settings <render>.json [options]
   --modes a,b         full, indirect (default both)
   --bias-range R      bias map scale, e.g. 0.2 for +-20% (default 0.2)
   --out DIR           output directory (default renders/compare/<scene>_<WxH>_<settings hash>)
-  --imgcmp PATH       imgcmp executable (default tools/imgcmp/target/release/imgcmp)";
+  --imgcmp PATH       imgcmp executable (default tools/imgcmp/target/release/imgcmp)
+  --render PATH       rnpt-render executable (default: next to rnpt-compare), e.g. a
+                      build of an experimental variant
+  --tag NAME          label of this run: results go to <mode>/<rays>rpp-<tag>, so
+                      variants sit side by side and share the references";
 
 fn main() {
     if let Err(e) = run() {
@@ -115,7 +119,8 @@ fn run() -> Result<(), String> {
     std::fs::write(&settings_file, serde_json::to_string_pretty(&saved).unwrap()).map_err(|e| e.to_string())?;
 
     let self_exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let rnpt_render = exe(&self_exe, "rnpt-render");
+    let rnpt_render = value("--render").map(PathBuf::from).unwrap_or_else(|| exe(&self_exe, "rnpt-render"));
+    let tag = value("--tag").map_or(String::new(), |t| format!("-{t}"));
     let imgcmp = value("--imgcmp").map(PathBuf::from).unwrap_or_else(|| {
         PathBuf::from(format!("tools/imgcmp/target/release/imgcmp{}", std::env::consts::EXE_SUFFIX))
     });
@@ -142,7 +147,7 @@ fn run() -> Result<(), String> {
             None => render(&rnpt_render, &settings_file, "mis", ref_rays, indirect, &ref_dir)?,
         };
 
-        let run_dir = dir.join(format!("{rays}rpp"));
+        let run_dir = dir.join(format!("{rays}rpp{tag}"));
         let _ = std::fs::remove_dir_all(&run_dir);
         let mut renders = vec![];
         for s in &strategies {
@@ -162,7 +167,7 @@ fn run() -> Result<(), String> {
         sections.push_str(&html_section(mode, &out, &reference, &renders, &metrics)?);
     }
 
-    let index = out.join("index.html");
+    let index = out.join(format!("index{tag}.html"));
     std::fs::write(&index, html_page(&settings, rays, ref_rays, &sections)).map_err(|e| e.to_string())?;
     println!("{}", index.display());
     Ok(())

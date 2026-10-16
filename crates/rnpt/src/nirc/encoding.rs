@@ -1,15 +1,16 @@
 use nalgebra::SVector;
 
-pub const POS_BINS: usize = 1;
+/// The position is fed as is: x, y, z normalized to [-1, 1] over the scene bounds.
+pub const POS_FEATURES: usize = 3;
 /// Number of sinusoidal NeRF frequencies applied to each direction component.
 /// Frequency k has period 2/2^k in [-1,1]; at k=9 the period is ~0.004 in dz
 /// → angular resolution ~3.6° even near the poles of the unit sphere.
 pub const DIR_FREQS: usize = 1;
-pub const INPUT_DIM: usize = POS_BINS * 3 + DIR_FREQS * 2 * 3;
+pub const INPUT_DIM: usize = POS_FEATURES + DIR_FREQS * 2 * 3;
 pub(super) const HIDDEN_DIM: usize = 16;
 pub(super) const OUTPUT_DIM: usize = 3;
 
-/// NeRF positional encoding for position (oneblob) + direction (sinusoidal).
+/// Raw position + NeRF sinusoidal direction encoding.
 /// Returns the INPUT_DIM-dimensional feature vector fed to the MLP.
 pub fn encode_inputs(
     pos: &nalgebra::Point3<f32>,
@@ -27,16 +28,14 @@ pub fn encode_inputs(
         if extents.z > 0.0 { (pos.z - bounds_min.z) / extents.z } else { 0.5 },
     );
 
-    // Oneblob position encoding.
-    let pos_sigma = 1.0 / (POS_BINS as f32);
-    let pos_inv_2sigma2 = (POS_BINS as f32).powi(2) / 2.0;
-    for i in 0..POS_BINS {
-        let c = (i as f32 + 0.5) * pos_sigma;
-        input[idx]     = (-(norm_pos.x - c).powi(2) * pos_inv_2sigma2).exp();
-        input[idx + 1] = (-(norm_pos.y - c).powi(2) * pos_inv_2sigma2).exp();
-        input[idx + 2] = (-(norm_pos.z - c).powi(2) * pos_inv_2sigma2).exp();
-        idx += 3;
-    }
+    // Raw position in [-1, 1]. Measured on Sponza against richer encodings
+    // (one-blob with 1, 4 or 8 Gaussians per axis, NeRF frequencies): as good
+    // or better with this tiny network, and the old single centered Gaussian
+    // was symmetric, mapping x and 1 - x to the same input.
+    input[idx]     = norm_pos.x * 2.0 - 1.0;
+    input[idx + 1] = norm_pos.y * 2.0 - 1.0;
+    input[idx + 2] = norm_pos.z * 2.0 - 1.0;
+    idx += 3;
 
     // NeRF sinusoidal direction encoding.
     // dir components are in [-1, 1] (unit vector). Each frequency k encodes

@@ -37,7 +37,7 @@ The BVH lives in its own crate (`rnpt-bvh`) and can be used independently.
 An online-trained neural cache that replaces indirect path tracing bounces with a network prediction, trading a small bias for significantly higher convergence speed.
 
 - **Architecture**: 4-layer MLP, hidden dim 16, ReLU activations. ~755 parameters, <3 KB — fits entirely in L1 cache.
-- **Encoding**: one-blob for position (1 Gaussian per axis, 3 features) + NeRF sinusoidal for direction (sin/cos at one frequency, 6 features) → `INPUT_DIM = 9`.
+- **Encoding**: raw position normalized to the scene bounds (3 features) + NeRF sinusoidal for direction (sin/cos at one frequency, 6 features) → `INPUT_DIM = 9`.
 - **Training**: Adam optimizer, log-space MSE loss for HDR balance, EMA-smoothed inference snapshot published to workers lock-free.
 - **Sample collection**: Lock-free ring buffer (131 072 entries). Every 64th rendered pixel triggers a dedicated MIS path; all bounce-level radiances are pushed as training targets.
 - **Inference**: `gemv`-based forward pass (no weight matrix copies), alternating activation buffers. Backward pass uses `gemv_tr` to transpose-multiply without materializing the transpose.
