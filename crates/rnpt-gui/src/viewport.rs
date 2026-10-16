@@ -30,7 +30,8 @@ pub fn show(app: &mut RnptGuiApp, ctx: &egui::Context) -> NavInput {
                 desired,
             );
 
-            ui.put(rect, egui::Image::new(texture));
+            // Scale to the fitted rect: a fixed-size render may be larger than the viewport.
+            ui.put(rect, egui::Image::new(texture).fit_to_exact_size(desired));
 
             let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
 

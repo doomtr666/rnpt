@@ -12,7 +12,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Rust Neural Path Tracer")
-            .with_inner_size([1100.0, 700.0]),
+            .with_inner_size([1100.0, 860.0]),
         ..Default::default()
     };
 
