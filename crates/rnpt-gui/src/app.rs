@@ -63,6 +63,9 @@ pub struct RnptGuiApp {
     /// Wall-clock time since the last reset, frozen once the budget is reached.
     pub render_start: Instant,
     pub render_time: Option<Duration>,
+
+    /// Outcome of the last "Save image" (PNG path or error).
+    pub last_save: Option<Result<std::path::PathBuf, String>>,
 }
 
 // ── Construction helpers ──────────────────────────────────────────────────────
@@ -230,6 +233,7 @@ impl RnptGuiApp {
             probe_texture: None,
             render_start: Instant::now(),
             render_time: None,
+            last_save: None,
         }
     }
 

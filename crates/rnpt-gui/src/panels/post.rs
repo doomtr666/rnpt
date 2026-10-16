@@ -20,6 +20,20 @@ pub fn show(app: &mut RnptGuiApp, ui: &mut egui::Ui) {
             });
     });
 
+    ui.add_space(6.0);
+    if ui.button("Save image (PNG + HDR)").clicked() {
+        app.last_save = Some(crate::export::save_render(app));
+    }
+    match &app.last_save {
+        Some(Ok(path)) => {
+            ui.label(format!("Saved {}", path.display()));
+        }
+        Some(Err(e)) => {
+            ui.colored_label(egui::Color32::LIGHT_RED, format!("Save failed: {e}"));
+        }
+        None => {}
+    }
+
     ui.add_space(10.0);
     ui.separator();
     ui.add_space(10.0);
