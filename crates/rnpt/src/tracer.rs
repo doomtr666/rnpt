@@ -1,5 +1,5 @@
 use crate::{
-    Brdf, BrdfSample, Bvh, BvhHit, Camera, Color, ColorExt, Light, Pcg32, Ray, Scene,
+    AliasTable, Brdf, BrdfSample, Bvh, BvhHit, Camera, Color, ColorExt, Light, Pcg32, Ray, Scene,
     SurfaceInteraction, evaluate_surface, sample_glass,
 };
 use nalgebra::{Point3, Transform3, UnitVector3, Vector3};
@@ -145,12 +145,22 @@ fn russian_roulette(throughput: &mut Color, bounce: u32, rng: &mut Pcg32) -> boo
 pub struct PathTracer {
     config: PathTracerConfig,
     cam2world: Transform3<f32>,
+    /// NEE picks one light per vertex with probability proportional to its
+    /// estimated power, so the cost does not grow with the number of lights.
+    light_select: Option<AliasTable>,
 }
 
 impl PathTracer {
     pub fn new(config: PathTracerConfig) -> Self {
         let cam2world = config.camera.compute_camera_to_world();
-        Self { config, cam2world }
+        let light_select = light_selection(&config);
+        Self { config, cam2world, light_select }
+    }
+
+    /// Probability that NEE picks light `idx`.
+    #[inline]
+    fn light_select_pdf(&self, idx: usize) -> f32 {
+        self.light_select.as_ref().map_or(0.0, |t| t.entry_pdf(idx))
     }
 
     /// Hot-swap the inference network without recreating the PathTracer.
@@ -224,52 +234,75 @@ impl PathTracer {
         rng: &mut Pcg32,
         strategy: SamplingStrategy,
     ) -> Color {
-        let mut total_direct = Color::zeros();
         let textures = &self.config.scene.textures;
 
-        for light in self.config.lights.iter() {
-            // BrdfOnly draws no light samples for non-delta lights (area + env;
-            // their contribution comes from BRDF rays hitting emitters / escaping
-            // into the environment); delta lights always need NEE.
-            if strategy == SamplingStrategy::BrdfOnly && !light.is_delta() {
-                continue;
+        // BrdfOnly lights non-delta lights through BRDF rays only; delta lights
+        // still need NEE, and there are few of them: keep the loop.
+        if strategy == SamplingStrategy::BrdfOnly {
+            let mut total = Color::zeros();
+            for light in self.config.lights.iter().filter(|l| l.is_delta()) {
+                total += self.light_contribution(light, 1.0, hit_position, normal, brdf, wo, shadow_rays, rng, textures, strategy);
             }
-
-            let Some(s) = light.sample_li(hit_position, rng, textures) else {
-                continue;
-            };
-
-            let cos_s = normal.dot(&s.wi).max(0.0);
-            if cos_s <= 0.0 {
-                continue;
-            }
-
-            // Shadow ray starts at t=0: single-sided culling rejects the
-            // originating triangle (det < 0), so no normal offset is needed.
-            let tmax = if s.distance.is_finite() {
-                s.distance - RAY_EPSILON
-            } else {
-                f32::INFINITY
-            };
-            let shadow_ray =
-                Ray::new_with_minmax(*hit_position, UnitVector3::new_unchecked(s.wi), 0.0, tmax);
-
-            *shadow_rays += 1;
-            if !self.config.bvh.is_occluded(&shadow_ray) {
-                let f = brdf.eval(normal, wo, &s.wi);
-                // MIS balance-heuristic weight against BRDF sampling, for non-delta
-                // lights (area + env); delta lights can't be BRDF-sampled → weight 1.
-                let w = if strategy == SamplingStrategy::Mis && !light.is_delta() {
-                    let p_b = brdf.pdf(normal, wo, &s.wi);
-                    s.pdf / (s.pdf + p_b)
-                } else {
-                    1.0
-                };
-                total_direct += f.component_mul(&s.li) * (cos_s / s.pdf * w);
-            }
+            return total;
         }
 
-        total_direct
+        // One light, picked by power; its contribution is divided by the pick
+        // probability, which keeps the estimator unbiased.
+        let Some(table) = &self.light_select else {
+            return Color::zeros();
+        };
+        let idx = table.sample(rng.next_f32());
+        let p_select = table.entry_pdf(idx);
+        let light = &self.config.lights[idx];
+        self.light_contribution(light, p_select, hit_position, normal, brdf, wo, shadow_rays, rng, textures, strategy)
+    }
+
+    /// NEE estimate for one light picked with probability `p_select`: one
+    /// light sample, one shadow ray.
+    #[allow(clippy::too_many_arguments)]
+    fn light_contribution(
+        &self,
+        light: &Light,
+        p_select: f32,
+        hit_position: &Point3<f32>,
+        normal: &UnitVector3<f32>,
+        brdf: &Brdf,
+        wo: &Vector3<f32>,
+        shadow_rays: &mut u64,
+        rng: &mut Pcg32,
+        textures: &[crate::Texture],
+        strategy: SamplingStrategy,
+    ) -> Color {
+        let Some(s) = light.sample_li(hit_position, rng, textures) else {
+            return Color::zeros();
+        };
+
+        let cos_s = normal.dot(&s.wi).max(0.0);
+        if cos_s <= 0.0 {
+            return Color::zeros();
+        }
+
+        // Shadow ray starts at t=0: single-sided culling rejects the
+        // originating triangle (det < 0), so no normal offset is needed.
+        let tmax = if s.distance.is_finite() { s.distance - RAY_EPSILON } else { f32::INFINITY };
+        let shadow_ray = Ray::new_with_minmax(*hit_position, UnitVector3::new_unchecked(s.wi), 0.0, tmax);
+
+        *shadow_rays += 1;
+        if self.config.bvh.is_occluded(&shadow_ray) {
+            return Color::zeros();
+        }
+        let f = brdf.eval(normal, wo, &s.wi);
+        // MIS balance-heuristic weight against BRDF sampling, for non-delta
+        // lights (area + env); delta lights can't be BRDF-sampled → weight 1.
+        // The light-sampling pdf includes the probability of picking this light.
+        let p_light = p_select * s.pdf;
+        let w = if strategy == SamplingStrategy::Mis && !light.is_delta() {
+            let p_b = brdf.pdf(normal, wo, &s.wi);
+            p_light / (p_light + p_b)
+        } else {
+            1.0
+        };
+        f.component_mul(&s.li) * (cos_s / p_light * w)
     }
 
     /// Trace one path from the camera and return its radiance estimate. Each
@@ -440,7 +473,7 @@ impl PathTracer {
                         // pair (pos_k, wi_escape) → env_radiance × MIS_w.  Without this,
                         // the network never sees escape directions in training and
                         // extrapolates incorrectly at inference on open scenes (Bistro, etc).
-                        let p_l = env_light.env_pdf(&dir);
+                        let p_l = env_light.env_pdf(&dir) * self.light_select_pdf(env_idx);
                         let denom = bsdf_pdf + p_l;
                         let w = if denom > 0.0 { bsdf_pdf / denom } else { 1.0 };
                         let env_rad = env_light.radiance(&dir);
@@ -569,7 +602,7 @@ impl PathTracer {
                     if bounce == 0 {
                         1.0
                     } else {
-                        let p_l = env.env_pdf(&dir);
+                        let p_l = env.env_pdf(&dir) * self.light_select_pdf(env_idx);
                         let denom = bsdf_pdf + p_l;
                         if denom > 0.0 { bsdf_pdf / denom } else { 1.0 }
                     }
@@ -715,7 +748,8 @@ impl PathTracer {
     ) -> f32 {
         let cos_l = surf.geo_normal.dot(wo).max(0.0);
         let p_l = self.config.lights.get(hit.light as usize)
-            .map_or(0.0, |l| l.area_pdf(hit.hit.t * hit.hit.t, cos_l));
+            .map_or(0.0, |l| l.area_pdf(hit.hit.t * hit.hit.t, cos_l))
+            * self.light_select_pdf(hit.light as usize);
         let denom = bsdf_pdf + p_l;
         if denom > 0.0 { bsdf_pdf / denom } else { 1.0 }
     }
@@ -794,4 +828,34 @@ impl PathTracer {
     pub fn strategy(&self) -> SamplingStrategy {
         self.config.strategy
     }
+}
+
+/// Light-selection table for NEE: each light weighted by a rough estimate of
+/// the power it sends into the scene. Only the variance depends on these
+/// estimates, never the expected value, as long as no light gets probability 0.
+fn light_selection(config: &PathTracerConfig) -> Option<AliasTable> {
+    if config.lights.is_empty() {
+        return None;
+    }
+    let lum = |c: &Color| 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+    let extent = config.bvh.bounds_max - config.bvh.bounds_min;
+    let radius = 0.5 * extent.norm();
+    let disk = std::f32::consts::PI * radius * radius;
+    let power: Vec<f32> = config
+        .lights
+        .iter()
+        .map(|light| match light {
+            Light::Point { color, intensity, .. } | Light::Spot { color, intensity, .. } => {
+                lum(color) * intensity * 4.0 * std::f32::consts::PI
+            }
+            Light::Directional { color, intensity, .. } => lum(color) * intensity * disk,
+            Light::Area(mesh) => lum(&mesh.emissive()) * mesh.total_area() * std::f32::consts::PI,
+            Light::Environment(env) => env.average_luminance() * std::f32::consts::PI * disk,
+        })
+        .collect();
+    // Floor: a light with an underestimated power must stay reachable.
+    let mean = power.iter().sum::<f32>() / power.len() as f32;
+    let floor = (1e-3 * mean).max(f32::MIN_POSITIVE);
+    let weights: Vec<f32> = power.iter().map(|&p| if p.is_finite() { p.max(floor) } else { floor }).collect();
+    Some(AliasTable::new(&weights))
 }
