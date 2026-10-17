@@ -6,6 +6,15 @@ Every major system — BVH, BRDF, MIS, and the neural cache itself — is implem
 
 Developed in collaboration with Claude (Anthropic) as a coding assistant; design, experiments and validation are mine.
 
+<p align="center"><img src="docs/images/bistro-cafe.png" width="800" alt="Bistro exterior, café terrace"></p>
+
+| | |
+|---|---|
+| ![Bistro exterior, street](docs/images/bistro-street.png) | ![Sponza under an HDRI sky](docs/images/sponza.png) |
+| ![Damaged Helmet](docs/images/helmet.png) | ![Cornell box](docs/images/cornell.png) |
+
+<sub>All images rendered by rnpt on CPU (MIS, 8 000 rays per pixel, 800×800, ACES tonemapping).</sub>
+
 ## Goals
 
 - **Algorithm prototyping** — validate rendering research ideas (ReSTIR, neural caches, MIS variants) on CPU where iteration is fast and debugging is straightforward, then port the validated design to GPU.
@@ -22,30 +31,36 @@ Developed in collaboration with Claude (Anthropic) as a coding assistant; design
 | Sampling strategies | BRDF-only · NEE-only · MIS (balance heuristic) · Direct-only · NIRC |
 | BRDF | Lambertian diffuse + GGX Cook-Torrance specular (metallic-roughness) |
 | Glass | Thin/thick dielectric, Schlick Fresnel, GGX microfacet sampling |
-| Area lights | Emissive mesh triangles, alias-table O(1) selection |
-| Punctual lights | Point and directional (`KHR_lights_punctual`) |
+| Area lights | Emissive mesh triangles |
+| Punctual lights | Point, spot and directional (`KHR_lights_punctual`) |
+| Light selection | One light per shading point, alias table weighted by estimated power, selection pdf folded into MIS |
 | Environment | HDRI equirectangular, 2D piecewise-constant importance sampling |
 
 ### BVH
 
-8-wide BVH (BVH-8) built with SAH (16-bin sweep). Nodes store 8 child AABBs in SoA layout with `#[repr(C, align(32))]` for AVX2-friendly loads. Triangle intersection uses Möller–Trumbore with `wide::f32x8` fused multiply-add — 8 triangles tested in parallel per SIMD lane. Octant-ordered child visitation for front-to-back traversal.
+8-wide BVH (BVH-8) built with SAH (16-bin sweep). Nodes store 8 child AABBs in SoA layout with `#[repr(C, align(32))]` for AVX2-friendly loads. Triangle intersection uses Möller–Trumbore with `wide::f32x8` fused multiply-add — 8 triangles tested in parallel per SIMD lane. Front-to-back traversal: children are sorted by entry distance, and subtrees behind the closest hit are pruned.
 
 The BVH lives in its own crate (`rnpt-bvh`) and can be used independently.
 
 ### NIRC — Neural Incident Radiance Cache
 
-An online-trained neural cache that replaces indirect path tracing bounces with a network prediction, trading a small bias for significantly higher convergence speed.
+An online-trained neural cache that replaces indirect path tracing bounces with a network prediction, trading a small bias for faster convergence. The network is deliberately naive: the point is to see how far the simplest possible cache goes.
+
+<details>
+<summary>Architecture and training</summary>
 
 - **Architecture**: 4-layer MLP, hidden dim 16, ReLU activations. ~755 parameters, <3 KB — fits entirely in L1 cache.
 - **Encoding**: raw position normalized to the scene bounds (3 features) + NeRF sinusoidal for direction (sin/cos at one frequency, 6 features) → `INPUT_DIM = 9`.
-- **Training**: Adam optimizer, log-space MSE loss for HDR balance, EMA-smoothed inference snapshot published to workers lock-free.
-- **Sample collection**: Lock-free ring buffer (131 072 entries). Every 64th rendered pixel triggers a dedicated MIS path; all bounce-level radiances are pushed as training targets.
+- **Training**: Adam optimizer, log-space MSE loss for HDR balance, EMA-smoothed inference snapshot published to workers lock-free. Targets are single noisy path-traced samples: the network learns their expectation, and its small capacity pools neighbouring samples — denoising for free, paid for by spatial smoothing (the bias).
+- **Sample collection**: Lock-free ring buffer (131 072 entries). On average one rendered pixel in 64, drawn at random, triggers a dedicated MIS path; all bounce-level radiances are pushed as training targets.
 - **Inference**: `gemv`-based forward pass (no weight matrix copies), alternating activation buffers. Backward pass uses `gemv_tr` to transpose-multiply without materializing the transpose.
-- **Quality**: ~3.3% RelMean on Cornell Box, ~3.4% on Bistro exterior (vs MIS ground truth), at 2× the path throughput of pure MIS.
+- **Fair comparison**: strategies are compared at an equal per-pixel ray budget, counting every ray — closest hit, shadow, and the network's training paths.
+
+</details>
 
 ### Parallel rendering
 
-Workers run on all available cores, each owning a disjoint set of 128×128 pixel tiles. The pixel buffer is shared lock-free (workers write disjoint tiles; the GUI reads concurrently for progressive display). NIRC network hot-swap happens without restarting a render pass.
+Workers run on all available cores, with 32×32 pixel tiles dealt round-robin so every region of the image progresses at the same pace. The pixel buffer is shared lock-free (workers write disjoint tiles; the GUI reads concurrently for progressive display). NIRC network hot-swap happens without restarting a render pass.
 
 ## Crate structure
 
@@ -54,7 +69,10 @@ rnpt/
 ├── crates/
 │   ├── rnpt/          # Core library — path tracing, materials, NIRC, scene model
 │   ├── rnpt-bvh/      # Standalone BVH — SAH builder, 8-wide SIMD traversal
-│   └── rnpt-gui/      # eframe/egui GUI — scene import, live render, NIRC controls
+│   └── rnpt-gui/      # eframe/egui GUI, plus rnpt-render and rnpt-compare (headless)
+├── tools/
+│   ├── imgcmp/        # HDR image comparison: RelMSE, error and bias maps
+│   └── history-bench/ # replays the BVH's performance across the git history
 └── assets/            # glTF scenes, HDRI environment maps
 ```
 
@@ -85,11 +103,9 @@ The **Post-Processing** panel exposes:
 
 ### NIRC directional probe
 
-**Ctrl+click** on any surface point while NIRC is active renders a 256×128 equirectangular map showing the radiance the network predicts for every incoming direction at that point — essentially a neural HDRI captured at the clicked surface.
+**Ctrl+click** on any surface point while NIRC is active shows what the network has learned there: a small ball resting on the surface, seen from the camera, each point lit by the radiance the network predicts from the direction it faces. A checkbox shows the other half of the ball; gray marks directions below the surface, a yellow cross the surface normal.
 
-This makes the network's internal state directly visible: you can see whether it has learned the correct lighting direction, colour bleeding from nearby geometry, or sky contribution. Directions below the geometric horizon are masked to black, matching the hemisphere the network is actually queried over at render time.
-
-The probe updates instantly (no path tracing involved — it is a pure forward pass over the full directional grid) and is displayed in a collapsible panel on the right side of the GUI.
+The probe is a pure forward pass, so it updates live while the network trains: you can watch it learn the sun direction, colour bleeding from nearby walls, or the sky.
 
 ### Rendering strategies
 
@@ -102,6 +118,18 @@ The **Render** panel lets you switch sampling strategy at any time without resta
 | NEE | Next-event estimation only |
 | Direct | Direct illumination only (one bounce) |
 | NIRC | Indirect bounces replaced by the neural cache prediction |
+
+The panel also sets a **per-pixel ray budget** (every ray counts, training rays included) and an **indirect only** mode that keeps only light that bounced at least twice — where the strategies actually differ.
+
+### Headless rendering and comparison
+
+```bash
+# render a scene saved from the GUI (Save image writes .png, .hdr and a .json of the settings)
+cargo run --release -p rnpt-gui --bin rnpt-render -- --settings renders/my_view.json --strategy nirc --rays 1000
+# compare strategies at equal ray budget against a MIS reference; writes an HTML report
+cargo build --release --manifest-path tools/imgcmp/Cargo.toml   # error and bias maps used by rnpt-compare
+cargo run --release -p rnpt-gui --bin rnpt-compare -- --settings renders/my_view.json --strategies mis,nirc --modes full,indirect
+```
 
 ## Building
 
