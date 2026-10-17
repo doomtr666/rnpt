@@ -10,7 +10,16 @@ publish = false
 
 [dependencies]
 hb-common = { path = "../history-bench/common" }
-rnpt-bvh = { path = "../../crates/rnpt-bvh", features = ["stats"] }
+rnpt-bvh = { path = "../../crates/rnpt-bvh" }
 
+[features]
+# Count operations. Without it (--no-default-features), the tool only times, pinned to one core.
+default = ["count"]
+count = ["rnpt-bvh/stats"]
+
+# Same as rnpt's, so timings match history-bench.
 [profile.release]
 debug = true
+lto = "thin"
+codegen-units = 1
+panic = "abort"

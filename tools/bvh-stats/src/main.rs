@@ -6,10 +6,15 @@
 //! not depend on the machine's load; the time column does, and is only indicative.
 //! Results are checked against history-bench's brute-force references.
 //!
+//! Built without the default `count` feature, it times instead: no counters, pinned to
+//! one core, median of 9 passes after a warm-up, like history-bench.
+//!
 //!   bvh-stats [--scenes a,b] [--cache DIR] [--json FILE]
 
 use hb_common::*;
-use rnpt_bvh::{stats, Geometry, Ray, RayAccelerator, Scene};
+#[cfg(feature = "count")]
+use rnpt_bvh::stats;
+use rnpt_bvh::{Geometry, Ray, RayAccelerator, Scene};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -32,6 +37,9 @@ fn main() {
         }
     }
     let inputs = cache.join("inputs");
+    if !cfg!(feature = "count") && !pin_to_core(2) {
+        eprintln!("warning: could not pin to a core, timings will be noisier");
+    }
     let mut json = String::from("[");
 
     for name in &scenes {
@@ -67,8 +75,13 @@ fn main() {
             "SAH prediction for uniform rays: {:.1} nodes, {:.1} chunks per ray\n",
             tree.sah_nodes, tree.sah_chunks
         );
-        println!("| set | nodes/ray | boxes hit/ray | culled/ray | chunks/ray | lanes used | nodes vs SAH | chunks vs SAH | ns/ray* | check |");
-        println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|");
+        if cfg!(feature = "count") {
+            println!("| set | nodes/ray | boxes hit/ray | culled/ray | chunks/ray | lanes used | nodes vs SAH | chunks vs SAH | ns/ray* | check |");
+            println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|");
+        } else {
+            println!("| set | ns/ray | Mrays/s | spread | check |");
+            println!("|---|---:|---:|---:|---|");
+        }
 
         let mut sets_json = String::new();
         for set_name in SETS {
@@ -80,41 +93,68 @@ fn main() {
             let rays: Vec<Ray> = set.rays.iter().map(|r| Ray::new_with_minmax(r.org, r.dir, r.tmin, r.tmax)).collect();
             let reference = read_f32s(&inputs.join(format!("{name}.{set_name}.ref")));
 
+            let run = || -> Vec<f32> {
+                rays.iter()
+                    .map(|r| match set.kind {
+                        QueryKind::Closest => scene.closest_hit(r).map_or(f32::INFINITY, |h| h.t),
+                        QueryKind::Occluded => scene.any_hit(r) as u32 as f32,
+                    })
+                    .collect()
+            };
+            #[cfg(feature = "count")]
             stats::take();
             let t = Instant::now();
-            let results: Vec<f32> = rays
-                .iter()
-                .map(|r| match set.kind {
-                    QueryKind::Closest => scene.closest_hit(r).map_or(f32::INFINITY, |h| h.t),
-                    QueryKind::Occluded => scene.any_hit(r) as u32 as f32,
-                })
-                .collect();
-            let ns = t.elapsed().as_nanos() as f64 / rays.len() as f64;
-            let s = stats::take();
+            let results = run();
+            #[allow(unused_mut)]
+            let mut ns = t.elapsed().as_nanos() as f64 / rays.len() as f64;
             let wrong = mismatches(&results, &reference, set.kind, diag);
-
-            let per_ray = |v: u64| v as f64 / s.rays as f64;
-            let lanes = 100.0 * s.tri_lanes as f64 / (8 * s.chunks.max(1)) as f64;
             let check = if wrong as f64 <= 1e-3 * reference.len() as f64 {
                 "ok".to_string()
             } else {
                 format!("✗ {wrong}/{}", reference.len())
             };
-            println!(
-                "| {set_name} | {:.1} | {:.1} | {:.1} | {:.1} | {lanes:.1} % | {:.2}× | {:.2}× | {ns:.0} | {check} |",
-                per_ray(s.nodes),
-                per_ray(s.boxes_hit),
-                per_ray(s.culled),
-                per_ray(s.chunks),
-                per_ray(s.nodes) / tree.sah_nodes,
-                per_ray(s.chunks) / tree.sah_chunks,
-            );
-            let _ = write!(
-                sets_json,
-                "{}{{\"set\":\"{set_name}\",\"rays\":{},\"nodes\":{},\"boxes_hit\":{},\"culled\":{},\"chunks\":{},\"tri_lanes\":{},\"ns_per_ray\":{ns:.1},\"wrong\":{wrong}}}",
-                if sets_json.is_empty() { "" } else { "," },
-                s.rays, s.nodes, s.boxes_hit, s.culled, s.chunks, s.tri_lanes
-            );
+
+            #[cfg(feature = "count")]
+            {
+                let s = stats::take();
+                let per_ray = |v: u64| v as f64 / s.rays as f64;
+                let lanes = 100.0 * s.tri_lanes as f64 / (8 * s.chunks.max(1)) as f64;
+                println!(
+                    "| {set_name} | {:.1} | {:.1} | {:.1} | {:.1} | {lanes:.1} % | {:.2}× | {:.2}× | {ns:.0} | {check} |",
+                    per_ray(s.nodes),
+                    per_ray(s.boxes_hit),
+                    per_ray(s.culled),
+                    per_ray(s.chunks),
+                    per_ray(s.nodes) / tree.sah_nodes,
+                    per_ray(s.chunks) / tree.sah_chunks,
+                );
+                let _ = write!(
+                    sets_json,
+                    "{}{{\"set\":\"{set_name}\",\"rays\":{},\"nodes\":{},\"boxes_hit\":{},\"culled\":{},\"chunks\":{},\"tri_lanes\":{},\"ns_per_ray\":{ns:.1},\"wrong\":{wrong}}}",
+                    if sets_json.is_empty() { "" } else { "," },
+                    s.rays, s.nodes, s.boxes_hit, s.culled, s.chunks, s.tri_lanes
+                );
+            }
+            #[cfg(not(feature = "count"))]
+            {
+                let mut passes: Vec<f64> = (0..9)
+                    .map(|_| {
+                        let t = Instant::now();
+                        std::hint::black_box(run());
+                        t.elapsed().as_nanos() as f64 / rays.len() as f64
+                    })
+                    .collect();
+                passes.sort_by(f64::total_cmp);
+                ns = passes[passes.len() / 2];
+                let spread = 100.0 * (passes[passes.len() - 1] - passes[0]) / ns;
+                println!("| {set_name} | {ns:.1} | {:.2} | {spread:.1} % | {check} |", 1e3 / ns);
+                let _ = write!(
+                    sets_json,
+                    "{}{{\"set\":\"{set_name}\",\"rays\":{},\"ns_per_ray\":{ns:.2},\"spread_pct\":{spread:.2},\"wrong\":{wrong}}}",
+                    if sets_json.is_empty() { "" } else { "," },
+                    rays.len()
+                );
+            }
         }
         let _ = write!(
             json,
@@ -124,7 +164,9 @@ fn main() {
             tree.node_bytes, tree.chunk_bytes, tree.sah_nodes, tree.sah_chunks
         );
     }
-    println!("\n*single thread, unpinned, with the counters on: indicative only, unlike the counts.");
+    if cfg!(feature = "count") {
+        println!("\n*single thread, unpinned, with the counters on: indicative only, unlike the counts.");
+    }
 
     json.push(']');
     if let Some(path) = json_out {
