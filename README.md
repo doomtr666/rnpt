@@ -19,6 +19,7 @@ Developed in collaboration with Claude (Anthropic) as a coding assistant; design
 
 - **Algorithm prototyping** — validate rendering research ideas (ReSTIR, neural caches, MIS variants) on CPU where iteration is fast and debugging is straightforward, then port the validated design to GPU.
 - **Educational reference** — each subsystem is self-contained and documented. The BVH in particular is production-quality and serves as a study case for SIMD-accelerated tree traversal.
+- **Measured, not eyeballed** — every approximation is compared against a ground truth: renders against a converged unbiased reference at equal ray budget, BVH versions against brute-force intersection. A faster wrong answer does not count.
 - **Real-world scenes** — glTF 2.0 import with PBR materials, punctual lights, HDRI environments, transmission/IOR/volume extensions. Tested on Cornell Box, Bistro exterior, and others.
 
 ## Features
@@ -58,7 +59,21 @@ An online-trained neural cache that replaces indirect path tracing bounces with 
 
 </details>
 
-### Parallel rendering
+### Image comparison
+
+`rnpt-compare` answers one question: at the same cost, which strategy gets closer to the truth, and where does it go wrong?
+
+- **Equal budget**: every strategy gets the same number of rays per pixel — closest hit, shadow and training rays all count — so a cheaper path buys more samples instead of hiding its cost.
+- **Reference**: MIS, unbiased, at 20 000 rays per pixel by default. References are cached per scene, view and resolution, and reused across runs and variants (`--tag`).
+- **Metrics** (via `tools/imgcmp`, on the HDR output):
+  - *RelMSE* — mean of (render − ref)² / (ref² + 0.01), so dark and bright regions weigh alike;
+  - *bias* — mean signed relative error, which noise averages out and a systematic error does not;
+  - *efficiency* — 1 / (RelMSE × cost), per ray and per second, relative to the first strategy.
+- **Maps**: per-pixel relative error (log scale), and a local bias map — relative error averaged over a Gaussian (σ = 6 px), so noise cancels out and only structured error remains, blue where the render is too dark, red where it is too bright.
+- **Modes**: full image, or *indirect only* (light after at least two diffuse or glossy bounces; glass does not count), where the strategies actually differ.
+- **Report**: one HTML page per run, renders, maps and table side by side.
+
+
 
 Workers run on all available cores, with 32×32 pixel tiles dealt round-robin so every region of the image progresses at the same pace. The pixel buffer is shared lock-free (workers write disjoint tiles; the GUI reads concurrently for progressive display). NIRC network hot-swap happens without restarting a render pass.
 
