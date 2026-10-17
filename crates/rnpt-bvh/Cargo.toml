@@ -7,3 +7,7 @@ license = "GPL-3.0-only"
 [dependencies]
 nalgebra = "0.33"
 wide     = "1.5.0"
+
+[features]
+# Count traversal operations (see `stats`). Off by default: it slows traversal down.
+stats = []

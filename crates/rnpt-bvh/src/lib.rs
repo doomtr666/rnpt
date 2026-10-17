@@ -1,6 +1,7 @@
 mod bvh;
 mod builder;
 mod math;
+pub mod stats;
 
 use nalgebra::{Point3, UnitVector3, Vector3};
 
@@ -80,6 +81,11 @@ impl Scene {
     /// Build (or rebuild) the BVH from all attached geometries.
     pub fn commit(&mut self) {
         self.inner = Some(builder::build(&self.geometries));
+    }
+
+    /// Shape of the built tree and its SAH cost terms; `None` before `commit`.
+    pub fn tree_stats(&self) -> Option<stats::TreeStats> {
+        self.inner.as_ref().map(|b| b.tree_stats())
     }
 }
 

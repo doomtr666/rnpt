@@ -1,0 +1,16 @@
+[package]
+name = "bvh-stats"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+# Standalone workspace: the `stats` feature must not leak into other builds of rnpt-bvh.
+[workspace]
+
+[dependencies]
+hb-common = { path = "../history-bench/common" }
+rnpt-bvh = { path = "../../crates/rnpt-bvh", features = ["stats"] }
+
+[profile.release]
+debug = true

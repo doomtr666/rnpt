@@ -87,6 +87,7 @@ rnpt/
 │   └── rnpt-gui/      # eframe/egui GUI, plus rnpt-render and rnpt-compare (headless)
 ├── tools/
 │   ├── imgcmp/        # HDR image comparison: RelMSE, error and bias maps
+│   ├── bvh-stats/     # counts BVH operations per ray (nodes, chunks), vs the SAH prediction
 │   └── history-bench/ # replays the BVH's performance across the git history
 └── assets/            # glTF scenes, HDRI environment maps
 ```

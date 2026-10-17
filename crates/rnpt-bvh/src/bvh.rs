@@ -1,6 +1,7 @@
 use std::mem::MaybeUninit;
 
 use crate::math::InternalRay;
+use crate::stats::{record, TreeStats};
 use crate::Hit;
 
 const MAX_TRAVERSAL_DEPTH: usize = 64;
@@ -144,11 +145,78 @@ impl BvhInner {
         unsafe { self.tri_slots.get_unchecked(idx as usize) }
     }
 
+    /// Real triangles in a chunk: padding slots have no original index.
+    #[cfg_attr(not(feature = "stats"), allow(dead_code))]
+    fn real_lanes(&self, chunk_idx: u32) -> u64 {
+        let first = chunk_idx as usize * 8;
+        self.tri_slots[first..first + 8].iter().filter(|t| t.orig_idx != u32::MAX).count() as u64
+    }
+
+    pub fn tree_stats(&self) -> TreeStats {
+        let mut st = TreeStats {
+            chunks: self.soa_chunks.len() as u64,
+            triangles: self.tri_slots.iter().filter(|t| t.orig_idx != u32::MAX).count() as u64,
+            node_bytes: (self.nodes.len() * std::mem::size_of::<Bvh8Node>()) as u64,
+            chunk_bytes: (self.soa_chunks.len() * std::mem::size_of::<FlatTriangles>()
+                + self.tri_slots.len() * std::mem::size_of::<TriSlot>()
+                + self.double_sided_masks.len()) as u64,
+            ..Default::default()
+        };
+        if self.nodes.is_empty() {
+            return st;
+        }
+        // The root has no box of its own: it is the union of its children's.
+        let root = self.get_node(0);
+        let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+        for slot in (0..8).filter(|&i| root.children[i] != u32::MAX) {
+            let (a, b) = Self::slot_box(root, slot);
+            for k in 0..3 {
+                lo[k] = lo[k].min(a[k]);
+                hi[k] = hi[k].max(b[k]);
+            }
+        }
+        let root_area = area(lo, hi) as f64;
+        st.inner_nodes = 1;
+        st.sah_nodes = 1.0;
+        self.walk(0, 1, root_area, &mut st);
+        st
+    }
+
+    fn slot_box(node: &Bvh8Node, slot: usize) -> ([f32; 3], [f32; 3]) {
+        (
+            [node.p_min_x[slot], node.p_min_y[slot], node.p_min_z[slot]],
+            [node.p_max_x[slot], node.p_max_y[slot], node.p_max_z[slot]],
+        )
+    }
+
+    fn walk(&self, node_idx: u32, depth: u32, root_area: f64, st: &mut TreeStats) {
+        st.max_depth = st.max_depth.max(depth);
+        let node = self.get_node(node_idx);
+        for slot in 0..8 {
+            let encoded = node.children[slot];
+            if encoded == u32::MAX {
+                continue;
+            }
+            st.used_slots += 1;
+            let (lo, hi) = Self::slot_box(node, slot);
+            let p = area(lo, hi) as f64 / root_area;
+            if Bvh8Node::is_leaf(encoded) {
+                st.leaves += 1;
+                st.sah_chunks += p * Bvh8Node::leaf_count(encoded) as f64;
+            } else {
+                st.inner_nodes += 1;
+                st.sah_nodes += p;
+                self.walk(encoded, depth + 1, root_area, st);
+            }
+        }
+    }
+
     pub fn closest_hit(&self, ray: &InternalRay) -> Option<Hit> {
         if self.nodes.is_empty() {
             return None;
         }
 
+        record(|s| s.rays += 1);
         let mut result: Option<Hit> = None;
         let mut t_max = ray.tmax;
 
@@ -159,6 +227,7 @@ impl BvhInner {
             let (encoded_idx, node_t) = stack.pop();
 
             if node_t >= t_max {
+                record(|s| s.culled += 1);
                 continue;
             }
 
@@ -169,6 +238,10 @@ impl BvhInner {
                 for i in 0..chunk_count {
                     let chunk_idx = start_chunk + i;
                     let chunk = self.get_chunk(chunk_idx);
+                    record(|s| {
+                        s.chunks += 1;
+                        s.tri_lanes += self.real_lanes(chunk_idx);
+                    });
                     let ds_mask = self.double_sided_masks.get(chunk_idx as usize).copied().unwrap_or(0);
 
                     if let Some(simd_hit) = ray.closest_triangle_simd8(chunk, t_max, ds_mask) {
@@ -188,6 +261,7 @@ impl BvhInner {
             } else {
                 let node = self.get_node(encoded_idx);
                 let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
+                record(|s| s.nodes += 1);
 
                 let mut hits = [(0u32, 0.0f32); 8];
                 let mut hit_count = 0;
@@ -213,6 +287,7 @@ impl BvhInner {
                         j -= 1;
                     }
                 }
+                record(|s| s.boxes_hit += hit_count as u64);
                 for &(encoded, t) in &hits[..hit_count] {
                     stack.push(encoded, t);
                 }
@@ -227,6 +302,7 @@ impl BvhInner {
             return false;
         }
 
+        record(|s| s.rays += 1);
         let t_max = ray.tmax;
         let mut stack = BvhStack::new();
         stack.push(0, 0.0);
@@ -240,6 +316,10 @@ impl BvhInner {
 
                 for i in 0..chunk_count {
                     let chunk_idx = start_chunk + i;
+                    record(|s| {
+                        s.chunks += 1;
+                        s.tri_lanes += self.real_lanes(chunk_idx);
+                    });
                     let ds_mask = self.double_sided_masks.get(chunk_idx as usize).copied().unwrap_or(0);
                     if ray.any_triangle_simd8(self.get_chunk(chunk_idx), t_max, ds_mask) {
                         return true;
@@ -248,12 +328,14 @@ impl BvhInner {
             } else {
                 let node = self.get_node(encoded_idx);
                 let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
+                record(|s| s.nodes += 1);
 
                 while bitmask != 0 {
                     let lane = bitmask.trailing_zeros() as usize;
                     bitmask &= bitmask - 1;
                     let encoded = node.children[lane];
                     if encoded != u32::MAX && t_arr[lane] < t_max {
+                        record(|s| s.boxes_hit += 1);
                         stack.push(encoded, 0.0);
                     }
                 }
@@ -262,4 +344,9 @@ impl BvhInner {
 
         false
     }
+}
+
+fn area(lo: [f32; 3], hi: [f32; 3]) -> f32 {
+    let d = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+    2.0 * (d[0] * d[1] + d[1] * d[2] + d[2] * d[0])
 }
