@@ -3,3 +3,4 @@ deps/
 assets/*
 !assets/cornell.glb
 renders/
+tools/history-bench/results/**/*.json
