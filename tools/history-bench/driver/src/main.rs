@@ -23,6 +23,7 @@ options:
   --scenes a,b   scenes to use (default: all available, without the 10M ones)
   --big          also use the 10M-triangle scenes
   --commits a,b  commits to measure (default: every commit touching the BVH)
+  --timeout S    kill a measuring process after S seconds (default 1800)
   --branch B     measure the history of branch B instead of the current one;
                  results go to results/<cpu>/<mode>-<B>
   --mode M       own: each commit's own build config (default)
@@ -76,6 +77,8 @@ pub struct Ctx {
     pub rustc: String,
     pub machine: String,
     pub force: bool,
+    /// Seconds a measuring process may run before it is killed as hung.
+    pub timeout_s: u64,
     /// Branch whose history is measured (default: the current one).
     pub branch: Option<String>,
 }
@@ -239,6 +242,7 @@ fn real_main() -> Result<(), String> {
         rustc: String::new(),
         machine: slug(&cpu_brand()),
         force: false,
+        timeout_s: 1800,
         branch: None,
     };
     let mut scene_names: Option<Vec<String>> = None;
@@ -253,6 +257,7 @@ fn real_main() -> Result<(), String> {
             "--commits" => commits = Some(list(val()?)),
             "--big" => big = true,
             "--force" => ctx.force = true,
+            "--timeout" => ctx.timeout_s = val()?.parse().map_err(|_| "bad --timeout")?,
             "--branch" => ctx.branch = Some(val()?),
             "--mode" => {
                 ctx.mode = match val()?.as_str() {

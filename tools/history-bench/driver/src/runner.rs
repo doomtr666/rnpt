@@ -187,7 +187,20 @@ pub fn run_commit(ctx: &Ctx, scenes: &[SceneMeta], commit: &CommitInfo) -> Resul
             run.args(["--job", &format!("{}:{set}", meta.name)]);
         }
         eprintln!("[{}] measuring {} job(s), process {}/{}", commit.short, jobs.len(), p + 1, ctx.procs);
-        let status = run.status().map_err(|e| format!("{}: {e}", exe.display()))?;
+        let mut child = run.spawn().map_err(|e| format!("{}: {e}", exe.display()))?;
+        // A broken version can loop forever (NaNs in the traversal): give up on it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ctx.timeout_s);
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("adapter still running after {} s, killed (hang?)", ctx.timeout_s));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
         if !status.success() {
             return Err(format!("adapter failed: {status}"));
         }
