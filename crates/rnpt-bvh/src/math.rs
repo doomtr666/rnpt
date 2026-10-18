@@ -40,7 +40,8 @@ impl AABB {
 
     pub fn surface_area(&self) -> f32 {
         let extent = self.max - self.min;
-        if extent.x <= 0.0 || extent.y <= 0.0 || extent.z <= 0.0 {
+        // Only an empty box has no area: a flat one (a wall) still has two faces.
+        if extent.x < 0.0 || extent.y < 0.0 || extent.z < 0.0 {
             return 0.0;
         }
         2.0 * (extent.x * extent.y + extent.y * extent.z + extent.z * extent.x)

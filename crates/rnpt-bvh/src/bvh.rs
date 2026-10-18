@@ -1,7 +1,8 @@
 use std::mem::MaybeUninit;
 
 use crate::math::InternalRay;
-use crate::stats::{record, TreeStats};
+use crate::stats::{record, trace, Touch, TreeStats};
+use std::sync::atomic::{AtomicU16, Ordering::Relaxed};
 use crate::Hit;
 
 const MAX_TRAVERSAL_DEPTH: usize = 64;
@@ -95,6 +96,10 @@ pub struct BvhInner {
     /// in that chunk accepts backface hits (no culling). Self-hit avoidance for these
     /// triangles relies on `tmin = RAY_EPSILON` in the caller, not on det sign.
     pub double_sided_masks: Vec<u8>,
+    /// Shadow rays: per node and slot, occluders found through that child (learning only).
+    pub occluder_hits: Vec<[AtomicU16; 8]>,
+    /// Shadow rays count where occluders are (`RNPT_BVH_ANYHIT=learn`, experiment).
+    pub learn_occluders: bool,
 }
 
 struct BvhStack {
@@ -130,6 +135,95 @@ impl BvhStack {
 }
 
 impl BvhInner {
+    pub(crate) fn new(
+        nodes: Vec<Bvh8Node>,
+        tri_slots: Vec<TriSlot>,
+        soa_chunks: Vec<FlatTriangles>,
+        double_sided_masks: Vec<u8>,
+    ) -> Self {
+        let occluder_hits = (0..nodes.len()).map(|_| Default::default()).collect();
+        Self {
+            nodes,
+            tri_slots,
+            soa_chunks,
+            double_sided_masks,
+            occluder_hits,
+            learn_occluders: std::env::var("RNPT_BVH_ANYHIT").is_ok_and(|v| v == "learn"),
+        }
+    }
+
+    /// Makes the learned order physical: in every node, slots are sorted by the occluders
+    /// found through them (stable: ties keep their order), so that plain traversal, in slot
+    /// order, tries the likely occluder first. Children are referenced explicitly, so each
+    /// node is permuted alone, nothing else moves.
+    pub fn apply_occluder_order(&mut self) {
+        for (node, hits) in self.nodes.iter_mut().zip(&self.occluder_hits) {
+            let h: [u16; 8] = std::array::from_fn(|s| hits[s].load(Relaxed));
+            let mut perm: [usize; 8] = std::array::from_fn(|k| k);
+            perm.sort_by_key(|&s| std::cmp::Reverse(h[s]));
+            let old = *node;
+            for (k, &o) in perm.iter().enumerate() {
+                node.p_min_x[k] = old.p_min_x[o];
+                node.p_min_y[k] = old.p_min_y[o];
+                node.p_min_z[k] = old.p_min_z[o];
+                node.p_max_x[k] = old.p_max_x[o];
+                node.p_max_y[k] = old.p_max_y[o];
+                node.p_max_z[k] = old.p_max_z[o];
+                node.children[k] = old.children[o];
+            }
+            for (k, &o) in perm.iter().enumerate() {
+                hits[k].store(h[o], Relaxed);
+            }
+        }
+    }
+
+    /// Rearranging by visit counts is an experiment of the compact layout; this layout keeps
+    /// its depth-first order.
+    pub fn relayout_by_visits(&mut self, _visits: &[u32]) {}
+
+    /// Who holds whom: the parent of every node (`u32::MAX` for the root) and the node
+    /// owning every chunk. For walking from an answer back to the root.
+    pub fn parent_maps(&self) -> (Vec<u32>, Vec<u32>) {
+        let mut node_parent = vec![u32::MAX; self.nodes.len()];
+        let mut chunk_owner = vec![u32::MAX; self.soa_chunks.len()];
+        for (n, q) in self.nodes.iter().enumerate() {
+            for &c in q.children.iter().filter(|&&c| c != u32::MAX) {
+                if Bvh8Node::is_leaf(c) {
+                    let start = Bvh8Node::leaf_start(c);
+                    for k in start..start + Bvh8Node::leaf_count(c) {
+                        chunk_owner[k as usize] = n as u32;
+                    }
+                } else {
+                    node_parent[c as usize] = n as u32;
+                }
+            }
+        }
+        (node_parent, chunk_owner)
+    }
+
+    /// Chunks of every leaf whose box the ray's segment `[tmin, tmax]` enters.
+    pub(crate) fn leaf_chunks_along(&self, ray: &InternalRay, out: &mut Vec<u32>) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        let mut stack = vec![0u32];
+        while let Some(code) = stack.pop() {
+            if Bvh8Node::is_leaf(code) {
+                out.extend(Bvh8Node::leaf_start(code)..Bvh8Node::leaf_start(code) + Bvh8Node::leaf_count(code));
+                continue;
+            }
+            let node = self.get_node(code);
+            let (mut mask, t) = ray.intersect_bvh8(node, ray.tmax);
+            while mask != 0 {
+                let lane = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if node.children[lane] != u32::MAX && t[lane] <= ray.tmax {
+                    stack.push(node.children[lane]);
+                }
+            }
+        }
+    }
+
     #[inline(always)]
     fn get_node(&self, idx: u32) -> &Bvh8Node {
         unsafe { self.nodes.get_unchecked(idx as usize) }
@@ -202,6 +296,7 @@ impl BvhInner {
             let p = area(lo, hi) as f64 / root_area;
             if Bvh8Node::is_leaf(encoded) {
                 st.leaves += 1;
+                st.max_leaf_chunks = st.max_leaf_chunks.max(Bvh8Node::leaf_count(encoded));
                 st.sah_chunks += p * Bvh8Node::leaf_count(encoded) as f64;
             } else {
                 st.inner_nodes += 1;
@@ -242,10 +337,12 @@ impl BvhInner {
                         s.chunks += 1;
                         s.tri_lanes += self.real_lanes(chunk_idx);
                     });
+                    trace(Touch::Chunk(chunk_idx));
                     let ds_mask = self.double_sided_masks.get(chunk_idx as usize).copied().unwrap_or(0);
 
                     if let Some(simd_hit) = ray.closest_triangle_simd8(chunk, t_max, ds_mask) {
                         t_max = simd_hit.hit.t;
+                        trace(Touch::Answer(chunk_idx));
                         let tri_global_idx = chunk_idx * 8 + simd_hit.lane;
                         let slot = self.get_slot(tri_global_idx);
 
@@ -262,6 +359,7 @@ impl BvhInner {
                 let node = self.get_node(encoded_idx);
                 let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
                 record(|s| s.nodes += 1);
+                trace(Touch::Node(encoded_idx));
 
                 let mut hits = [(0u32, 0.0f32); 8];
                 let mut hit_count = 0;
@@ -301,6 +399,9 @@ impl BvhInner {
         if self.nodes.is_empty() {
             return false;
         }
+        if self.learn_occluders {
+            return self.any_hit_learning(ray);
+        }
 
         record(|s| s.rays += 1);
         let t_max = ray.tmax;
@@ -320,8 +421,10 @@ impl BvhInner {
                         s.chunks += 1;
                         s.tri_lanes += self.real_lanes(chunk_idx);
                     });
+                    trace(Touch::Chunk(chunk_idx));
                     let ds_mask = self.double_sided_masks.get(chunk_idx as usize).copied().unwrap_or(0);
                     if ray.any_triangle_simd8(self.get_chunk(chunk_idx), t_max, ds_mask) {
+                        trace(Touch::Answer(chunk_idx));
                         return true;
                     }
                 }
@@ -329,10 +432,13 @@ impl BvhInner {
                 let node = self.get_node(encoded_idx);
                 let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
                 record(|s| s.nodes += 1);
+                trace(Touch::Node(encoded_idx));
 
+                // Highest slot pushed first, so slot 0 is popped first: children are tried in
+                // slot order (the learned order once applied).
                 while bitmask != 0 {
-                    let lane = bitmask.trailing_zeros() as usize;
-                    bitmask &= bitmask - 1;
+                    let lane = 31 - bitmask.leading_zeros() as usize;
+                    bitmask &= !(1 << lane);
                     let encoded = node.children[lane];
                     if encoded != u32::MAX && t_arr[lane] < t_max {
                         record(|s| s.boxes_hit += 1);
@@ -342,6 +448,48 @@ impl BvhInner {
             }
         }
 
+        false
+    }
+}
+
+impl BvhInner {
+    /// Shadow rays, counting where occluders are: when a ray finds one, every node on its path
+    /// counts the child it came through (see `apply_occluder_order`).
+    fn any_hit_learning(&self, ray: &InternalRay) -> bool {
+        record(|s| s.rays += 1);
+        let t_max = ray.tmax;
+        // (node or chunk range, depth, slot in its parent)
+        let mut stack = vec![(0u32, 0usize, 0u8)];
+        let mut path_node = [0u32; MAX_TRAVERSAL_DEPTH];
+        let mut path_slot = [0u8; MAX_TRAVERSAL_DEPTH];
+        while let Some((code, depth, slot)) = stack.pop() {
+            path_slot[depth] = slot;
+            if Bvh8Node::is_leaf(code) {
+                for i in 0..Bvh8Node::leaf_count(code) {
+                    let chunk_idx = Bvh8Node::leaf_start(code) + i;
+                    let ds_mask = self.double_sided_masks[chunk_idx as usize];
+                    if ray.any_triangle_simd8(self.get_chunk(chunk_idx), t_max, ds_mask) {
+                        for k in 1..=depth {
+                            let h = &self.occluder_hits[path_node[k - 1] as usize][path_slot[k] as usize];
+                            h.store(h.load(Relaxed).saturating_add(1), Relaxed);
+                        }
+                        return true;
+                    }
+                }
+            } else {
+                path_node[depth] = code;
+                let node = self.get_node(code);
+                let (mut bitmask, t_arr) = ray.intersect_bvh8(node, t_max);
+                while bitmask != 0 {
+                    let lane = 31 - bitmask.leading_zeros() as usize;
+                    bitmask &= !(1 << lane);
+                    let child = node.children[lane];
+                    if child != u32::MAX && t_arr[lane] < t_max {
+                        stack.push((child, depth + 1, lane as u8));
+                    }
+                }
+            }
+        }
         false
     }
 }

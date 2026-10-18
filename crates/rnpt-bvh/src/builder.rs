@@ -34,7 +34,8 @@ impl BvhNode {
     }
 }
 
-pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
+/// Triangles of all geometries in one list, with their vertices in world space.
+fn gather(geometries: &[Geometry]) -> (Vec<Point3<f32>>, Vec<BuildTri>) {
     let mut world_vertices: Vec<Point3<f32>> = Vec::new();
     let mut build_tris: Vec<BuildTri> = Vec::new();
 
@@ -56,8 +57,73 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
         }
     }
 
+    (world_vertices, build_tris)
+}
+
+/// Builds with the triangles grouped as given: every group becomes one chunk. A group lists
+/// triangles as indices into the concatenated triangles of all geometries (`u32::MAX` pads).
+pub(crate) fn build_grouped(geometries: &[Geometry], groups: &[[u32; 8]]) -> BvhInner {
+    let (world_vertices, all) = gather(geometries);
+    let pad = BuildTri { v0: 0, v1: 0, v2: 0, orig_idx: u32::MAX, geom_id: u32::MAX, double_sided: false };
+    let build_tris: Vec<BuildTri> =
+        groups.iter().flatten().map(|&t| if t == u32::MAX { pad } else { all[t as usize] }).collect();
+    build_chunks_and_tree(&world_vertices, build_tris)
+}
+
+/// Global index (into the concatenated triangles of all geometries) of every geometry's first triangle.
+pub(crate) fn triangle_offsets(geometries: &[Geometry]) -> Vec<u32> {
+    let mut offsets = Vec::with_capacity(geometries.len());
+    let mut n = 0u32;
+    for g in geometries {
+        offsets.push(n);
+        n += g.tris.len() as u32;
+    }
+    offsets
+}
+
+/// World-space box of every triangle, in the concatenated order.
+pub(crate) fn triangle_boxes(geometries: &[Geometry]) -> Vec<AABB> {
+    let (world_vertices, all) = gather(geometries);
+    all.iter()
+        .map(|t| {
+            let mut b = AABB::invalid();
+            for v in [t.v0, t.v1, t.v2] {
+                b.extend(world_vertices[v as usize]);
+            }
+            b
+        })
+        .collect()
+}
+
+pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
+    let (world_vertices, mut build_tris) = gather(geometries);
+
     cluster_triangles(&world_vertices, &mut build_tris);
 
+    // Experiment E4: "e4" re-shares triangles between neighbouring chunks so that the sum of
+    // the chunks' box areas drops; "e4-split" also gives every chunk its own leaf box.
+    let mode = std::env::var("RNPT_BVH_BUILD").unwrap_or_default();
+    if mode.starts_with("e4") {
+        let tri_boxes: Vec<AABB> = build_tris
+            .iter()
+            .map(|t| {
+                let mut b = AABB::invalid();
+                for v in [t.v0, t.v1, t.v2] {
+                    b.extend(world_vertices[v as usize]);
+                }
+                b
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..build_tris.len()).collect();
+        optimize_groups(&mut order, &tri_boxes);
+        build_tris = order.iter().map(|&i| build_tris[i]).collect();
+    }
+
+    build_chunks_and_tree(&world_vertices, build_tris)
+}
+
+/// Every 8 consecutive triangles make a chunk; then the tree over the chunks.
+fn build_chunks_and_tree(world_vertices: &[Point3<f32>], mut build_tris: Vec<BuildTri>) -> BvhInner {
     let num_triangles = build_tris.len();
     let remainder = num_triangles % 8;
     if remainder != 0 {
@@ -86,7 +152,7 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
             soa.e1_x[i] = e1.x; soa.e1_y[i] = e1.y; soa.e1_z[i] = e1.z;
             soa.e2_x[i] = e2.x; soa.e2_y[i] = e2.y; soa.e2_z[i] = e2.z;
 
-            if chunk_start + i < num_triangles {
+            if tri.orig_idx != u32::MAX {
                 chunk_aabb.extend(v0);
                 chunk_aabb.extend(v1);
                 chunk_aabb.extend(v2);
@@ -118,8 +184,8 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
 
     let mut ordered_soa: Vec<FlatTriangles> = Vec::with_capacity(soa_chunks.len());
     let mut ordered_slots: Vec<TriSlot> = Vec::with_capacity(build_tris.len());
-    let mut double_sided_masks: Vec<u8> = Vec::with_capacity(soa_chunks.len());
 
+    let mut double_sided_masks: Vec<u8> = Vec::with_capacity(soa_chunks.len());
     for &idx in &chunk_indices {
         ordered_soa.push(soa_chunks[idx]);
         let mut ds_mask = 0u8;
@@ -138,7 +204,7 @@ pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
         collapse_to_bvh8(0, &nodes, &mut bvh8_nodes);
     }
 
-    BvhInner { nodes: bvh8_nodes, tri_slots: ordered_slots, soa_chunks: ordered_soa, double_sided_masks }
+    BvhInner::new(bvh8_nodes, ordered_slots, ordered_soa, double_sided_masks)
 }
 
 fn cluster_triangles(vertices: &[Point3<f32>], tris: &mut Vec<BuildTri>) {
@@ -233,7 +299,9 @@ fn subdivide_sah(
     }
 
     let extent = centroid_bounds.max - centroid_bounds.min;
-    if extent.x == 0.0 && extent.y == 0.0 && extent.z == 0.0 {
+    // A leaf's chunk count must fit its 7-bit field (Bvh8Node::COUNT_MASK).
+    let too_big = count as u32 > 127;
+    if extent.x == 0.0 && extent.y == 0.0 && extent.z == 0.0 && !too_big {
         return;
     }
 
@@ -299,36 +367,43 @@ fn subdivide_sah(
     }
 
     let leaf_cost = count as f32 * INTERSECT_COST;
-    if best_cost >= leaf_cost {
+    let split_all = std::env::var("RNPT_BVH_BUILD").is_ok_and(|v| v == "e4-split");
+    if best_cost >= leaf_cost && !too_big && !split_all {
         return;
     }
 
-    let bounds_min    = centroid_bounds.min[best_axis];
-    let bounds_extent = centroid_bounds.max[best_axis] - centroid_bounds.min[best_axis];
+    let mut left_count = 0;
+    if best_cost < f32::MAX {
+        let bounds_min    = centroid_bounds.min[best_axis];
+        let bounds_extent = centroid_bounds.max[best_axis] - centroid_bounds.min[best_axis];
 
-    let mut left  = first;
-    let mut right = first + count - 1;
+        let mut left  = first;
+        let mut right = first + count - 1;
 
-    while left <= right {
-        let chunk_idx = chunk_indices[left];
-        let centroid = chunk_centroids[chunk_idx];
-        let mut bin_idx =
-            (((centroid[best_axis] - bounds_min) / bounds_extent) * (SAH_BINS as f32)) as usize;
-        bin_idx = bin_idx.min(SAH_BINS - 1);
+        while left <= right {
+            let chunk_idx = chunk_indices[left];
+            let centroid = chunk_centroids[chunk_idx];
+            let mut bin_idx =
+                (((centroid[best_axis] - bounds_min) / bounds_extent) * (SAH_BINS as f32)) as usize;
+            bin_idx = bin_idx.min(SAH_BINS - 1);
 
-        if bin_idx <= best_split_bin {
-            left += 1;
-        } else {
-            chunk_indices.swap(left, right);
-            if right == 0 { break; }
-            right -= 1;
+            if bin_idx <= best_split_bin {
+                left += 1;
+            } else {
+                chunk_indices.swap(left, right);
+                if right == 0 { break; }
+                right -= 1;
+            }
         }
+        left_count = left - first;
     }
-
-    let left_count = left - first;
     if left_count == 0 || left_count == count {
-        return;
+        if !too_big {
+            return;
+        }
+        left_count = count / 2;
     }
+    let left = first + left_count;
 
     let left_child_idx = nodes.len();
     nodes.push(BvhNode {
@@ -411,4 +486,111 @@ fn collapse_to_bvh8(node_idx: usize, bvh2: &[BvhNode], bvh8: &mut Vec<Bvh8Node>)
 
     bvh8[bvh8_idx as usize] = node8;
     bvh8_idx
+}
+
+// ── Group optimization ───────────────────────────────────────────────────────
+//
+// Every 8 consecutive items of `order` form a group. Passes over pairs of groups
+// re-share their 16 items so that the sum of the two groups' box areas drops: first
+// the best cut along an axis, then single swaps while one helps. The pairs of a pass
+// are disjoint, so they are processed in parallel.
+
+const GROUP: usize = 8;
+const MAX_PASSES: usize = 8;
+
+fn optimize_groups(order: &mut [usize], boxes: &[AABB]) {
+    let groups = order.len() / GROUP; // a trailing partial group stays as it is
+    if groups < 2 {
+        return;
+    }
+    for _ in 0..MAX_PASSES {
+        let mut gain = 0.0f64;
+        // Neighbours 1 apart then 2 apart, each in two disjoint pairings.
+        for (dist, parity) in [(1, 0), (1, 1), (2, 0), (2, 1)] {
+            let pairs: Vec<(usize, usize)> = (0..groups)
+                .filter(|&g| (g / dist) % 2 == parity && g + dist < groups)
+                .map(|g| (g, g + dist))
+                .collect();
+            gain += improve_pairs(order, boxes, &pairs);
+        }
+        let total: f64 = (0..groups).map(|g| group_area(&order[g * GROUP..(g + 1) * GROUP], boxes) as f64).sum();
+        if gain < 1e-3 * total {
+            break;
+        }
+    }
+}
+
+fn improve_pairs(order: &mut [usize], boxes: &[AABB], pairs: &[(usize, usize)]) -> f64 {
+    let mut work: Vec<[usize; 2 * GROUP]> = pairs
+        .iter()
+        .map(|&(a, b)| {
+            let mut w = [0usize; 2 * GROUP];
+            w[..GROUP].copy_from_slice(&order[a * GROUP..(a + 1) * GROUP]);
+            w[GROUP..].copy_from_slice(&order[b * GROUP..(b + 1) * GROUP]);
+            w
+        })
+        .collect();
+
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per_thread = work.len().div_ceil(threads).max(1);
+    let gain: f64 = std::thread::scope(|scope| {
+        let handles: Vec<_> = work
+            .chunks_mut(per_thread)
+            .map(|part| scope.spawn(move || part.iter_mut().map(|w| improve_pair(w, boxes) as f64).sum::<f64>()))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).sum()
+    });
+
+    for (&(a, b), w) in pairs.iter().zip(&work) {
+        order[a * GROUP..(a + 1) * GROUP].copy_from_slice(&w[..GROUP]);
+        order[b * GROUP..(b + 1) * GROUP].copy_from_slice(&w[GROUP..]);
+    }
+    gain
+}
+
+/// Re-shares 16 items between two groups of 8; returns the area saved.
+fn improve_pair(w: &mut [usize; 2 * GROUP], boxes: &[AABB]) -> f32 {
+    let cost = |w: &[usize; 2 * GROUP]| group_area(&w[..GROUP], boxes) + group_area(&w[GROUP..], boxes);
+    let before = cost(w);
+    let mut best = before;
+
+    // Best cut along an axis.
+    for axis in 0..3 {
+        let mut sorted = *w;
+        sorted.sort_unstable_by(|&a, &b| boxes[a].center()[axis].total_cmp(&boxes[b].center()[axis]));
+        let c = cost(&sorted);
+        if c < best {
+            best = c;
+            *w = sorted;
+        }
+    }
+
+    // Then single swaps, best first, while one helps.
+    loop {
+        let mut best_swap = None;
+        for i in 0..GROUP {
+            for j in GROUP..2 * GROUP {
+                w.swap(i, j);
+                let c = cost(w);
+                w.swap(i, j);
+                if c < best * (1.0 - 1e-6) {
+                    best = c;
+                    best_swap = Some((i, j));
+                }
+            }
+        }
+        match best_swap {
+            Some((i, j)) => w.swap(i, j),
+            None => break,
+        }
+    }
+    before - best
+}
+
+fn group_area(items: &[usize], boxes: &[AABB]) -> f32 {
+    let mut b = AABB::invalid();
+    for &i in items {
+        b.extend_aabb(&boxes[i]);
+    }
+    b.surface_area()
 }

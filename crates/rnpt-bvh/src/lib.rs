@@ -2,6 +2,9 @@ mod bvh;
 mod builder;
 mod math;
 pub mod stats;
+mod refine;
+
+pub use refine::RefineReport;
 
 use nalgebra::{Point3, UnitVector3, Vector3};
 
@@ -59,6 +62,16 @@ impl Geometry {
     }
 }
 
+/// A ray observed during rendering, with the distance of its answer: its closest hit, or the
+/// end of its segment when it hit nothing (see `Scene::refine_chunks_by_rays`).
+#[derive(Clone, Copy, Debug)]
+pub struct RaySample {
+    pub org: [f32; 3],
+    pub dir: [f32; 3],
+    pub tmin: f32,
+    pub t_end: f32,
+}
+
 /// BVH-accelerated scene. Attach geometries, then call `commit` to build.
 pub struct Scene {
     geometries: Vec<Geometry>,
@@ -81,6 +94,48 @@ impl Scene {
     /// Build (or rebuild) the BVH from all attached geometries.
     pub fn commit(&mut self) {
         self.inner = Some(builder::build(&self.geometries));
+    }
+
+    /// Regroups triangles into chunks so that fewer of the sampled rays enter chunk boxes they
+    /// find nothing in, then rebuilds the tree over the new chunks (experiment). `prior`
+    /// weighs the surface-area term that stands for unobserved rays (1 = as much as the sample).
+    pub fn refine_chunks_by_rays(&mut self, samples: &[RaySample], prior: f32) -> Option<RefineReport> {
+        let inner = self.inner.as_ref()?;
+        let (groups, report) = refine::refine(&self.geometries, inner, samples, prior);
+        self.inner = Some(builder::build_grouped(&self.geometries, &groups));
+        Some(report)
+    }
+
+    /// Parent of every node (`u32::MAX` for the root) and owner node of every chunk.
+    pub fn parent_maps(&self) -> (Vec<u32>, Vec<u32>) {
+        self.inner.as_ref().map_or((Vec::new(), Vec::new()), |b| b.parent_maps())
+    }
+
+    /// Inner nodes of the built tree (indices of `stats::Touch::Node`).
+    pub fn node_count(&self) -> usize {
+        self.inner.as_ref().map_or(0, |b| b.nodes.len())
+    }
+
+    /// Rearranges the tree in memory by visit counts, one per node (see `stats::Touch`):
+    /// same tree, same results, the region rays explore packed together.
+    pub fn relayout_by_visits(&mut self, visits: &[u32]) {
+        if let Some(b) = self.inner.as_mut() {
+            b.relayout_by_visits(visits);
+        }
+    }
+
+    /// Shadow rays learn, per node, which child tends to hold occluders (experiment).
+    pub fn set_learn_occluders(&mut self, on: bool) {
+        if let Some(b) = self.inner.as_mut() {
+            b.learn_occluders = on;
+        }
+    }
+
+    /// Makes the learned order physical (see `BvhInner::apply_occluder_order`).
+    pub fn apply_occluder_order(&mut self) {
+        if let Some(b) = self.inner.as_mut() {
+            b.apply_occluder_order();
+        }
     }
 
     /// Shape of the built tree and its SAH cost terms; `None` before `commit`.

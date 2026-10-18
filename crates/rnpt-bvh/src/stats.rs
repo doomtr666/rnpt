@@ -38,6 +38,65 @@ pub(crate) fn record(f: impl FnOnce(&mut TraversalStats)) {
     let _ = f;
 }
 
+/// What one ray touched: an entry per inner node visited and per chunk tested, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Touch {
+    Node(u32),
+    Chunk(u32),
+    /// The chunk that holds the answer so far: the closest hit, or the occluder found.
+    Answer(u32),
+}
+
+#[cfg(feature = "stats")]
+thread_local! {
+    static TRACE: std::cell::RefCell<Option<Vec<Touch>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[inline(always)]
+pub(crate) fn trace(t: Touch) {
+    #[cfg(feature = "stats")]
+    TRACE.with(|tr| {
+        if let Some(v) = tr.borrow_mut().as_mut() {
+            v.push(t);
+        }
+    });
+    #[cfg(not(feature = "stats"))]
+    let _ = t;
+}
+
+/// Starts recording what the calling thread's rays touch.
+#[cfg(feature = "stats")]
+pub fn trace_start() {
+    TRACE.with(|tr| *tr.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stops recording.
+#[cfg(feature = "stats")]
+pub fn trace_stop() {
+    TRACE.with(|tr| *tr.borrow_mut() = None);
+}
+
+/// What was touched since `trace_start` or the last call; recording goes on.
+#[cfg(feature = "stats")]
+pub fn trace_take() -> Vec<Touch> {
+    TRACE.with(|tr| tr.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default())
+}
+
+/// Adds `s` to the calling thread's counters (counts taken per ray, given back in bulk).
+#[cfg(feature = "stats")]
+pub fn put_back(s: TraversalStats) {
+    COUNTERS.with(|c| {
+        let mut t = c.get();
+        t.rays += s.rays;
+        t.nodes += s.nodes;
+        t.boxes_hit += s.boxes_hit;
+        t.culled += s.culled;
+        t.chunks += s.chunks;
+        t.tri_lanes += s.tri_lanes;
+        c.set(t);
+    });
+}
+
 /// Counters of the calling thread since the last call, then reset.
 #[cfg(feature = "stats")]
 pub fn take() -> TraversalStats {
@@ -60,6 +119,8 @@ pub struct TreeStats {
     /// Children slots in use, over all inner nodes (8 per node at most).
     pub used_slots: u64,
     pub max_depth: u32,
+    /// Most chunks in one leaf.
+    pub max_leaf_chunks: u32,
     pub node_bytes: u64,
     /// Triangle chunks, their ids and double-sided masks.
     pub chunk_bytes: u64,

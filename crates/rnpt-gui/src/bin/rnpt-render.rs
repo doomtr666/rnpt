@@ -112,8 +112,38 @@ fn run() -> Result<(), String> {
         settings.samples_per_pixel,
         max_seconds.map_or(String::new(), |s| format!(", {s} s max"))
     );
-    let config = render_io::load_config(&settings)?;
+    let mut config = render_io::load_config(&settings)?;
     let budget = config.budget;
+
+    // Experiment: a warm-up render, not measured, before the real one. With --learn-shadows,
+    // shadow rays learn during it where occluders are, and the learned order is then made
+    // physical in the tree (see rnpt_bvh::Scene::apply_occluder_order).
+    if let Some(n) = parsed("--shadow-warmup")? {
+        let learn = args.iter().any(|a| a == "--learn-shadows");
+        let bvh = std::sync::Arc::get_mut(&mut config.bvh).ok_or("BVH shared before the warm-up")?;
+        bvh.accel.set_learn_occluders(learn);
+        let mut warm = config.clone();
+        warm.budget = rnpt::RenderBudget { rays_per_pixel: n as u64, samples_per_pixel: 0 };
+        let num_pixels = (settings.width * settings.height) as u64;
+        let t = Instant::now();
+        {
+            let tracer = rnpt::ParallelTracer::new(warm);
+            while tracer.pixels_done() < num_pixels {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let warm_s = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let bvh = std::sync::Arc::get_mut(&mut config.bvh).ok_or("BVH still shared after the warm-up")?;
+        if learn {
+            bvh.accel.apply_occluder_order();
+        }
+        bvh.accel.set_learn_occluders(false);
+        eprintln!(
+            "  warm-up {n} rays/px: {warm_s:.2} s{}",
+            if learn { format!(", learned shadow order applied in {:.1} ms", t.elapsed().as_secs_f64() * 1e3) } else { String::new() }
+        );
+    }
 
     let tracer = rnpt::ParallelTracer::new(config);
     let mut pixels = vec![rnpt::Pixel::default(); settings.width * settings.height];
