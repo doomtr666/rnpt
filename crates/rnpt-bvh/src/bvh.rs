@@ -98,7 +98,7 @@ pub struct BvhInner {
     pub double_sided_masks: Vec<u8>,
     /// Shadow rays: per node and slot, occluders found through that child (learning only).
     pub occluder_hits: Vec<[AtomicU16; 8]>,
-    /// Shadow rays count where occluders are (`RNPT_BVH_ANYHIT=learn`, experiment).
+    /// Shadow rays count where occluders are (see `apply_occluder_order`).
     pub learn_occluders: bool,
 }
 
@@ -148,7 +148,7 @@ impl BvhInner {
             soa_chunks,
             double_sided_masks,
             occluder_hits,
-            learn_occluders: std::env::var("RNPT_BVH_ANYHIT").is_ok_and(|v| v == "learn"),
+            learn_occluders: false,
         }
     }
 
@@ -176,10 +176,6 @@ impl BvhInner {
             }
         }
     }
-
-    /// Rearranging by visit counts is an experiment of the compact layout; this layout keeps
-    /// its depth-first order.
-    pub fn relayout_by_visits(&mut self, _visits: &[u32]) {}
 
     /// Who holds whom: the parent of every node (`u32::MAX` for the root) and the node
     /// owning every chunk. For walking from an answer back to the root.

@@ -21,6 +21,7 @@ usage: rnpt-render (--settings <render>.json | --scene <file.glb>) [options]
   --env F             environment map (.hdr); --env-intensity X, --env-rotation DEG
   --strategy S        nirc, mis, nee, brdf, direct
   --indirect          keep only indirect light (2+ diffuse/glossy bounces)
+  --no-adaptive-bvh   keep the BVH as built (by default it is tuned to the render's rays)
   --rays N            budget in rays per pixel
   --spp N             budget in samples per pixel
   --seconds T         stop after T seconds (equal-time comparisons)
@@ -115,58 +116,8 @@ fn run() -> Result<(), String> {
     let mut config = render_io::load_config(&settings)?;
     let budget = config.budget;
 
-    // Experiment: a warm-up render, not measured, before the real one. With --learn-shadows,
-    // shadow rays learn during it where occluders are, and the learned order is then made
-    // physical in the tree (see rnpt_bvh::Scene::apply_occluder_order).
-    if let Some(n) = parsed("--shadow-warmup")? {
-        let learn = args.iter().any(|a| a == "--learn-shadows");
-        let refine = args.iter().any(|a| a == "--refine");
-        let num_pixels = (settings.width * settings.height) as u64;
-        // Two warm-up renders of n rays/px each, also without options, so that every run starts
-        // from the same state of the caches.
-        let warm_up = |config: &rnpt::PathTracerConfig| {
-            let mut warm = config.clone();
-            warm.budget = rnpt::RenderBudget { rays_per_pixel: n as u64, samples_per_pixel: 0 };
-            let t = Instant::now();
-            let tracer = rnpt::ParallelTracer::new(warm);
-            while tracer.pixels_done() < num_pixels {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            drop(tracer);
-            t.elapsed().as_secs_f64()
-        };
-        let shared = "BVH shared around a warm-up";
-
-        // 1. Sample rays, then regroup chunks by them.
-        if refine {
-            config.bvh.accel.start_ray_sampling(64);
-        }
-        let s1 = warm_up(&config);
-        if refine {
-            let bvh = std::sync::Arc::get_mut(&mut config.bvh).ok_or(shared)?;
-            let samples = bvh.accel.take_ray_samples();
-            let t = Instant::now();
-            let rep = bvh.accel.refine_chunks_by_rays(&samples, 1.0).ok_or("no BVH")?;
-            eprintln!(
-                "  regrouped chunks by {} sampled rays in {:.0} ms (entries {} -> {})",
-                rep.samples,
-                t.elapsed().as_secs_f64() * 1e3,
-                rep.entries_before,
-                rep.entries_after
-            );
-        }
-
-        // 2. Learn where shadow rays find occluders, then make that order physical.
-        std::sync::Arc::get_mut(&mut config.bvh).ok_or(shared)?.accel.set_learn_occluders(learn);
-        let s2 = warm_up(&config);
-        let bvh = std::sync::Arc::get_mut(&mut config.bvh).ok_or(shared)?;
-        if learn {
-            let t = Instant::now();
-            bvh.accel.apply_occluder_order();
-            eprintln!("  learned shadow order applied in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
-        }
-        bvh.accel.set_learn_occluders(false);
-        eprintln!("  warm-ups {n} + {n} rays/px: {s1:.2} + {s2:.2} s");
+    if args.iter().any(|a| a == "--no-adaptive-bvh") {
+        config.adaptive_bvh = false;
     }
 
     let tracer = rnpt::ParallelTracer::new(config);
@@ -219,6 +170,12 @@ fn run() -> Result<(), String> {
 
     let wall = seconds * timing.threads as f64;
     eprintln!("  {:.2} Mpaths/s, {:.2} Mrays/s", paths as f64 / seconds / 1e6, rays as f64 / seconds / 1e6);
+    if timing.bvh_optimizations > 0 {
+        eprintln!(
+            "  BVH tuned to the render's rays {} time(s), {:.2} s in the background",
+            timing.bvh_optimizations, timing.bvh_optimize_s
+        );
+    }
     if timing.nirc_steps > 0 {
         eprintln!(
             "  NIRC: {} training steps, training {:.2} s ({:.0}% of the run), workers waiting {:.1}% of their time",

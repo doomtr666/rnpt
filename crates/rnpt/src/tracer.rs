@@ -84,6 +84,8 @@ pub struct PathTracerConfig {
     /// Keep only indirect light (2+ diffuse/glossy bounces), to judge how a
     /// strategy handles it without the direct light dominating the image.
     pub indirect_only: bool,
+    /// Tune the BVH to the rays the render traces, in the background (see `ParallelTracer`).
+    pub adaptive_bvh: bool,
 }
 
 /// No hard path-length cap: paths terminate via Russian roulette only (PBRT
@@ -144,6 +146,8 @@ fn russian_roulette(throughput: &mut Color, bounce: u32, rng: &mut Pcg32) -> boo
 
 pub struct PathTracer {
     config: PathTracerConfig,
+    /// The tree queries go through: the BVH's own, or one optimized since and swapped in.
+    accel: Arc<rnpt_bvh::Scene>,
     cam2world: Transform3<f32>,
     /// NEE picks one light per vertex with probability proportional to its
     /// estimated power, so the cost does not grow with the number of lights.
@@ -154,7 +158,13 @@ impl PathTracer {
     pub fn new(config: PathTracerConfig) -> Self {
         let cam2world = config.camera.compute_camera_to_world();
         let light_select = light_selection(&config);
-        Self { config, cam2world, light_select }
+        let accel = config.bvh.accel.clone();
+        Self { config, accel, cam2world, light_select }
+    }
+
+    /// Swap in a tree optimized meanwhile (same geometry, same results, faster).
+    pub fn set_accel(&mut self, accel: Arc<rnpt_bvh::Scene>) {
+        self.accel = accel;
     }
 
     /// Probability that NEE picks light `idx`.
@@ -288,7 +298,7 @@ impl PathTracer {
         let shadow_ray = Ray::new_with_minmax(*hit_position, UnitVector3::new_unchecked(s.wi), 0.0, tmax);
 
         *shadow_rays += 1;
-        if self.config.bvh.is_occluded(&shadow_ray) {
+        if self.config.bvh.is_occluded_in(&self.accel, &shadow_ray) {
             return Color::zeros();
         }
         let f = brdf.eval(normal, wo, &s.wi);
@@ -330,7 +340,7 @@ impl PathTracer {
 
         for bounce in 0..max_depth {
             *rays += 1;
-            let Some(hit) = self.config.bvh.intersect(&ray) else {
+            let Some(hit) = self.config.bvh.intersect_in(&self.accel, &ray) else {
                 if self.shows(scatters) {
                     self.handle_environment_hit(
                         &ray,
@@ -464,7 +474,7 @@ impl PathTracer {
 
         for bounce in 0..MAX_BOUNCES {
             *rays += 1;
-            let Some(hit) = self.config.bvh.intersect(&ray) else {
+            let Some(hit) = self.config.bvh.intersect_in(&self.accel, &ray) else {
                 if let Some(env_idx) = self.config.env {
                     let env_light = &self.config.lights[env_idx];
                     let dir = ray.direction.into_inner();

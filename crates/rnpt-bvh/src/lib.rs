@@ -43,6 +43,7 @@ pub trait RayAccelerator {
 }
 
 /// Triangle mesh geometry. Build with `Geometry::triangle_mesh`.
+#[derive(Clone)]
 pub struct Geometry {
     pub(crate) verts: Vec<[f32; 3]>,
     pub(crate) tris:  Vec<[u32; 3]>,
@@ -63,13 +64,16 @@ impl Geometry {
 }
 
 /// A ray observed during rendering, with the distance of its answer: its closest hit, or the
-/// end of its segment when it hit nothing (see `Scene::refine_chunks_by_rays`).
+/// end of its segment when it hit nothing (see `Scene::optimized_by_rays`).
 #[derive(Clone, Copy, Debug)]
 pub struct RaySample {
     pub org: [f32; 3],
     pub dir: [f32; 3],
     pub tmin: f32,
+    pub tmax: f32,
     pub t_end: f32,
+    /// An occlusion (shadow) query, rather than a closest-hit one.
+    pub shadow: bool,
 }
 
 /// BVH-accelerated scene. Attach geometries, then call `commit` to build.
@@ -77,6 +81,7 @@ pub struct Scene {
     geometries: Vec<Geometry>,
     inner: Option<bvh::BvhInner>,
     sampling: RaySampling,
+    regroup_chunks: bool,
 }
 
 /// Rays recorded while rendering, one in `every` (see `Scene::start_ray_sampling`).
@@ -89,7 +94,13 @@ struct RaySampling {
 
 impl Scene {
     pub fn new() -> Self {
-        Self { geometries: Vec::new(), inner: None, sampling: RaySampling::default() }
+        Self { geometries: Vec::new(), inner: None, sampling: RaySampling::default(), regroup_chunks: true }
+    }
+
+    /// Whether `commit` re-shares triangles between neighbouring chunks to tighten their
+    /// boxes (on by default; off to measure what it brings).
+    pub fn set_regroup_chunks(&mut self, on: bool) {
+        self.regroup_chunks = on;
     }
 
     /// Attach a geometry and return its `geom_id`.
@@ -102,12 +113,12 @@ impl Scene {
 
     /// Build (or rebuild) the BVH from all attached geometries.
     pub fn commit(&mut self) {
-        self.inner = Some(builder::build(&self.geometries));
+        self.inner = Some(builder::build(&self.geometries, self.regroup_chunks));
     }
 
     /// Regroups triangles into chunks so that fewer of the sampled rays enter chunk boxes they
-    /// find nothing in, then rebuilds the tree over the new chunks (experiment). `prior`
-    /// weighs the surface-area term that stands for unobserved rays (1 = as much as the sample).
+    /// find nothing in, then rebuilds the tree over the new chunks. `prior` weighs the
+    /// surface-area term that stands for unobserved rays (1 = as much as the sample).
     pub fn refine_chunks_by_rays(&mut self, samples: &[RaySample], prior: f32) -> Option<RefineReport> {
         let inner = self.inner.as_ref()?;
         let (groups, report) = refine::refine(&self.geometries, inner, samples, prior);
@@ -115,9 +126,38 @@ impl Scene {
         Some(report)
     }
 
+    /// A new scene tuned to the rays a render traces, this one untouched (it can keep serving
+    /// queries meanwhile): chunks regrouped by the sampled rays, then each node's children put
+    /// in the order where the sampled shadow rays found occluders. Same geometry, same results.
+    pub fn optimized_by_rays(&self, samples: &[RaySample]) -> Option<(Scene, RefineReport)> {
+        let inner = self.inner.as_ref()?;
+        let (groups, report) = refine::refine(&self.geometries, inner, samples, 1.0);
+        let mut scene = Scene {
+            geometries: self.geometries.clone(),
+            inner: Some(builder::build_grouped(&self.geometries, &groups)),
+            sampling: RaySampling::default(),
+            regroup_chunks: self.regroup_chunks,
+        };
+        scene.learn_occluder_order(samples);
+        Some((scene, report))
+    }
+
+    /// Replays the sampled shadow rays, counting through which child of each node they find
+    /// occluders, then sorts every node's children by those counts (see
+    /// `BvhInner::apply_occluder_order`).
+    pub fn learn_occluder_order(&mut self, samples: &[RaySample]) {
+        let Some(inner) = self.inner.as_mut() else { return };
+        inner.learn_occluders = true;
+        for s in samples.iter().filter(|s| s.shadow) {
+            inner.any_hit(&to_internal(&Ray::new_with_minmax(s.org, s.dir, s.tmin, s.tmax)));
+        }
+        inner.learn_occluders = false;
+        inner.apply_occluder_order();
+    }
+
     /// Starts recording one query in `every`, with the distance of its answer, for
-    /// `refine_chunks_by_rays` (0 stops). Shadow queries sampled also run a closest-hit query
-    /// to know where their answer is.
+    /// `optimized_by_rays` (0 stops). Shadow queries sampled also run a closest-hit query to
+    /// know where their answer is.
     pub fn start_ray_sampling(&self, every: u32) {
         self.sampling.every.store(every, std::sync::atomic::Ordering::Relaxed);
     }
@@ -135,8 +175,8 @@ impl Scene {
         every != 0 && self.sampling.counter.fetch_add(1, Relaxed) % every == 0
     }
 
-    fn record_sample(&self, ray: &Ray, t_end: f32) {
-        let s = RaySample { org: ray.org, dir: ray.dir, tmin: ray.tmin, t_end };
+    fn record_sample(&self, ray: &Ray, t_end: f32, shadow: bool) {
+        let s = RaySample { org: ray.org, dir: ray.dir, tmin: ray.tmin, tmax: ray.tmax, t_end, shadow };
         self.sampling.samples.lock().unwrap().push(s);
     }
 
@@ -150,13 +190,6 @@ impl Scene {
         self.inner.as_ref().map_or(0, |b| b.nodes.len())
     }
 
-    /// Rearranges the tree in memory by visit counts, one per node (see `stats::Touch`):
-    /// same tree, same results, the region rays explore packed together.
-    pub fn relayout_by_visits(&mut self, visits: &[u32]) {
-        if let Some(b) = self.inner.as_mut() {
-            b.relayout_by_visits(visits);
-        }
-    }
 
     /// Shadow rays learn, per node, which child tends to hold occluders (experiment).
     pub fn set_learn_occluders(&mut self, on: bool) {
@@ -188,7 +221,7 @@ impl RayAccelerator for Scene {
     fn closest_hit(&self, ray: &Ray) -> Option<Hit> {
         let hit = self.inner.as_ref()?.closest_hit(&to_internal(ray));
         if self.sample_due() {
-            self.record_sample(ray, hit.as_ref().map_or(ray.tmax, |h| h.t));
+            self.record_sample(ray, hit.as_ref().map_or(ray.tmax, |h| h.t), false);
         }
         hit
     }
@@ -198,7 +231,7 @@ impl RayAccelerator for Scene {
         let occluded = b.any_hit(&to_internal(ray));
         if self.sample_due() {
             let t_end = if occluded { b.closest_hit(&to_internal(ray)).map_or(ray.tmax, |h| h.t) } else { ray.tmax };
-            self.record_sample(ray, t_end);
+            self.record_sample(ray, t_end, true);
         }
         occluded
     }

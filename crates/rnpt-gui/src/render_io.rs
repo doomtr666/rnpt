@@ -160,6 +160,7 @@ pub fn load_config(settings: &RenderSettings) -> Result<rnpt::PathTracerConfig, 
             samples_per_pixel: settings.samples_per_pixel,
         },
         indirect_only: settings.indirect_only,
+        adaptive_bvh: true,
     })
 }
 

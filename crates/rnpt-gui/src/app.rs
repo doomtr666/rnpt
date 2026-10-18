@@ -163,6 +163,7 @@ impl RnptGuiApp {
             nirc_network: None,
             budget: rnpt::RenderBudget::default(),
             indirect_only: false,
+            adaptive_bvh: true,
         };
 
         Self {
@@ -249,6 +250,7 @@ impl RnptGuiApp {
             nirc_network: None,
             budget: self.budget,
             indirect_only: self.indirect_only,
+            adaptive_bvh: true,
         };
 
         self.tracer = None;

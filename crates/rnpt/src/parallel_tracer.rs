@@ -25,6 +25,19 @@ const RAYS_PER_TRAIN_STEP: u64 = 1 << 18;
 const MAX_TRAIN_LAG_STEPS: u64 = 2;
 /// Upper bound on training steps run by one `train_nirc` call.
 const MAX_TRAIN_STEPS_PER_CALL: u64 = 32;
+/// Adaptive BVH: rays traced per pixel of a view before the tree is tuned to them, and how
+/// many of those rays to sample meanwhile.
+const ADAPT_WARMUP_RAYS_PER_PIXEL: u64 = 16;
+const ADAPT_TARGET_SAMPLES: u64 = 100_000;
+
+/// The tree workers query, replaced when one tuned to the render's rays is ready.
+struct AccelShare {
+    current: Mutex<Arc<rnpt_bvh::Scene>>,
+    /// Incremented when `current` is replaced: workers swap at their next refresh.
+    epoch: AtomicU32,
+    optimizations: AtomicU32,
+    optimize_ns: AtomicU64,
+}
 
 /// A lock-free pixel buffer that multiple threads can write to concurrently.
 /// This is safe because each worker thread writes to a unique disjoint set of pixels.
@@ -76,6 +89,10 @@ pub struct TracerTiming {
     pub train_s: f64,
     /// Time workers spent waiting for training, summed over workers.
     pub pacing_wait_s: f64,
+    /// BVH trees tuned to the render's rays and swapped in, and time spent building them
+    /// (in the background).
+    pub bvh_optimizations: u32,
+    pub bvh_optimize_s: f64,
 }
 
 pub struct ParallelTracer {
@@ -108,6 +125,7 @@ pub struct ParallelTracer {
     nirc_trainer: Mutex<NircTrainer>,
     /// Lock-free ring buffer: workers push training samples, trainer reads random batches.
     nirc_ring: Arc<NircRingBuffer>,
+    accel: Arc<AccelShare>,
 }
 
 impl ParallelTracer {
@@ -121,6 +139,13 @@ impl ParallelTracer {
         let shared_buffer = Arc::new(UnsafePixelBuffer::new(buffer_ptr));
 
         let nirc_ring = Arc::new(NircRingBuffer::new());
+        let adaptive_bvh = config.adaptive_bvh;
+        let accel = Arc::new(AccelShare {
+            current: Mutex::new(config.bvh.accel.clone()),
+            epoch: AtomicU32::new(0),
+            optimizations: AtomicU32::new(0),
+            optimize_ns: AtomicU64::new(0),
+        });
 
         let config = Arc::new(Mutex::new(config));
         let epoch = Arc::new(AtomicU32::new(1));
@@ -153,6 +178,7 @@ impl ParallelTracer {
             let nirc_steps_atomic = nirc_steps.clone();
             let pacing_wait_atomic = pacing_wait_ns.clone();
             let pixels_done_atomic = pixels_done.clone();
+            let accel_share = accel.clone();
 
             threads.push(
                 thread::Builder::new()
@@ -175,9 +201,19 @@ impl ParallelTracer {
                             nirc_steps_atomic,
                             pacing_wait_atomic,
                             pixels_done_atomic,
+                            accel_share,
                         )
                     })
                     .expect("Failed to spawn worker thread"),
+            );
+        }
+        if adaptive_bvh {
+            let (running, epoch, rays, accel) = (running.clone(), epoch.clone(), nirc_rays.clone(), accel.clone());
+            threads.push(
+                thread::Builder::new()
+                    .name("BVH-optimizer".into())
+                    .spawn(move || Self::optimizer_loop(running, epoch, rays, accel, num_pixels))
+                    .expect("Failed to spawn the BVH optimizer thread"),
             );
         }
 
@@ -199,6 +235,57 @@ impl ParallelTracer {
             pixels_done,
             nirc_trainer: Mutex::new(NircTrainer::new(NircConfig::default())),
             nirc_ring,
+            accel,
+        }
+    }
+
+    /// Tunes the BVH to the rays of the current view, in the background: once the view has
+    /// traced `ADAPT_WARMUP_RAYS_PER_PIXEL` rays per pixel, rays sampled meanwhile regroup
+    /// triangles into chunks and order each node's children for shadow rays
+    /// (`rnpt_bvh::Scene::optimized_by_rays`). Workers keep rendering with the current tree
+    /// and swap the new one in when it is ready: same results, faster, nothing restarts.
+    fn optimizer_loop(
+        running: Arc<AtomicBool>,
+        epoch_atomic: Arc<AtomicU32>,
+        rays: Arc<AtomicU64>,
+        accel: Arc<AccelShare>,
+        num_pixels: usize,
+    ) {
+        let pause = |ms| thread::sleep(std::time::Duration::from_millis(ms));
+        let mut done_epoch = 0u32;
+        while running.load(Ordering::Relaxed) {
+            let epoch = epoch_atomic.load(Ordering::Relaxed);
+            if epoch == done_epoch {
+                pause(50);
+                continue;
+            }
+            let tree = accel.current.lock().unwrap().clone();
+            let warmup = num_pixels as u64 * ADAPT_WARMUP_RAYS_PER_PIXEL;
+            tree.start_ray_sampling((warmup / ADAPT_TARGET_SAMPLES).clamp(1, u32::MAX as u64) as u32);
+            let start = rays.load(Ordering::Relaxed);
+            let mut moved = false;
+            while running.load(Ordering::Relaxed) && rays.load(Ordering::Relaxed) - start < warmup {
+                if epoch_atomic.load(Ordering::Relaxed) != epoch {
+                    moved = true; // the view changed before enough rays: start over
+                    break;
+                }
+                pause(20);
+            }
+            let samples = tree.take_ray_samples();
+            if moved || !running.load(Ordering::Relaxed) {
+                continue;
+            }
+            done_epoch = epoch;
+            if samples.len() < 1000 {
+                continue;
+            }
+            let t = std::time::Instant::now();
+            if let Some((optimized, _)) = tree.optimized_by_rays(&samples) {
+                *accel.current.lock().unwrap() = Arc::new(optimized);
+                accel.epoch.fetch_add(1, Ordering::Release);
+                accel.optimizations.fetch_add(1, Ordering::Relaxed);
+                accel.optimize_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
         }
     }
 
@@ -285,6 +372,8 @@ impl ParallelTracer {
             nirc_steps: self.nirc_steps.load(Ordering::Relaxed),
             train_s: self.train_ns.load(Ordering::Relaxed) as f64 * 1e-9,
             pacing_wait_s: self.pacing_wait_ns.load(Ordering::Relaxed) as f64 * 1e-9,
+            bvh_optimizations: self.accel.optimizations.load(Ordering::Relaxed),
+            bvh_optimize_s: self.accel.optimize_ns.load(Ordering::Relaxed) as f64 * 1e-9,
         }
     }
 
@@ -376,8 +465,10 @@ impl ParallelTracer {
         nirc_steps_atomic: Arc<AtomicU64>,
         pacing_wait_atomic: Arc<AtomicU64>,
         pixels_done_atomic: Arc<AtomicU64>,
+        accel: Arc<AccelShare>,
     ) {
         let mut local_epoch = 0u32;
+        let mut local_accel_epoch = 0u32;
         let mut local_nirc_epoch = u32::MAX; // force first refresh
         let mut path_tracer: Option<PathTracer> = None;
         let mut width = 0;
@@ -398,7 +489,10 @@ impl ParallelTracer {
                 budget = cfg.budget;
                 is_nirc = cfg.strategy == SamplingStrategy::Nirc;
                 local_nirc_epoch = nirc_epoch_atomic.load(Ordering::Relaxed);
-                path_tracer = Some(PathTracer::new(cfg));
+                let mut tracer = PathTracer::new(cfg);
+                local_accel_epoch = accel.epoch.load(Ordering::Acquire);
+                tracer.set_accel(accel.current.lock().unwrap().clone());
+                path_tracer = Some(tracer);
             }
 
             let tracer = path_tracer.as_mut().unwrap();
@@ -469,6 +563,12 @@ impl ParallelTracer {
                         // Hot-swap NIRC network without restarting the render pass.
                         pixel_count += 1;
                         if pixel_count % NIRC_REFRESH_STRIDE == 0 {
+                            // A tree tuned to the render's rays may have been published.
+                            let cur = accel.epoch.load(Ordering::Acquire);
+                            if cur != local_accel_epoch {
+                                local_accel_epoch = cur;
+                                tracer.set_accel(accel.current.lock().unwrap().clone());
+                            }
                             let cur = nirc_epoch_atomic.load(Ordering::Acquire);
                             if cur != local_nirc_epoch {
                                 local_nirc_epoch = cur;

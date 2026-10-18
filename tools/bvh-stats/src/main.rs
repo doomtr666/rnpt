@@ -11,10 +11,10 @@
 //!
 //! With counts on, `--working-set` measures the cache lines rays touch per window of
 //! consecutive rays, and `--save-visits DIR` records how often each node is visited (one ray
-//! in four). `--relayout DIR` rearranges each tree by those visits before measuring.
+//! in four). `--no-regroup` builds without re-sharing triangles between chunks.
 //!
 //!   bvh-stats [--scenes a,b] [--cache DIR] [--json FILE] [--working-set]
-//!             [--save-visits DIR] [--relayout DIR]
+//!             [--save-visits DIR] [--no-regroup]
 
 use hb_common::*;
 #[cfg(feature = "count")]
@@ -33,7 +33,7 @@ fn main() {
     let mut json_out: Option<PathBuf> = None;
     let mut working_set = false;
     let mut save_visits: Option<PathBuf> = None;
-    let mut relayout: Option<PathBuf> = None;
+    let mut regroup = true;
     // Shadow rays: learn the occluder order on all rays, on even rays (then measure odd ones),
     // or on the first half (then measure the second).
     let mut learn_shadows: Option<String> = None;
@@ -53,13 +53,13 @@ fn main() {
             "--json" => json_out = Some(PathBuf::from(val())),
             "--working-set" => working_set = true,
             "--save-visits" => save_visits = Some(PathBuf::from(val())),
-            "--relayout" => relayout = Some(PathBuf::from(val())),
+            "--no-regroup" => regroup = false,
             "--learn-shadows" => learn_shadows = Some(val()),
             "--learn-shadows-first" => learn_first = true,
             "--separation" => separation = true,
             "--measure-odd" => measure_odd = true,
             "--refine-by-rays" => refine_prior = Some(val().parse().unwrap_or_else(|_| fail("bad --refine-by-rays"))),
-            _ => fail("usage: bvh-stats [--scenes a,b] [--cache DIR] [--json FILE] [--working-set] [--save-visits DIR] [--relayout DIR]"),
+            _ => fail("usage: bvh-stats [--scenes a,b] [--cache DIR] [--json FILE] [--working-set] [--save-visits DIR] [--no-regroup]"),
         }
     }
     let inputs = cache.join("inputs");
@@ -84,16 +84,10 @@ fn main() {
         let diag = read_diag(&inputs.join(format!("{name}.meta.json")));
         let t0 = Instant::now();
         let mut scene = Scene::new();
+        scene.set_regroup_chunks(regroup);
         scene.attach_geometry(Geometry::triangle_mesh(&tri_scene.verts, &tri_scene.tris));
         scene.commit();
         let build_ms = t0.elapsed().as_secs_f64() * 1e3;
-        if let Some(dir) = &relayout {
-            let path = dir.join(format!("{name}.visits"));
-            let bytes = std::fs::read(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
-            let visits: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
-            scene.relayout_by_visits(&visits);
-            eprintln!("{name}: relaid out by {}", path.display());
-        }
         if let Some(prior) = refine_prior {
             let t = Instant::now();
             let mut samples = Vec::new();
@@ -105,7 +99,14 @@ fn main() {
                 for r in read_rays(&path).rays.iter().step_by(2) {
                     let ray = Ray::new_with_minmax(r.org, r.dir, r.tmin, r.tmax);
                     let t_end = scene.closest_hit(&ray).map_or(r.tmax, |h| h.t);
-                    samples.push(rnpt_bvh::RaySample { org: r.org, dir: r.dir, tmin: r.tmin, t_end });
+                    samples.push(rnpt_bvh::RaySample {
+                        org: r.org,
+                        dir: r.dir,
+                        tmin: r.tmin,
+                        tmax: r.tmax,
+                        t_end,
+                        shadow: set_name == "shadow",
+                    });
                 }
             }
             let sample_ms = t.elapsed().as_secs_f64() * 1e3;

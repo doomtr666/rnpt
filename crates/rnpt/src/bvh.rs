@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use crate::{Color, TriangleHit};
 use nalgebra::{Point3, UnitVector3, Vector2, Vector4};
 use rnpt_bvh::RayAccelerator;
@@ -28,7 +29,8 @@ pub struct BvhHit {
 }
 
 pub struct Bvh {
-    pub accel:         rnpt_bvh::Scene,
+    /// Shared so that a tree optimized while rendering can replace it (see `ParallelTracer`).
+    pub accel:         Arc<rnpt_bvh::Scene>,
     pub vertices:      Vec<Point3<f32>>,
     pub normals:       Vec<UnitVector3<f32>>,
     pub uvs:           Vec<Vector2<f32>>,
@@ -43,13 +45,18 @@ pub struct Bvh {
 
 impl Bvh {
     pub fn intersect(&self, ray: &crate::Ray) -> Option<BvhHit> {
+        self.intersect_in(&self.accel, ray)
+    }
+
+    /// `intersect` through a given tree over this geometry (one optimized meanwhile).
+    pub fn intersect_in(&self, accel: &rnpt_bvh::Scene, ray: &crate::Ray) -> Option<BvhHit> {
         let bvh_ray = rnpt_bvh::Ray::new_with_minmax(
             [ray.origin.x, ray.origin.y, ray.origin.z],
             [ray.direction.x, ray.direction.y, ray.direction.z],
             ray.tmin,
             ray.tmax,
         );
-        let hit = self.accel.closest_hit(&bvh_ray)?;
+        let hit = accel.closest_hit(&bvh_ray)?;
         let meta = &self.triangle_meta[hit.prim_id as usize];
         Some(BvhHit {
             hit: TriangleHit { t: hit.t, u: hit.u, v: hit.v },
@@ -63,12 +70,17 @@ impl Bvh {
     }
 
     pub fn is_occluded(&self, ray: &crate::Ray) -> bool {
+        self.is_occluded_in(&self.accel, ray)
+    }
+
+    /// `is_occluded` through a given tree over this geometry.
+    pub fn is_occluded_in(&self, accel: &rnpt_bvh::Scene, ray: &crate::Ray) -> bool {
         let bvh_ray = rnpt_bvh::Ray::new_with_minmax(
             [ray.origin.x, ray.origin.y, ray.origin.z],
             [ray.direction.x, ray.direction.y, ray.direction.z],
             ray.tmin,
             ray.tmax,
         );
-        self.accel.any_hit(&bvh_ray)
+        accel.any_hit(&bvh_ray)
     }
 }

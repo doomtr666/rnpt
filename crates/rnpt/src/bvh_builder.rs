@@ -196,7 +196,7 @@ impl BvhBuilder {
         }
 
         let bvh = Bvh {
-            accel,
+            accel: std::sync::Arc::new(accel),
             vertices:      self.world_vertices,
             normals:       self.world_normals,
             uvs:           self.world_uvs,

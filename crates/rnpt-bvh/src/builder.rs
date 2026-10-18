@@ -95,15 +95,14 @@ pub(crate) fn triangle_boxes(geometries: &[Geometry]) -> Vec<AABB> {
         .collect()
 }
 
-pub(crate) fn build(geometries: &[Geometry]) -> BvhInner {
+pub(crate) fn build(geometries: &[Geometry], regroup_chunks: bool) -> BvhInner {
     let (world_vertices, mut build_tris) = gather(geometries);
 
     cluster_triangles(&world_vertices, &mut build_tris);
 
-    // Experiment E4: "e4" re-shares triangles between neighbouring chunks so that the sum of
-    // the chunks' box areas drops; "e4-split" also gives every chunk its own leaf box.
-    let mode = std::env::var("RNPT_BVH_BUILD").unwrap_or_default();
-    if mode.starts_with("e4") {
+    // Neighbouring chunks re-share their triangles so that the sum of the chunks' box areas
+    // drops: tighter chunks, fewer of them tested per ray.
+    if regroup_chunks {
         let tri_boxes: Vec<AABB> = build_tris
             .iter()
             .map(|t| {
@@ -367,8 +366,7 @@ fn subdivide_sah(
     }
 
     let leaf_cost = count as f32 * INTERSECT_COST;
-    let split_all = std::env::var("RNPT_BVH_BUILD").is_ok_and(|v| v == "e4-split");
-    if best_cost >= leaf_cost && !too_big && !split_all {
+    if best_cost >= leaf_cost && !too_big {
         return;
     }
 
