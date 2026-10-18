@@ -88,7 +88,6 @@ pub struct Scene {
 #[derive(Default)]
 struct RaySampling {
     every: std::sync::atomic::AtomicU32,
-    counter: std::sync::atomic::AtomicU32,
     samples: std::sync::Mutex<Vec<RaySample>>,
 }
 
@@ -121,7 +120,8 @@ impl Scene {
     /// surface-area term that stands for unobserved rays (1 = as much as the sample).
     pub fn refine_chunks_by_rays(&mut self, samples: &[RaySample], prior: f32) -> Option<RefineReport> {
         let inner = self.inner.as_ref()?;
-        let (groups, report) = refine::refine(&self.geometries, inner, samples, prior);
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let (groups, report) = refine::refine(&self.geometries, inner, samples, prior, threads);
         self.inner = Some(builder::build_grouped(&self.geometries, &groups));
         Some(report)
     }
@@ -129,9 +129,10 @@ impl Scene {
     /// A new scene tuned to the rays a render traces, this one untouched (it can keep serving
     /// queries meanwhile): chunks regrouped by the sampled rays, then each node's children put
     /// in the order where the sampled shadow rays found occluders. Same geometry, same results.
-    pub fn optimized_by_rays(&self, samples: &[RaySample]) -> Option<(Scene, RefineReport)> {
+    /// `threads`: how many threads the regrouping may use (few, if rendering goes on meanwhile).
+    pub fn optimized_by_rays(&self, samples: &[RaySample], threads: usize) -> Option<(Scene, RefineReport)> {
         let inner = self.inner.as_ref()?;
-        let (groups, report) = refine::refine(&self.geometries, inner, samples, 1.0);
+        let (groups, report) = refine::refine(&self.geometries, inner, samples, 1.0, threads);
         let mut scene = Scene {
             geometries: self.geometries.clone(),
             inner: Some(builder::build_grouped(&self.geometries, &groups)),
@@ -170,9 +171,17 @@ impl Scene {
 
     #[inline(always)]
     fn sample_due(&self) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        let every = self.sampling.every.load(Relaxed);
-        every != 0 && self.sampling.counter.fetch_add(1, Relaxed) % every == 0
+        // A counter per thread: a shared one would bounce between cores on every query.
+        thread_local! {
+            static QUERIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let every = self.sampling.every.load(std::sync::atomic::Ordering::Relaxed);
+        every != 0
+            && QUERIES.with(|q| {
+                let n = q.get().wrapping_add(1);
+                q.set(n);
+                n % every == 0
+            })
     }
 
     fn record_sample(&self, ray: &Ray, t_end: f32, shadow: bool) {

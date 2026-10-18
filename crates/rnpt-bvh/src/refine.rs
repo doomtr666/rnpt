@@ -29,6 +29,7 @@ pub(crate) fn refine(
     inner: &BvhInner,
     samples: &[RaySample],
     prior: f32,
+    threads: usize,
 ) -> (Vec<[u32; 8]>, RefineReport) {
     let offsets = triangle_offsets(geometries);
     let tri_boxes = triangle_boxes(geometries);
@@ -70,7 +71,7 @@ pub(crate) fn refine(
     let area_weight = (prior as f64 * entries_before as f64 / total_area.max(1e-30)) as f32;
 
     // Pairs of neighbouring chunks (siblings' chunks are contiguous), disjoint within a pass.
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = threads.max(1);
     for (dist, parity) in [(1, 0), (1, 1), (2, 0), (2, 1)] {
         let pairs: Vec<(usize, usize)> = (0..groups.len())
             .filter(|&a| (a / dist) % 2 == parity && a + dist < groups.len())

@@ -25,10 +25,11 @@ const RAYS_PER_TRAIN_STEP: u64 = 1 << 18;
 const MAX_TRAIN_LAG_STEPS: u64 = 2;
 /// Upper bound on training steps run by one `train_nirc` call.
 const MAX_TRAIN_STEPS_PER_CALL: u64 = 32;
-/// Adaptive BVH: rays traced per pixel of a view before the tree is tuned to them, and how
-/// many of those rays to sample meanwhile.
-const ADAPT_WARMUP_RAYS_PER_PIXEL: u64 = 16;
+/// Adaptive BVH: rays traced per pixel of a view before the tree is tuned to them, how many
+/// of those rays to sample meanwhile, and the threads the tuning takes from rendering.
+const ADAPT_WARMUP_RAYS_PER_PIXEL: u64 = 4;
 const ADAPT_TARGET_SAMPLES: u64 = 100_000;
+const ADAPT_THREADS: usize = 2;
 
 /// The tree workers query, replaced when one tuned to the render's rays is ready.
 struct AccelShare {
@@ -280,7 +281,7 @@ impl ParallelTracer {
                 continue;
             }
             let t = std::time::Instant::now();
-            if let Some((optimized, _)) = tree.optimized_by_rays(&samples) {
+            if let Some((optimized, _)) = tree.optimized_by_rays(&samples, ADAPT_THREADS) {
                 *accel.current.lock().unwrap() = Arc::new(optimized);
                 accel.epoch.fetch_add(1, Ordering::Release);
                 accel.optimizations.fetch_add(1, Ordering::Relaxed);
