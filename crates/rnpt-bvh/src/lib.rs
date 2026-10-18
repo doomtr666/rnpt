@@ -76,11 +76,20 @@ pub struct RaySample {
 pub struct Scene {
     geometries: Vec<Geometry>,
     inner: Option<bvh::BvhInner>,
+    sampling: RaySampling,
+}
+
+/// Rays recorded while rendering, one in `every` (see `Scene::start_ray_sampling`).
+#[derive(Default)]
+struct RaySampling {
+    every: std::sync::atomic::AtomicU32,
+    counter: std::sync::atomic::AtomicU32,
+    samples: std::sync::Mutex<Vec<RaySample>>,
 }
 
 impl Scene {
     pub fn new() -> Self {
-        Self { geometries: Vec::new(), inner: None }
+        Self { geometries: Vec::new(), inner: None, sampling: RaySampling::default() }
     }
 
     /// Attach a geometry and return its `geom_id`.
@@ -104,6 +113,31 @@ impl Scene {
         let (groups, report) = refine::refine(&self.geometries, inner, samples, prior);
         self.inner = Some(builder::build_grouped(&self.geometries, &groups));
         Some(report)
+    }
+
+    /// Starts recording one query in `every`, with the distance of its answer, for
+    /// `refine_chunks_by_rays` (0 stops). Shadow queries sampled also run a closest-hit query
+    /// to know where their answer is.
+    pub fn start_ray_sampling(&self, every: u32) {
+        self.sampling.every.store(every, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The rays recorded so far, and recording stops.
+    pub fn take_ray_samples(&self) -> Vec<RaySample> {
+        self.start_ray_sampling(0);
+        std::mem::take(&mut *self.sampling.samples.lock().unwrap())
+    }
+
+    #[inline(always)]
+    fn sample_due(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let every = self.sampling.every.load(Relaxed);
+        every != 0 && self.sampling.counter.fetch_add(1, Relaxed) % every == 0
+    }
+
+    fn record_sample(&self, ray: &Ray, t_end: f32) {
+        let s = RaySample { org: ray.org, dir: ray.dir, tmin: ray.tmin, t_end };
+        self.sampling.samples.lock().unwrap().push(s);
     }
 
     /// Parent of every node (`u32::MAX` for the root) and owner node of every chunk.
@@ -152,11 +186,21 @@ impl Default for Scene {
 
 impl RayAccelerator for Scene {
     fn closest_hit(&self, ray: &Ray) -> Option<Hit> {
-        self.inner.as_ref()?.closest_hit(&to_internal(ray))
+        let hit = self.inner.as_ref()?.closest_hit(&to_internal(ray));
+        if self.sample_due() {
+            self.record_sample(ray, hit.as_ref().map_or(ray.tmax, |h| h.t));
+        }
+        hit
     }
 
     fn any_hit(&self, ray: &Ray) -> bool {
-        self.inner.as_ref().map_or(false, |b| b.any_hit(&to_internal(ray)))
+        let Some(b) = self.inner.as_ref() else { return false };
+        let occluded = b.any_hit(&to_internal(ray));
+        if self.sample_due() {
+            let t_end = if occluded { b.closest_hit(&to_internal(ray)).map_or(ray.tmax, |h| h.t) } else { ray.tmax };
+            self.record_sample(ray, t_end);
+        }
+        occluded
     }
 }
 
